@@ -26,7 +26,10 @@ jobs:
       - name: Install qemu for arm64 cross-build
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static qemu-user-binfmt binfmt-support
+          # qemu-user-binfmt pulls qemu-user (provides /usr/bin/qemu-aarch64) and
+          # registers binfmts. It conflicts with qemu-user-static, so don't install
+          # that here — pi-gen's own build container installs the static variant.
+          sudo apt-get install -y qemu-user-binfmt binfmt-support
           which qemu-aarch64
 
       - name: Assemble stage payload
