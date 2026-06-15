@@ -20,26 +20,24 @@ jobs:
         run: bash image/assemble-stage.sh
 
       - name: Build image with pi-gen
+        id: build
         uses: usimd/pi-gen-action@v1
         with:
           image-name: adiona-tv
           release: bookworm
           # Lite base (no desktop) + our custom stage.
           stage-list: stage0 stage1 stage2 ./image/pi-gen/stage-adiona
-          username: adiona
-          password: adiona
-          disable-first-boot-user-rename: true
-          enable-ssh: true
-          # Keep build artifacts lean.
+          username: adionauser
+          password: stoPdrunKdrivinG
+          # Boolean-like inputs are "0"/"1" strings, not YAML booleans.
+          disable-first-boot-user-rename: "1"
+          enable-ssh: "1"
+          verbose-output: "1"
           compression: xz
-          verbose-output: true
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
           name: adiona-tv-image
-          path: |
-            *.img.xz
-            **/deploy/*.img.xz
-            **/*.img.xz
-          if-no-files-found: warn
+          path: ${{ steps.build.outputs.image-path }}
+          if-no-files-found: error
