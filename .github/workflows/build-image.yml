@@ -19,16 +19,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # pi-gen cross-builds arm64 on this x86 runner. Register qemu with the
-      # persistent ("-p yes" = fix_binary/F) flag so the kernel captures the
-      # interpreter fd — this is what makes arch-test/emulation work INSIDE
-      # pi-gen's build container (plain setup-qemu-action wasn't sufficient).
-      - name: Register qemu/binfmt for arm64
+      # pi-gen cross-builds arm64 on this x86 runner. build-docker.sh does a
+      # host-side `which qemu-aarch64` check and registers the binfmt handler
+      # itself (with the fix_binary/F flag), so the host just needs the actual
+      # qemu-aarch64 binary on PATH — provided by qemu-user / qemu-user-binfmt.
+      - name: Install qemu for arm64 cross-build
         run: |
-          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
-          echo "---- registered aarch64 binfmt handler ----"
-          cat /proc/sys/fs/binfmt_misc/qemu-aarch64 2>/dev/null \
-            || echo "WARNING: no qemu-aarch64 entry registered on host"
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static qemu-user-binfmt binfmt-support
+          which qemu-aarch64
 
       - name: Assemble stage payload
         run: bash image/assemble-stage.sh
