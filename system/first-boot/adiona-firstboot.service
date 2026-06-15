@@ -1,0 +1,18 @@
+[Unit]
+Description=Adiona-TV first-boot provisioning (unique SSID/hostname + Wi-Fi AP)
+# NetworkManager must be up so nmcli can build the AP connection.
+After=NetworkManager.service
+Wants=NetworkManager.service
+# Runs once; the script writes this stamp on success.
+ConditionPathExists=!/etc/adiona/.firstboot-done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/adiona/first-boot/adiona-firstboot.sh
+# wlan0 driver / NM can lag right after a fresh flash — allow a couple of retries
+# across boots rather than wedging the whole boot.
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

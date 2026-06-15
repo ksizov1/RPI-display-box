@@ -1,0 +1,5 @@
+# Everything in this repo is deployed to / run on Linux (Raspberry Pi). Force LF
+# on checkout so shell scripts, systemd units and configs never get CRLF (which
+# would break shebangs and unit parsing on the device), regardless of the host
+# git's autocrlf setting.
+* text=auto eol=lf

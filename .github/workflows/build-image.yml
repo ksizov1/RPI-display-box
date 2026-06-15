@@ -1,0 +1,45 @@
+name: Build Adiona-TV image
+
+# Builds the flashable Raspberry Pi OS image in the cloud and uploads it as a
+# build artifact — no local Linux/Docker needed. Run it from the Actions tab
+# (workflow_dispatch) or on a version tag.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assemble stage payload
+        run: bash image/assemble-stage.sh
+
+      - name: Build image with pi-gen
+        uses: usimd/pi-gen-action@v1
+        with:
+          image-name: adiona-tv
+          release: bookworm
+          # Lite base (no desktop) + our custom stage.
+          stage-list: stage0 stage1 stage2 ./image/pi-gen/stage-adiona
+          username: adiona
+          password: adiona
+          disable-first-boot-user-rename: true
+          enable-ssh: true
+          # Keep build artifacts lean.
+          compression: xz
+          verbose-output: true
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: adiona-tv-image
+          path: |
+            *.img.xz
+            **/deploy/*.img.xz
+            **/*.img.xz
+          if-no-files-found: warn

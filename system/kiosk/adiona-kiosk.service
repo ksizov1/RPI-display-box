@@ -1,0 +1,29 @@
+[Unit]
+Description=Adiona-TV kiosk display (cage + Chromium)
+After=adiona-controller.service systemd-user-sessions.service
+Wants=adiona-controller.service
+ConditionPathExists=/dev/tty1
+
+[Service]
+Type=simple
+User=adionauser
+# A real login session (via PAM) on tty1 gives logind a seat + creates
+# /run/user/1000, which cage/wlroots need to take over the display.
+PAMName=login
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+UtmpIdentifier=tty1
+UtmpMode=user
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=XDG_SESSION_TYPE=wayland
+Environment=WLR_LIBINPUT_NO_DEVICES=1
+ExecStart=/opt/adiona/kiosk/cage-chromium.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

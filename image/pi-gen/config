@@ -1,0 +1,21 @@
+# pi-gen build config for the Adiona-TV image (Raspberry Pi OS Lite, 64-bit,
+# Bookworm). Consumed by image/build-image.sh.
+IMG_NAME="adiona-tv"
+RELEASE="bookworm"
+ARCH="arm64"
+
+# Fixed first user 'adiona' (uid 1000) — the kiosk service runs as this user and
+# its /run/user/1000 path is referenced by the unit. Keep the rename disabled so
+# Bookworm's first-boot wizard doesn't change it.
+FIRST_USER_NAME="adionauser"
+FIRST_USER_PASS="stoPdrunKdrivinG"
+DISABLE_FIRST_BOOT_USER_RENAME="1"
+
+TARGET_HOSTNAME="adiona-tv"
+ENABLE_SSH="1"
+LOCALE_DEFAULT="en_US.UTF-8"
+KEYBOARD_LAYOUT="us"
+
+# Lite stages (no desktop) + our stage. build-image.sh adds SKIP_IMAGES to the
+# earlier stages so only stage-adiona exports an image.
+STAGE_LIST="stage0 stage1 stage2 ./stage-adiona"

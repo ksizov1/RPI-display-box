@@ -1,0 +1,18 @@
+[Unit]
+Description=Adiona-TV cast controller (headset discovery + display state)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+# Runs as root: reads NetworkManager's DHCP lease file under /var/lib and binds
+# only the loopback controller port. Restarts forever — the kiosk depends on it.
+ExecStart=/usr/bin/python3 /opt/adiona/controller/adiona_controller.py
+Environment=ADIONA_CONF=/etc/adiona/box.conf
+Environment=ADIONA_WEB_DIR=/opt/adiona/web
+Environment=ADIONA_SSID_FILE=/etc/adiona/ssid
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

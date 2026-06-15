@@ -1,0 +1,2 @@
+# Presence of this file makes pi-gen export a flashable image from this stage.
+IMG_SUFFIX="-adiona-tv"
