@@ -1,12 +1,14 @@
-# pi-gen build config for the Adiona-TV image (Raspberry Pi OS Lite, 64-bit,
-# Bookworm). Consumed by image/build-image.sh.
+# pi-gen build config for the Adiona-TV image (Raspberry Pi OS Lite, 64-bit).
+# Consumed by image/build-image.sh. RELEASE matches pi-gen's builder container
+# (Debian trixie) — bootstrapping a different release leaves the chroot without
+# that release's archive signing keys (apt NO_PUBKEY errors in stage0).
 IMG_NAME="adiona-tv"
-RELEASE="bookworm"
+RELEASE="trixie"
 ARCH="arm64"
 
-# Fixed first user 'adiona' (uid 1000) — the kiosk service runs as this user and
-# its /run/user/1000 path is referenced by the unit. Keep the rename disabled so
-# Bookworm's first-boot wizard doesn't change it.
+# Fixed first user 'adionauser' (uid 1000) — the kiosk service runs as this user
+# and its /run/user/1000 path is referenced by the unit. Keep the rename disabled
+# so the first-boot wizard doesn't change it.
 FIRST_USER_NAME="adionauser"
 FIRST_USER_PASS="stoPdrunKdrivinG"
 DISABLE_FIRST_BOOT_USER_RENAME="1"
