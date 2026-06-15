@@ -29,10 +29,11 @@ jobs:
           stage-list: stage0 stage1 stage2 ./image/pi-gen/stage-adiona
           username: adionauser
           password: stoPdrunKdrivinG
-          # Boolean-like inputs are "0"/"1" strings, not YAML booleans.
+          # NB: these two are validated by the action as "0"/"1" STRINGS...
           disable-first-boot-user-rename: "1"
           enable-ssh: "1"
-          verbose-output: "1"
+          # ...but verbose-output is a real YAML boolean (unquoted true/false).
+          verbose-output: true
           compression: xz
 
       - name: Upload image artifact
