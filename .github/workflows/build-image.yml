@@ -23,14 +23,16 @@ jobs:
       # host-side `which qemu-aarch64` check and registers the binfmt handler
       # itself (with the fix_binary/F flag), so the host just needs the actual
       # qemu-aarch64 binary on PATH — provided by qemu-user / qemu-user-binfmt.
-      - name: Install qemu for arm64 cross-build
+      - name: Install static qemu for arm64 cross-build
         run: |
           sudo apt-get update
-          # qemu-user-binfmt pulls qemu-user (provides /usr/bin/qemu-aarch64) and
-          # registers binfmts. It conflicts with qemu-user-static, so don't install
-          # that here — pi-gen's own build container installs the static variant.
-          sudo apt-get install -y qemu-user-binfmt binfmt-support
-          which qemu-aarch64
+          sudo apt-get install -y qemu-user-static binfmt-support
+          # build-docker.sh registers `which qemu-aarch64` as the binfmt
+          # interpreter (with the F flag). It MUST be the STATIC qemu — the
+          # dynamic build can't run inside pi-gen's container (its shared libs
+          # aren't present there). Expose the static binary under that name.
+          sudo ln -sf /usr/bin/qemu-aarch64-static /usr/local/bin/qemu-aarch64
+          qemu-aarch64 --version | head -n1
 
       - name: Assemble stage payload
         run: bash image/assemble-stage.sh
