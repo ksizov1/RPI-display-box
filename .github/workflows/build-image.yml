@@ -1,8 +1,11 @@
 name: Build Adiona-TV image
 
-# Builds the flashable Raspberry Pi OS image in the cloud and uploads it as a
-# build artifact — no local Linux/Docker needed. Run it from the Actions tab
-# (workflow_dispatch) or on a version tag.
+# Builds the flashable 64-bit Raspberry Pi OS image in the cloud and uploads it
+# as a build artifact — no local Linux/Docker needed. Run it from the Actions
+# tab (workflow_dispatch) or on a version tag.
+#
+# Drives pi-gen directly (same as image/build-image.sh) rather than via a wrapper
+# action, so the full pi-gen build log streams into the Actions output.
 on:
   workflow_dispatch:
   push:
@@ -16,29 +19,31 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # pi-gen cross-builds arm64 on this x86 runner via binfmt/qemu.
+      - name: Set up QEMU (arm64 emulation)
+        uses: docker/setup-qemu-action@v3
+
       - name: Assemble stage payload
         run: bash image/assemble-stage.sh
 
-      - name: Build image with pi-gen
-        id: build
-        uses: usimd/pi-gen-action@v1
-        with:
-          image-name: adiona-tv
-          release: bookworm
-          # Lite base (no desktop) + our custom stage.
-          stage-list: stage0 stage1 stage2 ./image/pi-gen/stage-adiona
-          username: adionauser
-          password: stoPdrunKdrivinG
-          # NB: these two are validated by the action as "0"/"1" STRINGS...
-          disable-first-boot-user-rename: "1"
-          enable-ssh: "1"
-          # ...but verbose-output is a real YAML boolean (unquoted true/false).
-          verbose-output: true
-          compression: xz
+      - name: Clone pi-gen (arm64 / 64-bit branch)
+        run: git clone --depth 1 --branch arm64 https://github.com/RPi-Distro/pi-gen.git pi-gen
+
+      - name: Install custom stage + config
+        run: |
+          cp -r image/pi-gen/stage-adiona pi-gen/stage-adiona
+          cp image/pi-gen/config pi-gen/config
+          # Only our stage should export an image (stage2 still builds the rootfs).
+          touch pi-gen/stage2/SKIP_IMAGES
+          chmod +x pi-gen/stage-adiona/prerun.sh pi-gen/stage-adiona/00-install/01-run.sh
+
+      - name: Build image with pi-gen (Docker)
+        working-directory: pi-gen
+        run: ./build-docker.sh
 
       - name: Upload image artifact
         uses: actions/upload-artifact@v4
         with:
           name: adiona-tv-image
-          path: ${{ steps.build.outputs.image-path }}
+          path: pi-gen/deploy/*
           if-no-files-found: error

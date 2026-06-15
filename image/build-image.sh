@@ -10,7 +10,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-PIGEN_REF="${PIGEN_REF:-bookworm}"
+# 64-bit images are built from pi-gen's arm64 branch.
+PIGEN_REF="${PIGEN_REF:-arm64}"
 WORK="${ROOT}/image/.build"
 PIGEN="${WORK}/pi-gen"
 
