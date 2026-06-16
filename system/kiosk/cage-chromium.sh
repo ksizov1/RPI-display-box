@@ -21,7 +21,7 @@ done
 # `cage -- <app>` runs exactly one app full-screen and exits when it does
 # (systemd then restarts us). Chromium flags strip every bit of UI and disable
 # update/crash/translate prompts so nothing can ever cover the stream.
-exec cage -- chromium-browser \
+exec cage -- chromium \
     --kiosk \
     --ozone-platform=wayland \
     --enable-features=UseOzonePlatform \

@@ -22,6 +22,7 @@ log() { echo "[adiona-firstboot] $*"; }
 SSID_PREFIX="${SSID_PREFIX:-Adiona-TV}"
 WIFI_PASSPHRASE="${WIFI_PASSPHRASE:-adiona-drive}"
 WIFI_CHANNEL="${WIFI_CHANNEL:-6}"
+WIFI_COUNTRY="${WIFI_COUNTRY:-US}"
 AP_CIDR="${AP_CIDR:-192.168.50.1/24}"
 
 # ── Wait for the Wi-Fi interface to exist (driver can lag at first boot) ──────
@@ -44,6 +45,18 @@ log "MAC=$MAC -> SSID=$SSID hostname=$HOSTNAME"
 mkdir -p /etc/adiona
 printf '%s\n' "$SSID" > "$SSID_OUT"
 hostnamectl set-hostname "$HOSTNAME" || true
+
+# ── Unblock the Wi-Fi radio ──────────────────────────────────────────────────
+# Raspberry Pi keeps the Wi-Fi radio rfkill-blocked until a regulatory country
+# is set, so without this the AP can't broadcast. raspi-config persists the
+# country and clears the block; the extras are runtime/no-raspi-config fallbacks.
+log "setting WiFi country $WIFI_COUNTRY and enabling radio"
+if command -v raspi-config >/dev/null; then
+    raspi-config nonint do_wifi_country "$WIFI_COUNTRY" || true
+fi
+iw reg set "$WIFI_COUNTRY" 2>/dev/null || true
+command -v rfkill >/dev/null && rfkill unblock wifi || true
+nmcli radio wifi on || true
 
 # ── Build / refresh the access-point connection ──────────────────────────────
 # ipv4.method=shared gives DHCP + NAT masquerade to whatever holds the default

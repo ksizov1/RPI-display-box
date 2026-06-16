@@ -1,7 +1,7 @@
 network-manager
 dnsmasq-base
 iw
-chromium-browser
+chromium
 cage
 python3
 curl
