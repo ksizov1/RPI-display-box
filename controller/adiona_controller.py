@@ -19,6 +19,7 @@ stdlib only — nothing to pip-install on the image.
 """
 
 import json
+import mimetypes
 import os
 import socket
 import subprocess
@@ -107,8 +108,11 @@ def read_ssid():
 
 
 # ── Discovering connected headsets ───────────────────────────────────────────
+AP_IFACE = "wlan0"
+
+
 def leased_clients():
-    """{ip: hostname} for current DHCP leases on the AP subnet."""
+    """{ip: (mac, hostname)} for current DHCP leases on the AP subnet."""
     clients = {}
     try:
         with open(LEASE_FILE, "r") as fh:
@@ -116,12 +120,28 @@ def leased_clients():
                 # dnsmasq lease line: <expiry> <mac> <ip> <hostname> <clientid>
                 parts = line.split()
                 if len(parts) >= 4:
-                    ip, host = parts[2], parts[3]
+                    mac, ip, host = parts[1].lower(), parts[2], parts[3]
                     if ip.startswith(AP_PREFIX):
-                        clients[ip] = None if host == "*" else host
+                        clients[ip] = (mac, None if host == "*" else host)
     except OSError:
         pass
     return clients
+
+
+def associated_macs():
+    """MACs currently associated to our Wi-Fi AP (the authoritative 'still on the
+    network' signal — independent of whether the headset is actively casting)."""
+    macs = set()
+    try:
+        out = subprocess.run(["iw", "dev", AP_IFACE, "station", "dump"],
+                             capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("Station "):
+                macs.add(line.split()[1].lower())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return macs
 
 
 def neighbour_ips():
@@ -197,53 +217,53 @@ def internet_ok(eth):
 
 # ── Selection loop ───────────────────────────────────────────────────────────
 def selection_loop():
-    selected = None             # IP currently displayed
-    last_live = None            # last IP that was live (reconnect target)
-    first_seen = {}             # ip -> monotonic time it became an active caster
-    reconnect_deadline = None
+    # Selection is keyed on the headset's MAC, and "stay vs leave" is decided by
+    # Wi-Fi ASSOCIATION (not by whether it's actively casting). So once a headset
+    # is shown, it stays selected as long as it's on the AP — even if it pauses
+    # casting (headset taken off, app backgrounded). The page then just freezes
+    # the last frame. Only when the headset LEAVES the Wi-Fi do we drop to the
+    # waiting screen (or switch to another headset that is casting).
+    current_mac = None
+    first_seen = {}             # mac -> monotonic time it became an active caster
 
     while True:
+        leases = leased_clients()                 # {ip: (mac, host)}
+        mac_to_ip = {mac: ip for ip, (mac, _h) in leases.items() if mac}
+        mac_to_host = {mac: h for _ip, (mac, h) in leases.items() if mac}
+
+        assoc = associated_macs()
+        present_macs = set(mac_to_ip) & assoc      # leased AND associated to the AP
+        casting_ips = scan_casters([mac_to_ip[m] for m in present_macs])
+        caster_macs = {m for m in present_macs if mac_to_ip[m] in casting_ips}
+
+        # Track when each headset first started casting (for "most recent" choice).
         now = time.monotonic()
-        leases = leased_clients()
-        candidates = set(leases) | neighbour_ips()
-        active = scan_casters(candidates)
+        for m in caster_macs:
+            first_seen.setdefault(m, now)
+        for m in list(first_seen):
+            if m not in caster_macs:
+                del first_seen[m]
 
-        # Track when each caster first appeared (proxy for "connection order").
-        for ip in active:
-            first_seen.setdefault(ip, now)
-        for ip in list(first_seen):
-            if ip not in active:
-                del first_seen[ip]
-
-        if selected in active:
-            # Sticky: keep the running session; never preempt for a newcomer.
-            mode, target = "live", selected
-            last_live, reconnect_deadline = selected, None
-        elif active:
-            # Current headset stopped (or none chosen yet) AND another is casting
-            # → switch to the most-recently-connected one.
-            selected = max(active, key=lambda ip: first_seen[ip])
-            mode, target = "live", selected
-            last_live, reconnect_deadline = selected, None
+        if current_mac in present_macs:
+            # Sticky: current headset is still on the network → keep showing it,
+            # casting or not (frozen last frame while paused).
+            mode = "live"
+        elif caster_macs:
+            # Current headset left (or none yet) AND another is casting → switch to
+            # the most-recently-connected caster.
+            current_mac = max(caster_macs, key=lambda m: first_seen[m])
+            mode = "live"
         else:
-            # Nobody is casting.
-            selected = None
-            if last_live is not None:
-                if reconnect_deadline is None:
-                    reconnect_deadline = now + RECONNECT_GRACE
-                if now < reconnect_deadline:
-                    mode, target = "reconnecting", last_live   # page retries last IP
-                else:
-                    mode, target = "waiting", None
-                    last_live, reconnect_deadline = None, None
-            else:
-                mode, target = "waiting", None
+            # Current headset left the Wi-Fi and nothing else is casting → wait.
+            current_mac = None
+            mode = "waiting"
 
+        target = mac_to_ip.get(current_mac) if current_mac else None
         eth = ethernet_up()
         with LOCK:
             STATE["mode"] = mode
             STATE["target"] = target
-            STATE["target_name"] = leases.get(target) if target else None
+            STATE["target_name"] = mac_to_host.get(current_mac) if current_mac else None
             STATE["ssid"] = read_ssid()
             STATE["uplink"] = {"ethernet": eth, "internet": internet_ok(eth)}
 
@@ -251,13 +271,6 @@ def selection_loop():
 
 
 # ── HTTP server (loopback only) ──────────────────────────────────────────────
-STATIC = {
-    "/": ("index.html", "text/html; charset=utf-8"),
-    "/index.html": ("index.html", "text/html; charset=utf-8"),
-    "/jmuxer.js": ("jmuxer.js", "application/javascript; charset=utf-8"),
-}
-
-
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -279,10 +292,14 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps(STATE).encode("utf-8")
             self._send(200, body, "application/json")
             return
-        if path in STATIC:
-            fname, ctype = STATIC[path]
+        # Serve any asset in WEB_DIR (index.html, jmuxer.js, splash.png, …).
+        # basename() strips directories, so there's no path traversal.
+        name = "index.html" if path == "/" else os.path.basename(path)
+        fpath = os.path.join(WEB_DIR, name)
+        if name and os.path.isfile(fpath):
+            ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
             try:
-                with open(os.path.join(WEB_DIR, fname), "rb") as fh:
+                with open(fpath, "rb") as fh:
                     self._send(200, fh.read(), ctype)
             except OSError:
                 self._send(404, b"not found", "text/plain")

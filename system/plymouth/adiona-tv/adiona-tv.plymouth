@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=Adiona-TV
+Description=Adiona-TV boot splash
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/adiona-tv
+ScriptFile=/usr/share/plymouth/themes/adiona-tv/adiona-tv.script

@@ -5,43 +5,51 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
 <title>Adiona-TV</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  html, body { margin: 0; height: 100%; background: #fff; overflow: hidden; cursor: none; }
   #v { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
 
-  /* Overlay shown ONLY when there is no live video. While a stream is playing it
-     is fully hidden, so a livestream is never interrupted by status messages
-     (Wi-Fi/internet changes, etc.) — per the box's display rules. */
+  /* Non-live screen: the marketing splash fills the display (white letterboxing
+     on non-16:9 screens), with all service status confined to the bottom band.
+     Fully hidden whenever a stream is playing, so a livestream is never covered. */
   #overlay {
-    position: fixed; inset: 0; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; text-align: center;
-    color: #c8ccd0; font: 500 4.5vmin/1.4 system-ui, sans-serif; background: #000;
-    pointer-events: none;
+    position: fixed; inset: 0;
+    background: #fff url("splash.png") top center / contain no-repeat;
   }
   #overlay.hidden { display: none; }
-  #title { font-size: 5.5vmin; font-weight: 600; color: #e8eaed; }
-  #sub   { margin-top: 2vmin; font-size: 3vmin; color: #9aa0a6; }
-  #join  { margin-top: 4vmin; font-size: 3.2vmin; color: #c8ccd0; }
-  #join b { color: #8ab4f8; font-weight: 600; }
-  #uplink { margin-top: 5vmin; font-size: 2.6vmin; color: #5f6368; }
-  .dot { display: inline-block; width: 1.6vmin; height: 1.6vmin; border-radius: 50%;
-         margin-right: 1vmin; vertical-align: baseline; }
-  .dot.ok { background: #34a853; } .dot.no { background: #ea4335; } .dot.unk { background: #9aa0a6; }
-  .brand { position: fixed; bottom: 3vmin; left: 0; right: 0; text-align: center;
-           font: 500 2.4vmin system-ui, sans-serif; color: #3c4043; }
+
+  /* Bottom ~20% status band — dark text on a translucent white panel so it stays
+     legible over the white splash. */
+  #statusbar {
+    position: fixed; left: 0; right: 0; bottom: 0; height: 20%;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; gap: 0.6vmin;
+    background: rgba(255, 255, 255, 0.88);
+    border-top: 1px solid rgba(0, 0, 0, 0.08);
+    font-family: system-ui, "DejaVu Sans", sans-serif; color: #1a1a1a;
+  }
+  #title { font-size: 3.2vmin; font-weight: 700; color: #111; }
+  #sub   { font-size: 2.1vmin; color: #555; }
+  #join  { font-size: 2.4vmin; color: #222; }
+  #join b { color: #c1121f; font-weight: 700; }   /* red, matching the D² logo */
+  #uplink { font-size: 1.8vmin; color: #666; }
+  .dot { display: inline-block; width: 1.4vmin; height: 1.4vmin; border-radius: 50%;
+         margin-right: 0.8vmin; vertical-align: baseline; }
+  .dot.ok { background: #1a7f37; } .dot.no { background: #c1121f; } .dot.unk { background: #8a8a8a; }
 </style>
-<script src="jmuxer.js"></script>
 </head>
 <body>
 <video id="v" autoplay muted playsinline></video>
 
 <div id="overlay">
-  <div id="title">Waiting for a headset…</div>
-  <div id="sub"></div>
-  <div id="join"></div>
-  <div id="uplink"></div>
-  <div class="brand">Adiona-TV</div>
+  <div id="statusbar">
+    <div id="title">Waiting for a headset…</div>
+    <div id="sub"></div>
+    <div id="join"></div>
+    <div id="uplink"></div>
+  </div>
 </div>
 
+<script src="jmuxer.js"></script>
 <script>
 (function () {
   "use strict";
@@ -62,7 +70,7 @@
   var ws = null, jmuxer = null, pending = [], lastFeedMs = 0;
   var connectedHost = null;          // headset IP the WS is currently bound to
   var wsRetryTimer = null;
-  var lastProgressMs = 0, lastCurrentTime = -1;
+  var haveFrame = false;             // a decoded frame has arrived for this target
   var state = { mode: "waiting", target: null, target_name: null,
                 ssid: "", passphrase: "", uplink: {}, cast_port: 8080, fps: 15 };
 
@@ -94,14 +102,17 @@
       jmuxer.feed({ video: concat(pending), duration: dur });
       pending = [];
       if (video.paused) video.play().catch(function () {});
+      if (!haveFrame) { haveFrame = true; renderOverlay(); }  // first frame → reveal video
     }
   }
 
+  // Full reset — only when switching to a DIFFERENT headset (or to none). NOT on
+  // a mere stream pause, so the last frame stays frozen on screen.
   function teardownStream() {
     if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
     if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; }
     if (jmuxer) { try { jmuxer.destroy(); } catch (e) {} jmuxer = null; }
-    pending = []; lastFeedMs = 0;
+    pending = []; lastFeedMs = 0; haveFrame = false;
   }
 
   function connectWs(host) {
@@ -111,10 +122,10 @@
     ws.onmessage = function (ev) { onNalu(new Uint8Array(ev.data)); };
     ws.onclose = function () {
       ws = null;
-      if (jmuxer) { try { jmuxer.destroy(); } catch (e) {} jmuxer = null; }
+      // Keep jmuxer and the last decoded frame ON SCREEN — the headset is still
+      // on the network, it just paused casting. Reconnect silently; when frames
+      // resume the picture moves again, with no "waiting" flash in between.
       pending = []; lastFeedMs = 0;
-      // Keep trying the same host; the controller switches `target` when the
-      // current headset is gone and another is casting (sticky-session rule).
       if (connectedHost === host) {
         wsRetryTimer = setTimeout(function () { connectWs(host); }, 1000);
       }
@@ -132,26 +143,25 @@
     if (host) connectWs(host);
   }
 
-  // ── Playback liveliness + overlay ─────────────────────────────────────────
-  function isPlaying() {
-    // "Live" = video element is actually advancing. This (not the controller's
-    // mode) gates the overlay, so an in-flight stream is never covered by a
-    // status message even if a network event fires.
-    return !video.paused && video.readyState >= 3 &&
-           (performance.now() - lastProgressMs) < 1500;
-  }
-
+  // ── Overlay ───────────────────────────────────────────────────────────────
   function dot(stateStr) {
     var cls = stateStr === true ? "ok" : (stateStr === false ? "no" : "unk");
     return '<span class="dot ' + cls + '"></span>';
   }
 
+  // The splash overlay is gated on NETWORK PRESENCE, not on frame flow. The
+  // controller sets `target` only while a headset is associated to the AP, so:
+  //   • headset present + a frame seen  → hide overlay (show video; a paused
+  //     stream simply freezes on the last frame — no flash to "waiting").
+  //   • headset present, no frame yet   → "Connecting…" (brief, first connect).
+  //   • no headset on the network       → the waiting splash with join info.
   function renderOverlay() {
-    if (isPlaying()) { overlay.classList.add("hidden"); return; }
+    var present = !!state.target;
+    if (present && haveFrame) { overlay.classList.add("hidden"); return; }
     overlay.classList.remove("hidden");
 
-    if (state.mode === "reconnecting") {
-      elTitle.textContent = "Reconnecting…";
+    if (present) {
+      elTitle.textContent = "Connecting…";
       elSub.textContent = state.target_name ? ("to " + state.target_name) : "";
       elJoin.innerHTML = "";
     } else {
@@ -159,11 +169,10 @@
       elSub.textContent = "Power on the headset and start Live Stream.";
       if (state.ssid) {
         elJoin.innerHTML = "On the headset, join Wi-Fi <b>" + esc(state.ssid) + "</b>" +
-          (state.passphrase ? "<br>password <b>" + esc(state.passphrase) + "</b>" : "");
+          (state.passphrase ? " &nbsp;·&nbsp; password <b>" + esc(state.passphrase) + "</b>" : "");
       } else { elJoin.innerHTML = ""; }
     }
 
-    // Uplink status appears only on these non-live screens.
     var up = state.uplink || {};
     var eth = up.ethernet, net = up.internet;
     elUplink.innerHTML =
@@ -175,23 +184,15 @@
   function esc(s) { return String(s).replace(/[&<>"]/g, function (c) {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
 
-  // Live-edge catch-up + stall/progress tracking (250 ms cadence).
+  // Live-edge catch-up (keeps latency low while playing; a no-op when frozen).
   setInterval(function () {
-    if (video.buffered.length) {
-      var live = video.buffered.end(video.buffered.length - 1);
-      var lag = live - video.currentTime;
-      if (lag > SNAP_LAG) { video.currentTime = live - 0.05; video.playbackRate = 1.0; }
-      else if (lag > SOFT_LAG) { video.playbackRate = 1.10; }
-      else { video.playbackRate = 1.0; }
-    }
-    if (video.currentTime !== lastCurrentTime) {
-      lastCurrentTime = video.currentTime; lastProgressMs = performance.now();
-    }
-    renderOverlay();
+    if (!video.buffered.length) return;
+    var live = video.buffered.end(video.buffered.length - 1);
+    var lag = live - video.currentTime;
+    if (lag > SNAP_LAG) { video.currentTime = live - 0.05; video.playbackRate = 1.0; }
+    else if (lag > SOFT_LAG) { video.playbackRate = 1.10; }
+    else { video.playbackRate = 1.0; }
   }, 250);
-
-  video.addEventListener("playing", function () { lastProgressMs = performance.now(); });
-  video.addEventListener("timeupdate", function () { lastProgressMs = performance.now(); });
 
   // ── Poll the controller for what to display ───────────────────────────────
   function poll() {

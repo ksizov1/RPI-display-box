@@ -18,10 +18,12 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
-# `cage -- <app>` runs exactly one app full-screen and exits when it does
-# (systemd then restarts us). Chromium flags strip every bit of UI and disable
+# `cage -s -- <app>` runs exactly one app full-screen and exits when it does
+# (systemd then restarts us). `-s` allows VT switching, so Ctrl+Alt+F2 reaches a
+# maintenance login shell. Chromium flags strip every bit of UI and disable
 # update/crash/translate prompts so nothing can ever cover the stream.
-exec cage -- chromium \
+# (The mouse cursor is suppressed via the 99-adiona-no-pointer udev rule.)
+exec cage -s -- chromium \
     --kiosk \
     --ozone-platform=wayland \
     --enable-features=UseOzonePlatform \

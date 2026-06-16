@@ -1,0 +1,28 @@
+// Adiona-TV boot splash: the marketing image scaled to fit (contain), top-aligned
+// to match the browser waiting screen, on a white background, with a small dark
+// "Starting Adiona-TV..." line near the bottom.
+Window.SetBackgroundTopColor(1, 1, 1);
+Window.SetBackgroundBottomColor(1, 1, 1);
+
+sw = Window.GetWidth();
+sh = Window.GetHeight();
+
+logo.image = Image("splash.png");
+iw = logo.image.GetWidth();
+ih = logo.image.GetHeight();
+
+scale_w = sw / iw;
+scale_h = sh / ih;
+if (scale_w < scale_h) scale = scale_w; else scale = scale_h;
+nw = iw * scale;
+nh = ih * scale;
+
+logo.sprite = Sprite(logo.image.Scale(nw, nh));
+logo.sprite.SetX((sw - nw) / 2);
+logo.sprite.SetY(0);
+
+msg.sprite = Sprite();
+txt = Image.Text("Starting Adiona-TV...", 0.1, 0.1, 0.1);
+msg.sprite.SetImage(txt);
+msg.sprite.SetX((sw - txt.GetWidth()) / 2);
+msg.sprite.SetY(sh * 0.88);

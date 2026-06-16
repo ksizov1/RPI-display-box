@@ -6,3 +6,5 @@ cage
 python3
 curl
 fonts-dejavu-core
+plymouth
+plymouth-label

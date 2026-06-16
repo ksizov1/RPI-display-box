@@ -1,0 +1,7 @@
+# Adiona-TV kiosk: ignore pointer devices so the Wayland compositor never draws a
+# mouse cursor on screen. Keyboards are unaffected, so the Ctrl+Alt+F2 maintenance
+# shell still works. Production boxes have no mouse anyway, and the kiosk has
+# nothing clickable.
+ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_MOUSE}=="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_TOUCHPAD}=="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_POINTINGSTICK}=="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"

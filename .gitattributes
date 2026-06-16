@@ -3,3 +3,9 @@
 # would break shebangs and unit parsing on the device), regardless of the host
 # git's autocrlf setting.
 * text=auto eol=lf
+
+# Binary assets — never normalize line endings.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.ico binary
