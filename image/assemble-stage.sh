@@ -15,5 +15,6 @@ cp -r "${ROOT}/web"        "${PAYLOAD}/web"
 cp -r "${ROOT}/controller" "${PAYLOAD}/controller"
 cp -r "${ROOT}/system"     "${PAYLOAD}/system"
 cp -r "${ROOT}/config"     "${PAYLOAD}/config"
+cp    "${ROOT}/VERSION"    "${PAYLOAD}/VERSION"
 
 echo "Assembled payload at: ${PAYLOAD}"

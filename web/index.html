@@ -5,7 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
 <title>Adiona-TV</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #fff; overflow: hidden; cursor: none; }
+  html, body { margin: 0; height: 100%; background: #fff; overflow: hidden; cursor: none;
+               font-family: system-ui, "DejaVu Sans", sans-serif; }
+  input, button, select, textarea { font-family: inherit; }
   #v { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
 
   /* Non-live screen: the marketing splash fills the display (white letterboxing
@@ -32,9 +34,48 @@
   #join  { font-size: 2.4vmin; color: #222; }
   #join b { color: #c1121f; font-weight: 700; }   /* red, matching the D² logo */
   #uplink { font-size: 1.8vmin; color: #666; }
+  #version { position: absolute; right: 2.2vmin; bottom: 1.2vmin;
+             font-size: 1.7vmin; color: #9aa0a6; }
   .dot { display: inline-block; width: 1.4vmin; height: 1.4vmin; border-radius: 50%;
          margin-right: 0.8vmin; vertical-align: baseline; }
   .dot.ok { background: #1a7f37; } .dot.no { background: #c1121f; } .dot.unk { background: #8a8a8a; }
+  .hint { color: #8a8a8a; font-size: 0.9em; }
+
+  /* Keyboard-driven upstream-Wi-Fi setup overlay (no mouse — arrows/Tab/Enter/Esc). */
+  #wifi { position: fixed; inset: 0; z-index: 10; display: flex;
+          align-items: center; justify-content: center;
+          background: rgba(255, 255, 255, 0.98);
+          font-family: system-ui, "DejaVu Sans", sans-serif; color: #1a1a1a; }
+  #wifi.wifi-hidden { display: none; }
+  .wifi-card { width: min(860px, 92vw); max-height: 94vh; display: flex; flex-direction: column; }
+  .wifi-title { font-size: 3.4vmin; font-weight: 700; text-align: center; }
+  .wifi-note { font-size: 1.9vmin; color: #555; text-align: center; margin: 1vmin 0 2vmin; line-height: 1.4; }
+  .wifi-note b { color: #111; }
+  .wifi-list { border: 2px solid #ccc; border-radius: 1vmin; overflow-y: auto;
+               max-height: 40vh; background: #fff; }
+  .wifi-list:focus { outline: none; border-color: #1a73e8; box-shadow: 0 0 0 3px rgba(26,115,232,.3); }
+  .wifi-item { display: flex; align-items: center; gap: 1.5vmin; padding: 1.1vmin 1.6vmin;
+               font-size: 2.2vmin; border-bottom: 1px solid #eee; }
+  .wifi-item:last-child { border-bottom: none; }
+  .wifi-item.sel { background: #e8f0fe; }
+  .wifi-item .sig { width: 5ch; color: #777; font-size: 1.8vmin; text-align: right; }
+  .wifi-item .name { flex: 1; font-weight: 600; }
+  .wifi-item.off .name { color: #999; font-weight: 500; }
+  .wifi-item .badge { font-size: 1.6vmin; padding: 0.3vmin 1vmin; border-radius: 0.8vmin; white-space: nowrap; }
+  .badge.conn { background: #1a7f37; color: #fff; }
+  .badge.saved { background: #e8eaed; color: #444; }
+  .wifi-empty { padding: 2vmin; text-align: center; color: #888; font-size: 2vmin; }
+  .wifi-fields { display: flex; gap: 2vmin; margin: 2vmin 0 1vmin; }
+  .wifi-fields label { flex: 1; display: flex; flex-direction: column; gap: 0.5vmin;
+                       font-size: 1.9vmin; color: #555; }
+  .wifi-fields input { font-size: 2.4vmin; padding: 1vmin 1.2vmin; border: 2px solid #c2c2c2;
+                       border-radius: 1vmin; background: #fff; color: #111; }
+  .wifi-fields input:focus, .wifi-btns button:focus {
+      outline: none; border-color: #1a73e8; box-shadow: 0 0 0 3px rgba(26,115,232,.35); }
+  .wifi-btns { display: flex; gap: 1.5vmin; justify-content: center; margin: 1vmin 0; flex-wrap: wrap; }
+  .wifi-btns button { font-size: 2.2vmin; padding: 1vmin 2.6vmin; border: 2px solid #c2c2c2;
+                      border-radius: 1vmin; background: #f3f3f3; color: #111; }
+  .wifi-msg { text-align: center; font-size: 2vmin; min-height: 2.6vmin; margin-top: 1vmin; }
 </style>
 </head>
 <body>
@@ -46,6 +87,33 @@
     <div id="sub"></div>
     <div id="join"></div>
     <div id="uplink"></div>
+  </div>
+  <div id="version"></div>
+</div>
+
+<!-- Upstream-internet Wi-Fi setup (opened with the 'W' key; keyboard-only) -->
+<div id="wifi" class="wifi-hidden">
+  <div class="wifi-card">
+    <div class="wifi-title">Internet (upstream) Wi-Fi setup</div>
+    <div class="wifi-note">
+      Connects this box to an existing Wi-Fi for <b>internet</b> (repeater) via the USB adapter.<br>
+      This is <b>not</b> the headset network <b id="wifiApName">Adiona-TV</b> — that one stays fixed.
+    </div>
+    <div id="wifiList" class="wifi-list" tabindex="0" role="listbox"
+         aria-label="Available and saved networks"></div>
+    <div class="wifi-fields">
+      <label>Network (SSID)
+        <input id="wifiSsid" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+      <label>Password (blank = use saved)
+        <input id="wifiPass" type="password" autocomplete="off"></label>
+    </div>
+    <div class="wifi-btns">
+      <button id="wifiConnect">Connect</button>
+      <button id="wifiForget">Forget</button>
+      <button id="wifiRescan">Rescan</button>
+      <button id="wifiClose">Close (Esc)</button>
+    </div>
+    <div id="wifiMsg" class="wifi-msg"></div>
   </div>
 </div>
 
@@ -66,11 +134,14 @@
   var elSub = document.getElementById("sub");
   var elJoin = document.getElementById("join");
   var elUplink = document.getElementById("uplink");
+  var elVersion = document.getElementById("version");
 
   var ws = null, jmuxer = null, pending = [], lastFeedMs = 0;
   var connectedHost = null;          // headset IP the WS is currently bound to
-  var wsRetryTimer = null;
+  var wsRetryTimer = null, wsOpenTimer = null;
   var haveFrame = false;             // a decoded frame has arrived for this target
+  var lastNaluMs = 0;                // arrival time of the last NAL (frames flowing?)
+  var lastVideoTime = -1, lastAdvanceMs = 0;   // playback-progress watchdog
   var state = { mode: "waiting", target: null, target_name: null,
                 ssid: "", passphrase: "", uplink: {}, cast_port: 8080, fps: 15 };
 
@@ -92,6 +163,7 @@
   // prepended to the next VCL NAL), using real inter-arrival durations so the
   // live-edge timeline can't drift. Identical strategy to the headset's page.
   function onNalu(u8) {
+    lastNaluMs = performance.now();
     if (!jmuxer) jmuxer = makeMuxer();
     var t = nalType(u8);
     pending.push(u8);
@@ -110,6 +182,7 @@
   // a mere stream pause, so the last frame stays frozen on screen.
   function teardownStream() {
     if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
+    if (wsOpenTimer) { clearTimeout(wsOpenTimer); wsOpenTimer = null; }
     if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; }
     if (jmuxer) { try { jmuxer.destroy(); } catch (e) {} jmuxer = null; }
     pending = []; lastFeedMs = 0; haveFrame = false;
@@ -119,9 +192,19 @@
     if (!host) return;
     ws = new WebSocket("ws://" + host + ":" + castPort + "/stream");
     ws.binaryType = "arraybuffer";
+    var thisWs = ws;
+    // The headset can be associated to Wi-Fi yet have its :8080 frozen (off-head
+    // / app backgrounded), where a TCP connect would otherwise hang on the long
+    // OS timeout. Bail after 6 s so we retry quickly once it's reachable again.
+    if (wsOpenTimer) clearTimeout(wsOpenTimer);
+    wsOpenTimer = setTimeout(function () {
+      if (thisWs && thisWs.readyState === 0) { try { thisWs.close(); } catch (e) {} }
+    }, 6000);
+    ws.onopen = function () { if (wsOpenTimer) { clearTimeout(wsOpenTimer); wsOpenTimer = null; } };
     ws.onmessage = function (ev) { onNalu(new Uint8Array(ev.data)); };
     ws.onclose = function () {
       ws = null;
+      if (wsOpenTimer) { clearTimeout(wsOpenTimer); wsOpenTimer = null; }
       // Keep jmuxer and the last decoded frame ON SCREEN — the headset is still
       // on the network, it just paused casting. Reconnect silently; when frames
       // resume the picture moves again, with no "waiting" flash in between.
@@ -130,7 +213,7 @@
         wsRetryTimer = setTimeout(function () { connectWs(host); }, 1000);
       }
     };
-    ws.onerror = function () { try { ws.close(); } catch (e) {} };
+    ws.onerror = function () { try { thisWs.close(); } catch (e) {} };
   }
 
   // Re-bind the WebSocket whenever the controller points us at a different
@@ -174,24 +257,47 @@
     }
 
     var up = state.uplink || {};
-    var eth = up.ethernet, net = up.internet;
-    elUplink.innerHTML =
-      dot(eth) + "Ethernet " + (eth ? "connected" : "not connected") +
-      "&nbsp;&nbsp;&nbsp;" +
-      dot(net) + "Internet " + (net === true ? "available" : net === false ? "offline (local only)" : "unknown");
+    var net = up.internet;
+    var how = up.via === "wifi" ? ("Wi-Fi: " + (up.wifi_ssid || "")) :
+              up.via === "ethernet" ? "Ethernet" : null;
+    var line = net === true ? (dot(true) + "Internet via " + esc(how || "uplink")) :
+               net === false ? (dot(false) + "No internet (local network only)") :
+               (dot(null) + "Internet status unknown");
+    var hint = up.wifi_present ?
+      "&nbsp;&nbsp;&nbsp;<span class='hint'>Keyboard: press W to set up internet (upstream Wi-Fi)</span>" : "";
+    elUplink.innerHTML = line + hint;
   }
 
   function esc(s) { return String(s).replace(/[&<>"]/g, function (c) {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
 
-  // Live-edge catch-up (keeps latency low while playing; a no-op when frozen).
+  // Playback watchdog + live-edge catch-up (250 ms cadence).
   setInterval(function () {
-    if (!video.buffered.length) return;
-    var live = video.buffered.end(video.buffered.length - 1);
-    var lag = live - video.currentTime;
-    if (lag > SNAP_LAG) { video.currentTime = live - 0.05; video.playbackRate = 1.0; }
-    else if (lag > SOFT_LAG) { video.playbackRate = 1.10; }
-    else { video.playbackRate = 1.0; }
+    var now = performance.now();
+    var framesFlowing = (now - lastNaluMs) < 1500;
+
+    // Stall recovery: if NALs are arriving but the picture isn't advancing for a
+    // few seconds, the decode pipeline is wedged (common after a long pause and
+    // reconnect) — rebuild jmuxer so the resumed stream actually renders. When no
+    // frames are flowing we just hold the frozen frame (don't touch anything).
+    if (jmuxer && haveFrame && framesFlowing) {
+      if (video.buffered.length && video.currentTime !== lastVideoTime) {
+        lastVideoTime = video.currentTime; lastAdvanceMs = now;
+      } else if (lastAdvanceMs && (now - lastAdvanceMs) > 2500) {
+        try { jmuxer.destroy(); } catch (e) {}
+        jmuxer = null; pending = []; lastFeedMs = 0; lastAdvanceMs = now;
+      }
+    } else {
+      lastVideoTime = video.currentTime; lastAdvanceMs = now;
+    }
+
+    if (video.buffered.length) {
+      var live = video.buffered.end(video.buffered.length - 1);
+      var lag = live - video.currentTime;
+      if (lag > SNAP_LAG) { video.currentTime = live - 0.05; video.playbackRate = 1.0; }
+      else if (lag > SOFT_LAG) { video.playbackRate = 1.10; }
+      else { video.playbackRate = 1.0; }
+    }
   }, 250);
 
   // ── Poll the controller for what to display ───────────────────────────────
@@ -201,11 +307,124 @@
         state = s;
         if (s.cast_port) castPort = s.cast_port;
         if (s.fps) fps = s.fps;
+        elVersion.textContent = s.version ? ("Adiona-TV v" + s.version) : "";
         reconcileTarget();
         renderOverlay();
       })
       .catch(function () { /* controller momentarily down; keep last state */ });
   }
+
+  // ── Upstream Wi-Fi setup overlay (keyboard-only: W opens, arrows/Tab/Enter/Esc) ──
+  var wifiEl = document.getElementById("wifi");
+  var wifiListEl = document.getElementById("wifiList");
+  var elSsid = document.getElementById("wifiSsid");
+  var elPass = document.getElementById("wifiPass");
+  var elWifiMsg = document.getElementById("wifiMsg");
+  var elApName = document.getElementById("wifiApName");
+  var wifiOpen = false, wifiItems = [], wifiSel = 0;
+
+  function wifiPost(p) {
+    return fetch("/wifi", { method: "POST", body: JSON.stringify(p) }).then(function (r) { return r.json(); });
+  }
+  function msg(text, color) { elWifiMsg.style.color = color || "#555"; elWifiMsg.textContent = text; }
+
+  function renderList() {
+    if (!wifiItems.length) {
+      wifiListEl.innerHTML = '<div class="wifi-empty">No networks found — press Rescan.</div>'; return;
+    }
+    wifiListEl.innerHTML = "";
+    wifiItems.forEach(function (it, i) {
+      var row = document.createElement("div");
+      row.className = "wifi-item" + (i === wifiSel ? " sel" : "") + (it.inRange ? "" : " off");
+      row.setAttribute("role", "option");
+      var sig = it.inRange ? (it.signal + "%") : "—";
+      var lock = it.secure ? " 🔒" : "";
+      var badge = it.connected ? '<span class="badge conn">connected</span>'
+                : it.saved ? '<span class="badge saved">' + (it.inRange ? "saved" : "saved · out of range") + '</span>' : "";
+      row.innerHTML = '<span class="sig">' + sig + '</span><span class="name">' + esc(it.ssid) + lock + '</span>' + badge;
+      row.addEventListener("click", function () { wifiSel = i; chooseRow(false); });
+      wifiListEl.appendChild(row);
+    });
+  }
+  function chooseRow(focusPass) {
+    renderList();
+    var it = wifiItems[wifiSel];
+    if (!it) return;
+    elSsid.value = it.ssid;
+    var rows = wifiListEl.children;
+    if (rows[wifiSel] && rows[wifiSel].scrollIntoView) rows[wifiSel].scrollIntoView({ block: "nearest" });
+    if (focusPass) elPass.focus();
+  }
+  function buildList(w) {
+    var inScan = {};
+    wifiItems = [];
+    (w.scan || []).forEach(function (n) {
+      inScan[n.ssid] = true;
+      wifiItems.push({ ssid: n.ssid, secure: n.secure, signal: n.signal, inRange: true,
+                       saved: (w.saved || []).indexOf(n.ssid) >= 0, connected: n.ssid === w.ssid });
+    });
+    (w.saved || []).forEach(function (s) {
+      if (!inScan[s]) wifiItems.push({ ssid: s, secure: true, signal: 0, inRange: false, saved: true, connected: s === w.ssid });
+    });
+    wifiItems.sort(function (a, b) {
+      if (a.connected !== b.connected) return a.connected ? -1 : 1;
+      if (a.inRange !== b.inRange) return a.inRange ? -1 : 1;
+      return (b.signal || 0) - (a.signal || 0);
+    });
+    if (wifiSel >= wifiItems.length) wifiSel = 0;
+    renderList();
+  }
+  function loadWifi() {
+    return fetch("/wifi", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (w) {
+      if (!w.present) msg("No Wi-Fi adapter detected.", "#c1121f");
+      buildList(w);
+    }).catch(function () {});
+  }
+  function wifiShow(open) { wifiOpen = open; wifiEl.classList.toggle("wifi-hidden", !open); }
+  function openWifi() {
+    wifiShow(true);
+    elApName.textContent = state.ssid || "the headset network";
+    elSsid.value = ""; elPass.value = ""; wifiSel = 0;
+    msg("Scanning…");
+    loadWifi();
+    wifiPost({ action: "rescan" }).then(function () { msg(""); loadWifi(); }).catch(function () {});
+    setTimeout(function () { wifiListEl.focus(); }, 50);
+  }
+  function doConnect() {
+    var ssid = elSsid.value.trim();
+    if (!ssid) { msg("Choose or type a network.", "#c1121f"); return; }
+    msg("Connecting to " + ssid + "…");
+    wifiPost({ action: "connect", ssid: ssid, password: elPass.value }).then(function (res) {
+      msg(res.ok ? ("Connected to " + ssid) : ("Failed: " + (res.message || "")), res.ok ? "#1a7f37" : "#c1121f");
+      elPass.value = ""; loadWifi();
+    }).catch(function () { msg("Request failed.", "#c1121f"); });
+  }
+  function doForget() {
+    var ssid = elSsid.value.trim();
+    if (!ssid) { msg("Select a saved network to forget.", "#c1121f"); return; }
+    wifiPost({ action: "forget", ssid: ssid }).then(function (res) {
+      msg(res.ok ? ("Removed " + ssid) : ("Failed: " + (res.message || "")), res.ok ? "#1a7f37" : "#c1121f");
+      loadWifi();
+    });
+  }
+  function doRescan() { msg("Scanning…"); wifiPost({ action: "rescan" }).then(function () { msg(""); loadWifi(); }); }
+
+  wifiListEl.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowDown") { wifiSel = Math.min(wifiItems.length - 1, wifiSel + 1); chooseRow(false); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { wifiSel = Math.max(0, wifiSel - 1); chooseRow(false); e.preventDefault(); }
+    else if (e.key === "Enter") { chooseRow(true); e.preventDefault(); }
+  });
+  elSsid.addEventListener("keydown", function (e) { if (e.key === "Enter") { doConnect(); e.preventDefault(); } });
+  elPass.addEventListener("keydown", function (e) { if (e.key === "Enter") { doConnect(); e.preventDefault(); } });
+  document.getElementById("wifiConnect").addEventListener("click", doConnect);
+  document.getElementById("wifiForget").addEventListener("click", doForget);
+  document.getElementById("wifiRescan").addEventListener("click", doRescan);
+  document.getElementById("wifiClose").addEventListener("click", function () { wifiShow(false); });
+
+  document.addEventListener("keydown", function (e) {
+    if (wifiOpen) { if (e.key === "Escape") { wifiShow(false); e.preventDefault(); } return; }
+    if (e.key === "w" || e.key === "W") { openWifi(); }
+  });
 
   if (!window.MediaSource) {
     elTitle.textContent = "This display can’t play the stream";

@@ -13,6 +13,7 @@ cp -r files/payload/system/first-boot  "${ROOTFS_DIR}/opt/adiona/first-boot"
 cp -r files/payload/system/kiosk       "${ROOTFS_DIR}/opt/adiona/kiosk"
 
 install -m 0644 files/payload/config/box.conf "${ROOTFS_DIR}/etc/adiona/box.conf"
+install -m 0644 files/payload/VERSION "${ROOTFS_DIR}/opt/adiona/VERSION"
 
 chmod +x "${ROOTFS_DIR}/opt/adiona/first-boot/adiona-firstboot.sh" \
          "${ROOTFS_DIR}/opt/adiona/kiosk/cage-chromium.sh"
@@ -32,6 +33,11 @@ install -m 0644 files/payload/system/network/99-adiona-forward.conf \
 # udev: ignore pointer devices so no mouse cursor is ever drawn.
 install -m 0644 files/payload/system/udev/99-adiona-no-pointer.rules \
         "${ROOTFS_DIR}/etc/udev/rules.d/99-adiona-no-pointer.rules"
+
+# Chromium managed policy: suppress the (undismissable in kiosk) save-password bubble.
+install -d "${ROOTFS_DIR}/etc/chromium/policies/managed"
+install -m 0644 files/payload/system/chromium/adiona-policy.json \
+        "${ROOTFS_DIR}/etc/chromium/policies/managed/adiona-policy.json"
 
 # Plymouth boot-splash theme (marketing image + "Starting Adiona-TV..."). The
 # splash image is shared with the browser waiting screen.

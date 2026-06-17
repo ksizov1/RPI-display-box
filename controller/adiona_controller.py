@@ -34,12 +34,23 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONF_PATH = os.environ.get("ADIONA_CONF", "/etc/adiona/box.conf")
 WEB_DIR = os.environ.get("ADIONA_WEB_DIR", "/opt/adiona/web")
 SSID_FILE = os.environ.get("ADIONA_SSID_FILE", "/etc/adiona/ssid")
+VERSION_FILE = os.environ.get("ADIONA_VERSION_FILE", "/opt/adiona/VERSION")
 
 # Dev fallbacks so the controller runs from a checkout on a workstation.
 if not os.path.exists(CONF_PATH):
     CONF_PATH = os.path.join(HERE, "..", "config", "box.conf")
 if not os.path.isdir(WEB_DIR):
     WEB_DIR = os.path.join(HERE, "..", "web")
+if not os.path.exists(VERSION_FILE):
+    VERSION_FILE = os.path.join(HERE, "..", "VERSION")
+
+
+def read_version():
+    try:
+        with open(VERSION_FILE) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
 
 
 def load_conf(path):
@@ -83,6 +94,7 @@ STATE = {
     "uplink": {"ethernet": None, "internet": None},
     "cast_port": CAST_PORT,
     "fps": STREAM_FPS,
+    "version": read_version(),
 }
 
 
@@ -183,8 +195,34 @@ def scan_casters(candidates):
     return active
 
 
-# ── Uplink (Ethernet + internet) ─────────────────────────────────────────────
+# ── Uplink (Ethernet / Wi-Fi client) + internet ──────────────────────────────
 _internet_cache = {"ok": None, "at": 0.0}
+AP_CON = "Adiona-AP"
+
+
+def run_nmcli(args, timeout=15):
+    """Run nmcli with an ARGUMENT LIST (never a shell string), so user-supplied
+    SSID/password are passed as argv and can't be injected. Returns (rc, out, err)."""
+    try:
+        p = subprocess.run(["nmcli"] + list(args), capture_output=True,
+                           text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, "", str(e)
+
+
+def _nmcli_split(line):
+    """Split one `nmcli -t` line on unescaped ':' and unescape '\\:' / '\\\\'."""
+    out, cur, i = [], "", 0
+    while i < len(line):
+        c = line[i]
+        if c == "\\" and i + 1 < len(line):
+            cur += line[i + 1]; i += 2; continue
+        if c == ":":
+            out.append(cur); cur = ""; i += 1; continue
+        cur += c; i += 1
+    out.append(cur)
+    return out
 
 
 def ethernet_up():
@@ -195,10 +233,34 @@ def ethernet_up():
         return None
 
 
-def internet_ok(eth):
-    """Throttled reachability probe. Skipped (→ False) when Ethernet is down."""
+def wifi_uplink_iface():
+    """The Wi-Fi *client* interface (USB adapter) used for the internet uplink: a
+    wifi device that is neither the AP (wlan0) nor a p2p device. None if absent."""
+    rc, out, _ = run_nmcli(["-t", "-f", "DEVICE,TYPE", "dev", "status"])
+    for line in out.splitlines():
+        p = _nmcli_split(line)
+        if len(p) >= 2 and p[1] == "wifi" and p[0] != AP_IFACE and not p[0].startswith("p2p"):
+            return p[0]
+    return None
+
+
+def default_route_dev():
+    try:
+        out = subprocess.run(["ip", "route", "show", "default"],
+                             capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            toks = line.split()
+            if "dev" in toks:
+                return toks[toks.index("dev") + 1]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def internet_ok():
+    """Throttled reachability probe; → False when there is no default route."""
     now = time.monotonic()
-    if eth is not True:
+    if default_route_dev() is None:
         _internet_cache.update(ok=False, at=now)
         return False
     if now - _internet_cache["at"] < INTERNET_CHECK_INTERVAL and _internet_cache["ok"] is not None:
@@ -213,6 +275,93 @@ def internet_ok(eth):
             continue
     _internet_cache.update(ok=ok, at=now)
     return ok
+
+
+def uplink_status():
+    """Internet-uplink summary for the waiting-screen status line."""
+    up_if = wifi_uplink_iface()
+    wifi_ssid = None
+    if up_if:
+        rc, out, _ = run_nmcli(["-t", "-f", "GENERAL.CONNECTION", "dev", "show", up_if])
+        for line in out.splitlines():
+            if line.startswith("GENERAL.CONNECTION:"):
+                val = line.split(":", 1)[1].strip()
+                if val and val != "--":
+                    wifi_ssid = val
+    route = default_route_dev()
+    via = "ethernet" if route == UPLINK_IFACE else ("wifi" if route and route == up_if else None)
+    return {
+        "ethernet": ethernet_up(),
+        "wifi_present": up_if is not None,
+        "wifi_ssid": wifi_ssid,
+        "via": via,
+        "internet": internet_ok(),
+    }
+
+
+# ── Wi-Fi client setup (the on-screen overlay talks to these) ─────────────────
+def wifi_info(do_rescan=False):
+    """Status + saved + nearby networks for the uplink Wi-Fi adapter."""
+    up = wifi_uplink_iface()
+    info = {"present": up is not None, "iface": up, "state": None,
+            "ssid": None, "saved": [], "scan": []}
+    if not up:
+        return info
+    if do_rescan:
+        run_nmcli(["dev", "wifi", "rescan", "ifname", up], timeout=20)
+
+    rc, out, _ = run_nmcli(["-t", "-f", "DEVICE,STATE,CONNECTION", "dev", "status"])
+    for line in out.splitlines():
+        p = _nmcli_split(line)
+        if len(p) >= 3 and p[0] == up:
+            info["state"] = p[1]
+            if p[1] == "connected" and p[2] != "--":
+                info["ssid"] = p[2]
+
+    rc, out, _ = run_nmcli(["-t", "-f", "NAME,TYPE", "con", "show"])
+    for line in out.splitlines():
+        p = _nmcli_split(line)
+        if len(p) >= 2 and p[1] == "802-11-wireless" and p[0] != AP_CON:
+            info["saved"].append(p[0])
+
+    ap_ssid = read_ssid()
+    rc, out, _ = run_nmcli(["-t", "-f", "SSID,SIGNAL,SECURITY", "dev", "wifi", "list", "ifname", up])
+    seen = {}
+    for line in out.splitlines():
+        c = _nmcli_split(line)
+        ssid = c[0] if c else ""
+        if not ssid or ssid == ap_ssid:
+            continue
+        sig = int(c[1]) if len(c) > 1 and c[1].isdigit() else 0
+        sec = c[2] if len(c) > 2 else ""
+        if ssid not in seen or sig > seen[ssid]["signal"]:
+            seen[ssid] = {"ssid": ssid, "signal": sig, "secure": bool(sec and sec != "")}
+    info["scan"] = sorted(seen.values(), key=lambda x: -x["signal"])
+    return info
+
+
+def wifi_connect(ssid, password):
+    """Join (and save, autoconnect) a network on the uplink adapter."""
+    up = wifi_uplink_iface()
+    if not up:
+        return {"ok": False, "message": "No Wi-Fi adapter present"}
+    if not ssid:
+        return {"ok": False, "message": "SSID required"}
+    args = ["-w", "25", "dev", "wifi", "connect", ssid]
+    if password:
+        args += ["password", password]
+    args += ["ifname", up]
+    rc, out, err = run_nmcli(args, timeout=35)
+    text = (out or err).strip()
+    msg = text.splitlines()[-1] if text else ("Connected" if rc == 0 else "Failed")
+    return {"ok": rc == 0, "message": msg}
+
+
+def wifi_forget(ssid):
+    if not ssid:
+        return {"ok": False, "message": "SSID required"}
+    rc, out, err = run_nmcli(["con", "delete", ssid], timeout=15)
+    return {"ok": rc == 0, "message": (out or err).strip() or ("Removed" if rc == 0 else "Failed")}
 
 
 # ── Selection loop ───────────────────────────────────────────────────────────
@@ -259,13 +408,12 @@ def selection_loop():
             mode = "waiting"
 
         target = mac_to_ip.get(current_mac) if current_mac else None
-        eth = ethernet_up()
         with LOCK:
             STATE["mode"] = mode
             STATE["target"] = target
             STATE["target_name"] = mac_to_host.get(current_mac) if current_mac else None
             STATE["ssid"] = read_ssid()
-            STATE["uplink"] = {"ethernet": eth, "internet": internet_ok(eth)}
+            STATE["uplink"] = uplink_status()
 
         time.sleep(SCAN_INTERVAL)
 
@@ -292,6 +440,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps(STATE).encode("utf-8")
             self._send(200, body, "application/json")
             return
+        if path == "/wifi":
+            self._send(200, json.dumps(wifi_info()).encode("utf-8"), "application/json")
+            return
         # Serve any asset in WEB_DIR (index.html, jmuxer.js, splash.png, …).
         # basename() strips directories, so there's no path traversal.
         name = "index.html" if path == "/" else os.path.basename(path)
@@ -305,6 +456,29 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, b"not found", "text/plain")
             return
         self._send(404, b"not found", "text/plain")
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path != "/wifi":
+            self._send(404, b"not found", "text/plain")
+            return
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            data = json.loads(self.rfile.read(n) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            self._send(400, b'{"ok":false,"message":"bad request"}', "application/json")
+            return
+        action = data.get("action")
+        if action == "connect":
+            res = wifi_connect(str(data.get("ssid", "")).strip(), str(data.get("password", "")))
+        elif action == "forget":
+            res = wifi_forget(str(data.get("ssid", "")).strip())
+        elif action == "rescan":
+            wifi_info(do_rescan=True)
+            res = {"ok": True, "message": "rescanned"}
+        else:
+            res = {"ok": False, "message": "unknown action"}
+        self._send(200, json.dumps(res).encode("utf-8"), "application/json")
 
 
 def main():

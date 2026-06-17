@@ -1,7 +1,11 @@
-# Adiona-TV kiosk: ignore pointer devices so the Wayland compositor never draws a
-# mouse cursor on screen. Keyboards are unaffected, so the Ctrl+Alt+F2 maintenance
-# shell still works. Production boxes have no mouse anyway, and the kiosk has
-# nothing clickable.
-ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_MOUSE}=="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
-ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_TOUCHPAD}=="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
-ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_POINTINGSTICK}=="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+# Adiona-TV kiosk: ignore pure pointer devices so the Wayland compositor never
+# draws a mouse cursor on screen. A device that is ALSO a keyboard (combo
+# keyboard+trackpad on a single node) is NOT ignored — otherwise the keyboard
+# would die with it, breaking the Wi-Fi setup overlay and the Ctrl+Alt+F2 shell.
+#
+# Net effect: with no input device (normal event use) there is no cursor; a plain
+# mouse is ignored (still no cursor); a combo keyboard keeps working but its
+# pointer is active, so a cursor appears while that keyboard is plugged in.
+ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_MOUSE}=="1", ENV{ID_INPUT_KEYBOARD}!="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_TOUCHPAD}=="1", ENV{ID_INPUT_KEYBOARD}!="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_POINTINGSTICK}=="1", ENV{ID_INPUT_KEYBOARD}!="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"

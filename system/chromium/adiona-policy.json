@@ -1,0 +1,9 @@
+{
+  "_comment": "Managed Chromium policy for the kiosk. Disables the password-manager and autofill prompts (the 'Save password?' bubble can't be dismissed in --kiosk with no mouse), and turns off sign-in/metrics.",
+  "PasswordManagerEnabled": false,
+  "AutofillAddressEnabled": false,
+  "AutofillCreditCardEnabled": false,
+  "PasswordLeakDetectionEnabled": false,
+  "BrowserSignin": 0,
+  "MetricsReportingEnabled": false
+}
