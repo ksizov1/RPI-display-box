@@ -16,7 +16,9 @@ install -m 0644 files/payload/config/box.conf "${ROOTFS_DIR}/etc/adiona/box.conf
 install -m 0644 files/payload/VERSION "${ROOTFS_DIR}/opt/adiona/VERSION"
 
 chmod +x "${ROOTFS_DIR}/opt/adiona/first-boot/adiona-firstboot.sh" \
-         "${ROOTFS_DIR}/opt/adiona/kiosk/cage-chromium.sh"
+         "${ROOTFS_DIR}/opt/adiona/kiosk/cage-session.sh" \
+         "${ROOTFS_DIR}/opt/adiona/kiosk/kiosk-session.sh" \
+         "${ROOTFS_DIR}/opt/adiona/kiosk/adiona-player.sh"
 
 # systemd units
 install -m 0644 files/payload/system/controller/adiona-controller.service \

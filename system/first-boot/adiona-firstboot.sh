@@ -21,6 +21,7 @@ log() { echo "[adiona-firstboot] $*"; }
 [ -f "$CONF" ] && source "$CONF"
 SSID_PREFIX="${SSID_PREFIX:-Adiona-TV}"
 WIFI_PASSPHRASE="${WIFI_PASSPHRASE:-adiona-drive}"
+WIFI_BAND="${WIFI_BAND:-bg}"
 WIFI_CHANNEL="${WIFI_CHANNEL:-6}"
 WIFI_COUNTRY="${WIFI_COUNTRY:-US}"
 AP_CIDR="${AP_CIDR:-192.168.50.1/24}"
@@ -74,7 +75,7 @@ nmcli con modify "$AP_CON" \
     connection.autoconnect-priority 100 \
     802-11-wireless.ssid "$SSID" \
     802-11-wireless.mode ap \
-    802-11-wireless.band bg \
+    802-11-wireless.band "$WIFI_BAND" \
     802-11-wireless.channel "$WIFI_CHANNEL" \
     802-11-wireless-security.key-mgmt wpa-psk \
     802-11-wireless-security.proto rsn \

@@ -8,16 +8,15 @@
   html, body { margin: 0; height: 100%; background: #fff; overflow: hidden; cursor: none;
                font-family: system-ui, "DejaVu Sans", sans-serif; }
   input, button, select, textarea { font-family: inherit; }
-  #v { width: 100%; height: 100%; object-fit: contain; background: #000; display: block; }
 
-  /* Non-live screen: the marketing splash fills the display (white letterboxing
-     on non-16:9 screens), with all service status confined to the bottom band.
-     Fully hidden whenever a stream is playing, so a livestream is never covered. */
+  /* This page is the NON-LIVE screen only. Video is played natively by
+     adiona-player.sh (GStreamer), which maps a Wayland surface on top of this
+     one while a headset is casting — so there is no <video> here, and nothing to
+     hide: when the stream is up, the player simply covers this page. */
   #overlay {
     position: fixed; inset: 0;
     background: #fff url("splash.png") top center / contain no-repeat;
   }
-  #overlay.hidden { display: none; }
 
   /* Bottom ~20% status band — dark text on a translucent white panel so it stays
      legible over the white splash. */
@@ -79,8 +78,6 @@
 </style>
 </head>
 <body>
-<video id="v" autoplay muted playsinline></video>
-
 <div id="overlay">
   <div id="statusbar">
     <div id="title">Waiting for a headset…</div>
@@ -117,18 +114,10 @@
   </div>
 </div>
 
-<script src="jmuxer.js"></script>
 <script>
 (function () {
   "use strict";
 
-  // ── Config from the controller (filled by /state) ─────────────────────────
-  var castPort = 8080;
-  var fps = 15;
-
-  // ── Stream plumbing (mirrors Adiona-G cast_index.html) ────────────────────
-  var SNAP_LAG = 1.0, SOFT_LAG = 0.3;
-  var video = document.getElementById("v");
   var overlay = document.getElementById("overlay");
   var elTitle = document.getElementById("title");
   var elSub = document.getElementById("sub");
@@ -136,95 +125,8 @@
   var elUplink = document.getElementById("uplink");
   var elVersion = document.getElementById("version");
 
-  var ws = null, jmuxer = null, pending = [], lastFeedMs = 0;
-  var connectedHost = null;          // headset IP the WS is currently bound to
-  var wsRetryTimer = null, wsOpenTimer = null;
-  var haveFrame = false;             // a decoded frame has arrived for this target
-  var lastNaluMs = 0;                // arrival time of the last NAL (frames flowing?)
-  var lastVideoTime = -1, lastAdvanceMs = 0;   // playback-progress watchdog
   var state = { mode: "waiting", target: null, target_name: null,
-                ssid: "", passphrase: "", uplink: {}, cast_port: 8080, fps: 15 };
-
-  function nalType(u8) { return u8.length > 4 ? (u8[4] & 0x1f) : 0; }
-  function concat(parts) {
-    var total = 0, i;
-    for (i = 0; i < parts.length; i++) total += parts[i].length;
-    var out = new Uint8Array(total), off = 0;
-    for (i = 0; i < parts.length; i++) { out.set(parts[i], off); off += parts[i].length; }
-    return out;
-  }
-  function makeMuxer() {
-    return new JMuxer({
-      node: "v", mode: "video", fps: fps, flushingTime: 50, clearBuffer: true,
-      onError: function (e) { console.warn("jmuxer error", e); }
-    });
-  }
-  // Feed jmuxer one COMPLETE access unit at a time (SPS/PPS/SEI buffered and
-  // prepended to the next VCL NAL), using real inter-arrival durations so the
-  // live-edge timeline can't drift. Identical strategy to the headset's page.
-  function onNalu(u8) {
-    lastNaluMs = performance.now();
-    if (!jmuxer) jmuxer = makeMuxer();
-    var t = nalType(u8);
-    pending.push(u8);
-    if (t >= 1 && t <= 5) {
-      var now = performance.now();
-      var dur = lastFeedMs ? Math.max(1, now - lastFeedMs) : (1000 / fps);
-      lastFeedMs = now;
-      jmuxer.feed({ video: concat(pending), duration: dur });
-      pending = [];
-      if (video.paused) video.play().catch(function () {});
-      if (!haveFrame) { haveFrame = true; renderOverlay(); }  // first frame → reveal video
-    }
-  }
-
-  // Full reset — only when switching to a DIFFERENT headset (or to none). NOT on
-  // a mere stream pause, so the last frame stays frozen on screen.
-  function teardownStream() {
-    if (wsRetryTimer) { clearTimeout(wsRetryTimer); wsRetryTimer = null; }
-    if (wsOpenTimer) { clearTimeout(wsOpenTimer); wsOpenTimer = null; }
-    if (ws) { try { ws.onclose = null; ws.close(); } catch (e) {} ws = null; }
-    if (jmuxer) { try { jmuxer.destroy(); } catch (e) {} jmuxer = null; }
-    pending = []; lastFeedMs = 0; haveFrame = false;
-  }
-
-  function connectWs(host) {
-    if (!host) return;
-    ws = new WebSocket("ws://" + host + ":" + castPort + "/stream");
-    ws.binaryType = "arraybuffer";
-    var thisWs = ws;
-    // The headset can be associated to Wi-Fi yet have its :8080 frozen (off-head
-    // / app backgrounded), where a TCP connect would otherwise hang on the long
-    // OS timeout. Bail after 6 s so we retry quickly once it's reachable again.
-    if (wsOpenTimer) clearTimeout(wsOpenTimer);
-    wsOpenTimer = setTimeout(function () {
-      if (thisWs && thisWs.readyState === 0) { try { thisWs.close(); } catch (e) {} }
-    }, 6000);
-    ws.onopen = function () { if (wsOpenTimer) { clearTimeout(wsOpenTimer); wsOpenTimer = null; } };
-    ws.onmessage = function (ev) { onNalu(new Uint8Array(ev.data)); };
-    ws.onclose = function () {
-      ws = null;
-      if (wsOpenTimer) { clearTimeout(wsOpenTimer); wsOpenTimer = null; }
-      // Keep jmuxer and the last decoded frame ON SCREEN — the headset is still
-      // on the network, it just paused casting. Reconnect silently; when frames
-      // resume the picture moves again, with no "waiting" flash in between.
-      pending = []; lastFeedMs = 0;
-      if (connectedHost === host) {
-        wsRetryTimer = setTimeout(function () { connectWs(host); }, 1000);
-      }
-    };
-    ws.onerror = function () { try { thisWs.close(); } catch (e) {} };
-  }
-
-  // Re-bind the WebSocket whenever the controller points us at a different
-  // headset (or at none). The controller owns selection; the page just follows.
-  function reconcileTarget() {
-    var host = state.target;
-    if (host === connectedHost) return;
-    teardownStream();
-    connectedHost = host;
-    if (host) connectWs(host);
-  }
+                ssid: "", passphrase: "", uplink: {} };
 
   // ── Overlay ───────────────────────────────────────────────────────────────
   function dot(stateStr) {
@@ -232,16 +134,14 @@
     return '<span class="dot ' + cls + '"></span>';
   }
 
-  // The splash overlay is gated on NETWORK PRESENCE, not on frame flow. The
-  // controller sets `target` only while a headset is associated to the AP, so:
-  //   • headset present + a frame seen  → hide overlay (show video; a paused
-  //     stream simply freezes on the last frame — no flash to "waiting").
-  //   • headset present, no frame yet   → "Connecting…" (brief, first connect).
-  //   • no headset on the network       → the waiting splash with join info.
+  // This page only ever draws the non-live screen; the native player covers it
+  // once video is flowing. So there is nothing to hide here — the two states are:
+  //   • headset present  → "Connecting…" (visible only in the moment before the
+  //     player maps its surface; if it lingers, the player failed to start and
+  //     this message is the diagnostic).
+  //   • no headset       → the waiting splash with join info.
   function renderOverlay() {
     var present = !!state.target;
-    if (present && haveFrame) { overlay.classList.add("hidden"); return; }
-    overlay.classList.remove("hidden");
 
     if (present) {
       elTitle.textContent = "Connecting…";
@@ -271,44 +171,12 @@
   function esc(s) { return String(s).replace(/[&<>"]/g, function (c) {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
 
-  // Playback watchdog + live-edge catch-up (250 ms cadence).
-  setInterval(function () {
-    var now = performance.now();
-    var framesFlowing = (now - lastNaluMs) < 1500;
-
-    // Stall recovery: if NALs are arriving but the picture isn't advancing for a
-    // few seconds, the decode pipeline is wedged (common after a long pause and
-    // reconnect) — rebuild jmuxer so the resumed stream actually renders. When no
-    // frames are flowing we just hold the frozen frame (don't touch anything).
-    if (jmuxer && haveFrame && framesFlowing) {
-      if (video.buffered.length && video.currentTime !== lastVideoTime) {
-        lastVideoTime = video.currentTime; lastAdvanceMs = now;
-      } else if (lastAdvanceMs && (now - lastAdvanceMs) > 2500) {
-        try { jmuxer.destroy(); } catch (e) {}
-        jmuxer = null; pending = []; lastFeedMs = 0; lastAdvanceMs = now;
-      }
-    } else {
-      lastVideoTime = video.currentTime; lastAdvanceMs = now;
-    }
-
-    if (video.buffered.length) {
-      var live = video.buffered.end(video.buffered.length - 1);
-      var lag = live - video.currentTime;
-      if (lag > SNAP_LAG) { video.currentTime = live - 0.05; video.playbackRate = 1.0; }
-      else if (lag > SOFT_LAG) { video.playbackRate = 1.10; }
-      else { video.playbackRate = 1.0; }
-    }
-  }, 250);
-
   // ── Poll the controller for what to display ───────────────────────────────
   function poll() {
     fetch("/state", { cache: "no-store" }).then(function (r) { return r.json(); })
       .then(function (s) {
         state = s;
-        if (s.cast_port) castPort = s.cast_port;
-        if (s.fps) fps = s.fps;
         elVersion.textContent = s.version ? ("Adiona-TV v" + s.version) : "";
-        reconcileTarget();
         renderOverlay();
       })
       .catch(function () { /* controller momentarily down; keep last state */ });
@@ -426,11 +294,6 @@
     if (e.key === "w" || e.key === "W") { openWifi(); }
   });
 
-  if (!window.MediaSource) {
-    elTitle.textContent = "This display can’t play the stream";
-    elSub.textContent = "(browser missing MediaSource/H.264 support)";
-    return;
-  }
   poll();
   setInterval(poll, 1000);
 })();

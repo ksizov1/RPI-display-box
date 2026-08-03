@@ -9,7 +9,7 @@ simulator session:
 2. **Routes the headset to the internet via Ethernet** when an uplink cable is
    plugged in (NAT), so the Quest can validate its license. Works fine with no
    uplink — the LAN just stays offline.
-3. **Boots straight into a full-screen browser** that displays the headset's live
+3. **Boots straight into a full-screen video player** showing the headset's live
    stream on the HDMI screen, with no on-box controls.
 
 There is **nothing to type at show time**: power on the box, power on the
@@ -19,22 +19,45 @@ headset, and the stream appears.
 
 ## How it works
 
-Adiona-G casting is a **pull model**: a casting headset runs an HTTP + WebSocket
-server on `:8080` and pushes hardware-encoded H.264 to any browser that connects;
-the browser decodes it with the bundled `jmuxer.js` (Media Source Extensions).
-See `docs/casting-receiver.md` in the Adiona-G repo. This box reuses that exact
-client — so no Adiona-G changes are needed.
+Adiona-G casting is a **push model**: a casting headset hardware-encodes H.264
+and sends it as RTP over **UDP**, unicast to this box on `:5004`. The box plays it
+natively with GStreamer.
 
-Because the Pi is the Wi-Fi access point **and** the DHCP server, it always knows
-which headsets are connected. The controller:
+UDP is the whole design, not an optimisation. For live video a frame that misses
+its moment is worthless, so the transport must be free to **drop** it. The earlier
+receiver used a browser reading the headset's WebSocket, and TCP's guarantees —
+acknowledge, retransmit, deliver in order — meant a momentary radio hiccup was
+buffered and delivered late instead of discarded. Nothing in that chain could shed
+the backlog, so every transient became permanent latency; it accumulated to tens
+of seconds over a session, punctuated by freezes. A bounded jitter buffer with
+`drop-on-latency` cannot do that: late packets are thrown away and the picture
+stays at the live edge by construction.
+
+The headset resolves this box's address itself (default route → DHCP gateway →
+`<subnet>.1`), so no pairing or configuration is involved. The stream is always
+**unicast** — never a `.255` broadcast, which an AP would re-send into the BSS at
+the 1–6 Mbps basic rate and bridge onto the Ethernet uplink.
+
+Because the Pi is the Wi-Fi access point **and** the DHCP server, it also knows
+which headsets are present. The controller:
 
 - enumerates connected devices from the DHCP lease table,
 - probes each one's `:8080` (an Adiona headset only serves there *while actively
-  casting*), and
-- picks which headset to display, exposing the decision to the kiosk page.
+  casting*) to tell casting headsets from idle ones, and
+- picks which one is the session, exposing the decision at `/state`.
 
-This sidesteps mDNS entirely — every headset defaults to the same `adiona.local`
-name, so name-based discovery is useless when more than one is around.
+The kiosk session polls `/state` and runs the video player only while a headset is
+live. This sidesteps mDNS entirely — every headset defaults to the same
+`adiona.local` name, so name-based discovery is useless when more than one is
+around.
+
+### What is on screen
+
+`cage` hosts two clients. Chromium draws the **non-live** screen — splash, join
+credentials, uplink status, and the `W`-key Wi-Fi setup overlay — and stays
+resident so switching is instant. `adiona-player.sh` maps its video surface on top
+whenever a headset is casting. (If a `cage` build won't stack them, set
+`PLAYER_OVERLAY_MODE="swap"` in `box.conf`.)
 
 ### Display rules
 
@@ -44,7 +67,8 @@ name, so name-based discovery is useless when more than one is around.
 | A headset starts casting | Its stream is shown full-screen |
 | **A second headset starts while one is live** | **Sticky session** — the live stream is never interrupted |
 | The live headset stops / disconnects | Switches to the most-recently-connected remaining caster; if none, shows "Reconnecting…" for a grace window, then "Waiting…" |
-| Stream blips | "Reconnecting…" (same as the in-app behavior) |
+| Stream pauses (headset off-head, app backgrounded) | Last frame holds on screen — no flash back to the splash |
+| Packet loss | Recovers on the next keyframe (≤ 1 s); corrupt frames are suppressed rather than shown |
 | Any network event while live | **Never shown over a running stream** — status only appears on the waiting/reconnecting screens |
 
 ## Networking
@@ -72,12 +96,14 @@ the Quest at the right network.
 
 ```
 config/box.conf        Fleet-wide settings (SSID prefix, Wi-Fi password, subnet, ports)
-web/                   Kiosk page (index.html) + vendored jmuxer.js decoder
+web/                   Non-live kiosk page (splash, status, Wi-Fi setup overlay)
 controller/            adiona_controller.py — discovery, selection, /state, page server
 system/
   network/             sysctl forwarding drop-in
   first-boot/          MAC→SSID/hostname provisioning oneshot (+ unit)
-  kiosk/               cage + Chromium launcher (+ unit)
+  kiosk/               cage-session.sh   → starts cage
+                       kiosk-session.sh  → Chromium + player supervision
+                       adiona-player.sh  → GStreamer RTP receiver (+ --probe)
   controller/          controller unit
 image/
   pi-gen/              custom pi-gen stage + build config
@@ -123,11 +149,51 @@ on the waiting screen). Set it to auto-connect. Then enable
 ## Configuration
 
 Edit `config/box.conf` **before building** to change fleet defaults — most
-importantly `WIFI_PASSPHRASE`. Also tunable: SSID prefix, Wi-Fi channel, LAN
-subnet, scan interval, and the reconnect grace period.
+importantly `WIFI_PASSPHRASE`. Also tunable: SSID prefix, Wi-Fi band/channel, LAN
+subnet, RTP port, player latency, scan interval, and the reconnect grace period.
 
 > Change `WIFI_PASSPHRASE` (and the image's default `adiona`/`adiona` login in
 > `image/pi-gen/config`) before deploying to customers.
+
+Two settings are worth a deliberate decision per venue:
+
+- **`WIFI_BAND`** — defaults to `bg` (2.4 GHz) for range. 2.4 GHz is the most
+  contended spectrum at a public event and rate-adapts down hard at distance. If
+  the headset sits within a few metres of the box, `a` (5 GHz, channel 36 or 149)
+  is usually the better link.
+- **`PLAYER_LATENCY_MS`** — how long the player waits for a late packet before
+  discarding it. 50 ms is the live-edge default; raise to 80–120 only if a weak
+  link shows stutter.
+
+---
+
+## Troubleshooting the stream
+
+**Nothing but the splash, though the headset says it's casting.** Check whether
+RTP is arriving at all:
+
+```bash
+sudo systemctl stop adiona-kiosk        # release the port
+/opt/adiona/kiosk/adiona-player.sh --probe
+sudo systemctl start adiona-kiosk
+```
+
+- *"NO PACKETS"* → the headset isn't sending here. Confirm it joined **this**
+  box's SSID, and that nothing is filtering `udp/5004` on `wlan0` (a stock
+  Raspberry Pi OS has no INPUT firewall, so this is only a factor if one was
+  added).
+- *Packets counted, but still no picture* → the player itself is failing. Run it
+  in the foreground and read the GStreamer error: `journalctl -u adiona-kiosk -f`,
+  or check that the `gstreamer1.0-libav` package is present (it provides
+  `avdec_h264`).
+
+**Video plays but the splash never gets out of the way** — this box's `cage`
+build isn't stacking the two clients. Set `PLAYER_OVERLAY_MODE="swap"` in
+`/etc/adiona/box.conf` and restart `adiona-kiosk`.
+
+**Stutter or tearing on a weak link** — raise `PLAYER_LATENCY_MS`, or move the AP
+to 5 GHz. Do not "fix" it by raising the headset's bitrate: offering the link more
+than it can carry is what causes the problem in the first place.
 
 ---
 

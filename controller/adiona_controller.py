@@ -13,7 +13,13 @@ Single-purpose background service for the headless Raspberry Pi cast box. It:
      same `adiona.local` name, so name-based discovery is useless here).
   3. Applies the sticky-session selection rule and exposes the chosen headset +
      display mode (live / reconnecting / waiting) and uplink status at /state.
-  4. Serves the kiosk page (web/index.html + jmuxer.js) on loopback for Chromium.
+     Both the kiosk page and kiosk-session.sh (which starts/stops the native RTP
+     video player) drive off that endpoint.
+  4. Serves the kiosk page (web/index.html + splash.png) on loopback for Chromium.
+
+The video itself never passes through here — the headset pushes RTP/UDP straight
+to the box and adiona-player.sh renders it. This service only decides *who* is
+the session.
 
 stdlib only — nothing to pip-install on the image.
 """
@@ -78,7 +84,6 @@ AP_PREFIX = AP_GATEWAY.rsplit(".", 1)[0] + "."          # e.g. "192.168.50."
 SCAN_INTERVAL = float(CONF.get("SCAN_INTERVAL_SECONDS", "2"))
 RECONNECT_GRACE = float(CONF.get("RECONNECT_GRACE_SECONDS", "20"))
 PASSPHRASE = CONF.get("WIFI_PASSPHRASE", "")
-STREAM_FPS = 15                                         # CastingPlugin FPS (fixed)
 PROBE_TIMEOUT = 0.6
 UPLINK_IFACE = "eth0"
 INTERNET_CHECK_INTERVAL = 15.0
@@ -92,8 +97,6 @@ STATE = {
     "ssid": "",
     "passphrase": PASSPHRASE,
     "uplink": {"ethernet": None, "internet": None},
-    "cast_port": CAST_PORT,
-    "fps": STREAM_FPS,
     "version": read_version(),
 }
 
@@ -443,7 +446,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/wifi":
             self._send(200, json.dumps(wifi_info()).encode("utf-8"), "application/json")
             return
-        # Serve any asset in WEB_DIR (index.html, jmuxer.js, splash.png, …).
+        # Serve any asset in WEB_DIR (index.html, splash.png, …).
         # basename() strips directories, so there's no path traversal.
         name = "index.html" if path == "/" else os.path.basename(path)
         fpath = os.path.join(WEB_DIR, name)

@@ -1,5 +1,5 @@
 [Unit]
-Description=Adiona-TV kiosk display (cage + Chromium)
+Description=Adiona-TV kiosk display (cage + Chromium splash + RTP video player)
 After=adiona-controller.service systemd-user-sessions.service
 Wants=adiona-controller.service
 ConditionPathExists=/dev/tty1
@@ -21,7 +21,7 @@ UtmpMode=user
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=XDG_SESSION_TYPE=wayland
 Environment=WLR_LIBINPUT_NO_DEVICES=1
-ExecStart=/opt/adiona/kiosk/cage-chromium.sh
+ExecStart=/opt/adiona/kiosk/cage-session.sh
 Restart=always
 RestartSec=3
 
