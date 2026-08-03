@@ -116,6 +116,9 @@ image/
 
 ## Building the image
 
+> For the full deployment runbook — hot-deploying to a running box over SSH,
+> flashing cards, and verifying the stream end to end — see **[DEPLOY.md](DEPLOY.md)**.
+
 ### Option A — GitHub Actions (recommended, no local tooling)
 
 Push this repo to GitHub, open the **Actions** tab, run **Build Adiona-TV image**
@@ -196,6 +199,48 @@ to 5 GHz. Do not "fix" it by raising the headset's bitrate: offering the link mo
 than it can carry is what causes the problem in the first place.
 
 ---
+
+## Live deploy to a running box
+
+Flashing a card per change is not an iteration loop. `tools/deploy.ps1` pushes the
+working tree to a box that is already provisioned and reachable on its Ethernet
+uplink, replaying the same repo→box file mapping the image build performs, then
+restarts the services. Run it from Windows PowerShell:
+
+```powershell
+.\tools\deploy.ps1                          # push everything, restart both services
+.\tools\deploy.ps1 -Box 192.168.1.155       # or set $env:ADIONA_BOX / $env:ADIONA_USER
+.\tools\deploy.ps1 -Packages -Logs 60       # after a change that adds a dependency
+.\tools\deploy.ps1 -Restart controller -NoConf   # keep the box's own box.conf tuning
+.\tools\deploy.ps1 -Status                  # what is this box running right now?
+.\tools\deploy.ps1 -Probe                   # is RTP actually arriving? (kiosk stopped)
+.\tools\deploy.ps1 -DryRun                  # show the plan, send nothing
+```
+
+`Get-Help .\tools\deploy.ps1 -Full` documents every switch. It needs only
+`ssh.exe` and `tar.exe` (both ship with Windows 10/11) plus passwordless `sudo` on
+the box, and it stamps `/etc/adiona/.deployed` with the version, commit and dirty
+flag it pushed — so a box never has to be guessed at later.
+
+A deploy is a single SSH connection: the payload tarball carries the install
+script inside it and is fed to `ssh` on stdin. Use key-based auth if you iterate
+often — trixie's `PerSourcePenalties` blocks a source that reconnects rapidly, and
+password auth means one prompt per connection.
+
+Three classes of change it cannot carry, by design:
+
+- **New packages.** A file sync leaves the box unable to run the new code (the
+  RTP switch added five GStreamer packages). Pass `-Packages`; it installs
+  whatever is missing from the image's `00-packages`.
+- **Wi-Fi AP settings.** `SSID_PREFIX`, `WIFI_BAND`, `WIFI_CHANNEL` and
+  `WIFI_PASSPHRASE` are consumed once, when first boot builds the NetworkManager
+  AP profile. Pass `-FirstBoot` to rebuild it (SSID and hostname are MAC-derived,
+  so they do not change).
+- **Boot-level changes** — `cmdline.txt`, `config.txt`, Plymouth theme
+  registration, service enablement. Reflash for those.
+
+Deploy is for iteration; the image is the release. Anything validated this way
+still has to land in the repo and be flashed before it counts as shipped.
 
 ## Developing / testing the controller
 

@@ -1,0 +1,372 @@
+<#
+.SYNOPSIS
+    Live-deploy this working tree to a running Adiona-TV box over SSH.
+
+.DESCRIPTION
+    The ITERATION path, not the release path. A release is a flashed image
+    (image/build-image.sh or the GitHub Actions build); this script replays the
+    same repo -> box file mapping that
+    image/pi-gen/stage-adiona/00-install/01-run.sh performs at build time, onto a
+    box that is already provisioned and reachable on its Ethernet uplink. Keep
+    the two in step: if 01-run.sh grows a file, add it here.
+
+    What it deliberately does NOT do (reflash instead):
+      * kernel cmdline / config.txt, Plymouth theme registration, service
+        enablement, the tty1 getty mask - all boot-level, all already done on a
+        provisioned box.
+      * Wi-Fi AP settings. SSID_PREFIX / WIFI_BAND / WIFI_CHANNEL /
+        WIFI_PASSPHRASE are consumed ONCE, when first-boot creates the
+        NetworkManager AP profile. Use -FirstBoot to re-run that provisioning.
+
+    Debian trixie's sshd has PerSourcePenalties: a burst of connections gets the
+    source address temporarily blocked. So a deploy is ONE ssh connection - the
+    payload tarball (which carries the install script inside it) is fed to ssh on
+    stdin. Only -Status / -Probe / -Logs / -Follow open a second one.
+
+    Requires ssh.exe and tar.exe (both ship with Windows 10/11) and passwordless
+    sudo on the box. Key-based SSH auth is strongly recommended: one deploy is
+    one password prompt, and -Logs/-Follow add another.
+
+.PARAMETER Box
+    Target hostname or IP. Defaults to $env:ADIONA_BOX, else adiona-tv-6ced.local.
+
+.PARAMETER User
+    SSH login. Defaults to $env:ADIONA_USER, else adionauser.
+
+.PARAMETER NoConf
+    Leave /etc/adiona/box.conf alone, preserving tuning done on the box.
+
+.PARAMETER Packages
+    Install any packages from the image's 00-packages list that the box is
+    missing. REQUIRED after a change that adds a dependency - a file sync alone
+    leaves the box unable to run the new code.
+
+.PARAMETER FirstBoot
+    Re-run first-boot provisioning, rebuilding the Wi-Fi AP profile from
+    box.conf. SSID and hostname are MAC-derived, so they do not change.
+
+.PARAMETER Restart
+    Which services to restart afterwards: both (default), controller, kiosk, none.
+
+.PARAMETER Logs
+    After deploying, tail this many journal lines from both units. E.g. -Logs 60.
+
+.PARAMETER Follow
+    After deploying, follow the journal until Ctrl-C.
+
+.PARAMETER Status
+    Report what the box is running and exit. No deploy.
+
+.PARAMETER Probe
+    Stop the kiosk, run adiona-player.sh --probe (is RTP arriving at all?), then
+    restart the kiosk. No deploy.
+
+.PARAMETER DryRun
+    Show the plan - target, stamp, payload, remote arguments - and send nothing.
+
+.EXAMPLE
+    .\tools\deploy.ps1
+    Push everything and restart both services.
+
+.EXAMPLE
+    .\tools\deploy.ps1 -Packages -Logs 60
+    First deploy after a change that adds a dependency, then show the journal.
+
+.EXAMPLE
+    .\tools\deploy.ps1 -Restart controller -NoConf
+    Web/controller iteration that keeps the box's own box.conf tuning.
+
+.EXAMPLE
+    .\tools\deploy.ps1 -Box 192.168.1.155 -Status
+    Ask a specific box what it is running.
+#>
+
+[CmdletBinding()]
+param(
+    [string] $Box = $(if ($env:ADIONA_BOX) { $env:ADIONA_BOX } else { 'adiona-tv-6ced.local' }),
+    [string] $User = $(if ($env:ADIONA_USER) { $env:ADIONA_USER } else { 'adionauser' }),
+    [switch] $NoConf,
+    [switch] $Packages,
+    [switch] $FirstBoot,
+    [ValidateSet('both', 'controller', 'kiosk', 'none')]
+    [string] $Restart = 'both',
+    [int]    $Logs = 0,
+    [switch] $Follow,
+    [switch] $Status,
+    [switch] $Probe,
+    [switch] $DryRun
+)
+
+$ErrorActionPreference = 'Stop'
+$Root = Split-Path -Parent $PSScriptRoot
+$Target = "$User@$Box"
+# BatchMode is left off on purpose: password auth is a legitimate way in here.
+$SshOpts = @('-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new')
+
+function Say  { param([string] $Message) Write-Host "==> $Message" -ForegroundColor Cyan }
+function Fail { param([string] $Message) Write-Host "deploy: $Message" -ForegroundColor Red; exit 1 }
+
+function Get-Tool {
+    param([string] $Name)
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+    if (-not $cmd) { Fail "$Name not found on PATH (ships with Windows 10/11; install OpenSSH Client if missing)" }
+    return $cmd.Source
+}
+
+# ---------------------------------------------------------------------------
+# Debug-only modes. One connection each, no file transfer, so they are safe to
+# run against a box mid-session.
+# ---------------------------------------------------------------------------
+
+$StatusCmd = @'
+echo "--- identity ---"; echo "hostname: $(hostname)   ssid: $(cat /etc/adiona/ssid 2>/dev/null || echo ?)"; echo "image VERSION: $(cat /opt/adiona/VERSION 2>/dev/null || echo ?)"; echo "last live deploy: $(cat /etc/adiona/.deployed 2>/dev/null || echo none - running the flashed image)"; echo "uptime:$(uptime -p | sed s/^up//)"; echo "--- services ---"; for u in adiona-controller adiona-kiosk; do printf "%-20s %s\n" $u $(systemctl is-active $u); done; echo "--- controller /state ---"; curl -s --max-time 3 http://127.0.0.1:8090/state || echo "(no answer on :8090)"; echo; echo "--- wifi ---"; echo "associated stations: $(iw dev wlan0 station dump 2>/dev/null | grep -c ^Station)"
+'@ -replace "`r`n", ' '
+
+$ProbeCmd = @'
+sudo systemctl stop adiona-kiosk; rc=0; /opt/adiona/kiosk/adiona-player.sh --probe || rc=$?; sudo systemctl start adiona-kiosk; exit $rc
+'@ -replace "`r`n", ' '
+
+$ssh = Get-Tool 'ssh.exe'
+
+if ($Status) {
+    Say "status of $Target"
+    & $ssh @SshOpts $Target $StatusCmd
+    exit $LASTEXITCODE
+}
+
+if ($Probe) {
+    Say "probing RTP on $Target (kiosk stopped for the duration)"
+    & $ssh '-t' @SshOpts $Target $ProbeCmd
+    exit $LASTEXITCODE
+}
+
+# ---------------------------------------------------------------------------
+# The remote half. Mirrors 01-run.sh. Travels inside the tarball rather than on
+# the command line, which keeps the ssh invocation short and quoting-free.
+# ---------------------------------------------------------------------------
+
+$InstallSh = @'
+#!/usr/bin/env bash
+# Generated by tools/deploy.ps1 - do not edit on the box; it is overwritten every
+# deploy. Mirrors image/pi-gen/stage-adiona/00-install/01-run.sh.
+set -euo pipefail
+SRC="$(cd "$(dirname "$0")" && pwd)"
+PUSH_CONF=1 DO_PACKAGES=0 DO_FIRSTBOOT=0 RESTART=both STAMP=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--no-conf)   PUSH_CONF=0 ;;
+		--packages)  DO_PACKAGES=1 ;;
+		--firstboot) DO_FIRSTBOOT=1 ;;
+		--restart)   RESTART="$2"; shift ;;
+		--stamp)     STAMP="$2"; shift ;;
+	esac
+	shift
+done
+
+sudo -n true 2>/dev/null || {
+	echo "deploy: passwordless sudo is required on the box (stdin here is the payload," >&2
+	echo "        so sudo cannot prompt). Add /etc/sudoers.d with NOPASSWD for this user." >&2
+	exit 1
+}
+
+# Packages first: new code with an unmet dependency fails at runtime, not at copy
+# time, and the failure (a black screen) looks nothing like its cause.
+if [ "$DO_PACKAGES" = 1 ]; then
+	PKGLIST="$SRC/image/pi-gen/stage-adiona/00-install/00-packages"
+	missing=()
+	while read -r pkg; do
+		[ -n "$pkg" ] || continue
+		case "$pkg" in \#*) continue ;; esac
+		dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "ok installed" || missing+=("$pkg")
+	done < "$PKGLIST"
+	if [ ${#missing[@]} -eq 0 ]; then
+		echo "  packages: all present"
+	else
+		echo "  packages: installing ${missing[*]}"
+		sudo apt-get update -qq
+		sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}"
+	fi
+fi
+
+# Payload. The directories are removed rather than overlaid so files DELETED in
+# the repo actually disappear from the box (web/jmuxer.js is the cautionary tale:
+# left behind, it is a stale copy that nothing loads and everyone greps).
+sudo rm -rf /opt/adiona/web /opt/adiona/controller /opt/adiona/first-boot /opt/adiona/kiosk
+sudo install -d /opt/adiona /etc/adiona
+sudo cp -r "$SRC/web"                "/opt/adiona/web"
+sudo cp -r "$SRC/controller"         "/opt/adiona/controller"
+sudo cp -r "$SRC/system/first-boot"  "/opt/adiona/first-boot"
+sudo cp -r "$SRC/system/kiosk"       "/opt/adiona/kiosk"
+sudo chmod +x /opt/adiona/kiosk/*.sh /opt/adiona/first-boot/*.sh
+sudo install -m 0644 "$SRC/VERSION" /opt/adiona/VERSION
+echo "  payload: /opt/adiona/{web,controller,first-boot,kiosk}"
+
+if [ "$PUSH_CONF" = 1 ]; then
+	if ! sudo diff -q /etc/adiona/box.conf "$SRC/config/box.conf" >/dev/null 2>&1; then
+		echo "  box.conf changes (on-box -> repo; previous kept as box.conf.prev):"
+		sudo diff -u /etc/adiona/box.conf "$SRC/config/box.conf" | sed 's/^/    /' || true
+		sudo cp -f /etc/adiona/box.conf /etc/adiona/box.conf.prev 2>/dev/null || true
+	fi
+	sudo install -m 0644 "$SRC/config/box.conf" /etc/adiona/box.conf
+else
+	echo "  box.conf: left as-is (--no-conf)"
+fi
+
+# Units and system drop-ins.
+sudo install -m 0644 "$SRC/system/controller/adiona-controller.service" \
+                     "$SRC/system/kiosk/adiona-kiosk.service" \
+                     "$SRC/system/first-boot/adiona-firstboot.service" /etc/systemd/system/
+sudo install -m 0644 "$SRC/system/network/99-adiona-forward.conf" /etc/sysctl.d/
+sudo install -m 0644 "$SRC/system/udev/99-adiona-no-pointer.rules" /etc/udev/rules.d/
+sudo install -d /etc/chromium/policies/managed
+sudo install -m 0644 "$SRC/system/chromium/adiona-policy.json" /etc/chromium/policies/managed/
+sudo sysctl -q -p /etc/sysctl.d/99-adiona-forward.conf || true
+sudo udevadm control --reload-rules || true   # takes effect on the next replug
+
+# Plymouth theme: files only. Registering a *different* theme needs an initramfs
+# rebuild (plymouth-set-default-theme -R) and is a reflash-class change.
+if [ -d /usr/share/plymouth/themes/adiona-tv ]; then
+	sudo install -m 0644 "$SRC/system/plymouth/adiona-tv/adiona-tv.plymouth" \
+	                     "$SRC/system/plymouth/adiona-tv/adiona-tv.script" \
+	                     /usr/share/plymouth/themes/adiona-tv/
+	sudo install -m 0644 "$SRC/web/splash.png" /usr/share/plymouth/themes/adiona-tv/splash.png
+fi
+
+printf '%s\n' "$STAMP" | sudo tee /etc/adiona/.deployed >/dev/null
+
+if [ "$DO_FIRSTBOOT" = 1 ]; then
+	echo "  first-boot: re-running provisioning (AP profile rebuilt from box.conf)"
+	sudo rm -f /etc/adiona/.firstboot-done
+	sudo systemctl start adiona-firstboot.service
+fi
+
+sudo systemctl daemon-reload
+case "$RESTART" in
+	both)       UNITS="adiona-controller adiona-kiosk" ;;
+	controller) UNITS="adiona-controller" ;;
+	kiosk)      UNITS="adiona-kiosk" ;;
+	none)       UNITS="" ;;
+esac
+if [ -n "$UNITS" ]; then
+	echo "  restarting: $UNITS"
+	# shellcheck disable=SC2086
+	sudo systemctl restart $UNITS
+	sleep 2
+	# shellcheck disable=SC2086
+	for u in $UNITS; do printf '    %-20s %s\n' "$u" "$(systemctl is-active "$u")"; done
+else
+	echo "  restart: skipped (--restart none)"
+fi
+'@
+
+# ---------------------------------------------------------------------------
+# Preflight
+# ---------------------------------------------------------------------------
+
+$tar = Get-Tool 'tar.exe'
+
+$PayloadItems = @(
+    'web'
+    'controller'
+    'system'
+    'config'
+    'VERSION'
+    'image/pi-gen/stage-adiona/00-install/00-packages'
+)
+foreach ($item in $PayloadItems) {
+    $p = Join-Path $Root ($item -replace '/', '\')
+    if (-not (Test-Path $p)) { Fail "missing from the working tree: $item" }
+}
+
+# Stamp the box with exactly what it is running - the first question every remote
+# debugging session asks, and a working tree is not a commit.
+$version = (Get-Content (Join-Path $Root 'VERSION') -TotalCount 1).Trim()
+$gitRef = 'no-git'
+$sha = & git -C $Root rev-parse --short HEAD 2>$null
+if ($LASTEXITCODE -eq 0 -and $sha) {
+    $gitRef = $sha.Trim()
+    & git -C $Root diff --quiet
+    if ($LASTEXITCODE -ne 0) { $gitRef = "$gitRef-dirty" }
+}
+$stamp = "v$version $gitRef deployed from $env:COMPUTERNAME at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+$stamp = $stamp -replace "['`"]", ''   # it rides in a single-quoted shell argument
+
+$remoteArgs = "--restart $Restart --stamp '$stamp'"
+if ($NoConf)    { $remoteArgs += ' --no-conf' }
+if ($Packages)  { $remoteArgs += ' --packages' }
+if ($FirstBoot) { $remoteArgs += ' --firstboot' }
+
+if ($DryRun) {
+    Say 'dry run - nothing sent'
+    Write-Host "  target:   $Target"
+    Write-Host "  stamp:    $stamp"
+    Write-Host "  payload:  $($PayloadItems -join ' ')"
+    Write-Host "  remote:   bash install.sh $remoteArgs"
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Stage -> tar -> one ssh connection
+# ---------------------------------------------------------------------------
+
+$stage = Join-Path ([IO.Path]::GetTempPath()) ("adiona-deploy-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+$tarball = "$stage.tgz"
+
+try {
+    Say "deploying v$version $gitRef -> $Target"
+
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    foreach ($item in $PayloadItems) {
+        $src = Join-Path $Root ($item -replace '/', '\')
+        if (Test-Path $src -PathType Container) {
+            Copy-Item $src -Destination (Join-Path $stage (Split-Path $item -Leaf)) -Recurse -Force
+        }
+        else {
+            # keep the repo-relative path so install.sh can find 00-packages where it expects
+            $dest = Join-Path $stage ($item -replace '/', '\')
+            New-Item -ItemType Directory -Path (Split-Path $dest -Parent) -Force | Out-Null
+            Copy-Item $src -Destination $dest -Force
+        }
+    }
+    Get-ChildItem $stage -Recurse -Directory -Filter '__pycache__' | Remove-Item -Recurse -Force
+
+    # install.sh must reach the Pi as LF/UTF-8-without-BOM or bash chokes on the
+    # shebang; PowerShell's default writers give neither.
+    $shText = ($InstallSh -replace "`r`n", "`n")
+    [IO.File]::WriteAllText((Join-Path $stage 'install.sh'), $shText, (New-Object Text.UTF8Encoding($false)))
+
+    & $tar '-czf' $tarball '-C' $stage '.'
+    if ($LASTEXITCODE -ne 0) { Fail "tar failed ($LASTEXITCODE)" }
+
+    $remoteCmd = "set -e; rm -rf /tmp/adiona-deploy; mkdir -p /tmp/adiona-deploy; " +
+                 "tar xzf - -C /tmp/adiona-deploy; " +
+                 "bash /tmp/adiona-deploy/install.sh $remoteArgs; " +
+                 "rm -rf /tmp/adiona-deploy"
+
+    # Start-Process, not a pipeline: Windows PowerShell reinterprets bytes flowing
+    # between native commands as text, which corrupts the gzip stream. Redirecting
+    # a file into stdin keeps it binary-clean. The password prompt (if any) still
+    # works - ssh reads it from the console, not stdin.
+    $argLine = "$($SshOpts -join ' ') $Target `"$remoteCmd`""
+    $proc = Start-Process -FilePath $ssh -ArgumentList $argLine `
+        -RedirectStandardInput $tarball -NoNewWindow -Wait -PassThru
+    if ($proc.ExitCode -ne 0) { Fail "remote install failed (exit $($proc.ExitCode))" }
+
+    Say 'done'
+}
+finally {
+    if (Test-Path $stage)   { Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $tarball) { Remove-Item $tarball -Force -ErrorAction SilentlyContinue }
+}
+
+# ---------------------------------------------------------------------------
+# Optional journal tail (second connection)
+# ---------------------------------------------------------------------------
+
+if ($Follow) {
+    Say 'following journal (Ctrl-C to stop)'
+    & $ssh '-t' @SshOpts $Target 'journalctl -u adiona-kiosk -u adiona-controller -f --no-pager -n 20'
+}
+elseif ($Logs -gt 0) {
+    & $ssh @SshOpts $Target "journalctl -u adiona-kiosk -u adiona-controller -n $Logs --no-pager"
+}

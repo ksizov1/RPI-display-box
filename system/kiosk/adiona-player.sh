@@ -20,6 +20,15 @@
 # decode remains), so avdec_h264 software-decodes. At 480–720p15 that is nothing
 # for four A76 cores.
 #
+# Debian packages providing the elements used below (see the image's 00-packages;
+# note that h264parse and waylandsink are BOTH in -bad, and that there is no
+# `gstreamer1.0-wayland` package on Trixie):
+#   udpsrc, rtpjitterbuffer, rtph264depay  gstreamer1.0-plugins-good
+#   h264parse, waylandsink                 gstreamer1.0-plugins-bad
+#   avdec_h264                             gstreamer1.0-libav
+#   videoconvert                           gstreamer1.0-plugins-base
+#   gst-launch-1.0                         gstreamer1.0-tools
+#
 # Usage:
 #   adiona-player.sh            play (runs until killed; started by kiosk-session.sh)
 #   adiona-player.sh --probe    diagnose: count arriving packets and exit

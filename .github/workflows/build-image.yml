@@ -13,8 +13,46 @@ on:
       - "v*"
 
 jobs:
+  # pi-gen only reaches our stage ~40 minutes into the build, so a single bad
+  # package name costs a whole build to discover. This resolves the name list
+  # first, in about a minute, against the same two archives the image uses.
+  preflight-packages:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve stage-adiona package names
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          # Name existence only, against plain Debian trixie — not dependency
+          # resolution. The Raspberry Pi archive publishes no amd64 index, so it
+          # can't be added on this runner; every package the image currently
+          # installs also exists in Debian, which is what makes this check valid.
+          missing=()
+          while read -r pkg; do
+            [ -n "$pkg" ] || continue
+            case "$pkg" in \#*) continue ;; esac
+            apt-cache show "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
+          done < image/pi-gen/stage-adiona/00-install/00-packages
+
+          if [ ${#missing[@]} -ne 0 ]; then
+            echo "::error::Unknown package name(s): ${missing[*]}"
+            echo
+            echo "These do not exist in Debian trixie. Either the name is wrong, or"
+            echo "the package is Raspberry-Pi-archive-only (this check can't see that"
+            echo "archive — it has no amd64 index). Verify at:"
+            echo "  https://packages.debian.org/search?searchon=contents&keywords=<file>&suite=trixie&arch=arm64"
+            echo "and if it really is Pi-only, skip it here explicitly."
+            exit 1
+          fi
+          echo "All $(grep -cve '^\s*$' image/pi-gen/stage-adiona/00-install/00-packages) package names resolve."
+
   build:
     runs-on: ubuntu-latest
+    needs: preflight-packages
     steps:
       - name: Checkout
         uses: actions/checkout@v4
