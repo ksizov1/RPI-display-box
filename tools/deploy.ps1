@@ -364,7 +364,7 @@ sudo cp -r "$SRC/web"                "/opt/adiona/web"
 sudo cp -r "$SRC/controller"         "/opt/adiona/controller"
 sudo cp -r "$SRC/system/first-boot"  "/opt/adiona/first-boot"
 sudo cp -r "$SRC/system/kiosk"       "/opt/adiona/kiosk"
-sudo chmod +x /opt/adiona/kiosk/*.sh /opt/adiona/first-boot/*.sh
+sudo chmod +x /opt/adiona/kiosk/*.sh /opt/adiona/kiosk/*.py /opt/adiona/first-boot/*.sh
 sudo install -m 0644 "$SRC/VERSION" /opt/adiona/VERSION
 echo "  payload: /opt/adiona/{web,controller,first-boot,kiosk}"
 

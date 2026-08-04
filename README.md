@@ -70,7 +70,16 @@ whenever a headset is casting. (If a `cage` build won't stack them, set
 | Stream pauses (headset off-head, app backgrounded) | Last frame holds on screen — no flash back to the splash |
 | Packet loss | Recovers on the next keyframe (≤ 1 s); corrupt frames are suppressed rather than shown |
 | Any network event while live | **Never shown over a running stream** — status only appears on the waiting/reconnecting screens |
-| Waiting screen unchanged for 3 min | **Screensaver** — the two logos and the wordmark drift around the screen. Any change on screen, or any keypress, dismisses it. Never runs over a live stream |
+| Waiting screen unchanged for 3 min | **Screensaver** — the two logos and the wordmark drift around a half-brightness screen. Any change on screen, or any keypress, dismisses it. Never runs over a live stream |
+
+> **No mouse cursor, ever.** `99-adiona-no-pointer.rules` makes libinput ignore
+> pure pointer devices, but it cannot ignore a combo keyboard+trackpad (a Logitech
+> K400) — keyboard and pointer share one event node, so dropping the device would
+> take the keyboard with it. `cage` then paints a cursor that the page cannot hide,
+> and one parked in a corner for hours is the same burn-in the screensaver exists
+> to prevent. `blank-cursor.py` generates a cursor theme made entirely of
+> transparent pixels, and `cage-session.sh` points `XCURSOR_THEME` at it. The
+> pointer still works for the overlay's click handlers; it is simply not drawn.
 
 ## Networking
 
@@ -131,7 +140,7 @@ controller/            adiona_controller.py — discovery, selection, /state, pa
 system/
   network/             sysctl forwarding drop-in
   first-boot/          MAC→SSID/hostname provisioning oneshot (+ unit)
-  kiosk/               cage-session.sh   → starts cage
+  kiosk/               cage-session.sh   → starts cage (+ blank cursor theme)
                        kiosk-session.sh  → Chromium + player supervision
                        adiona-player.sh  → GStreamer RTP receiver (+ --probe)
   controller/          controller unit

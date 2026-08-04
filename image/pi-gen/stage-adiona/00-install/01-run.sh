@@ -18,7 +18,8 @@ install -m 0644 files/payload/VERSION "${ROOTFS_DIR}/opt/adiona/VERSION"
 chmod +x "${ROOTFS_DIR}/opt/adiona/first-boot/adiona-firstboot.sh" \
          "${ROOTFS_DIR}/opt/adiona/kiosk/cage-session.sh" \
          "${ROOTFS_DIR}/opt/adiona/kiosk/kiosk-session.sh" \
-         "${ROOTFS_DIR}/opt/adiona/kiosk/adiona-player.sh"
+         "${ROOTFS_DIR}/opt/adiona/kiosk/adiona-player.sh" \
+         "${ROOTFS_DIR}/opt/adiona/kiosk/blank-cursor.py"
 
 # systemd units
 install -m 0644 files/payload/system/controller/adiona-controller.service \

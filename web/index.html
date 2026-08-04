@@ -50,18 +50,28 @@
      measured off the actual pixels (logos x764-1664 and x2104-3024, wordmark
      x360-3444 of 3840x2160), not eyeballed, so nothing clips.
 
-     Background stays white to match the splash the crops carry with them - it is
-     the moving that prevents burn-in, not the colour. */
-  #saver { position: fixed; inset: 0; background: #fff; z-index: 5; display: none; }
+     Dimmed to half brightness with a filter on the WHOLE layer, not on the tiles
+     individually: the crops carry the splash's white background with them, so
+     background and tiles must be dimmed by the identical operation or they land
+     a level apart and the tile rectangles show as seams.
+
+     mix-blend-mode: multiply then makes those white tile backgrounds vanish into
+     the backdrop (white x anything = anything), so the elements can overlap
+     without one painting a grey rectangle over another. */
+  #saver { position: fixed; inset: 0; background: #fff; z-index: 5; display: none;
+           filter: brightness(0.5); cursor: none; }
   #saver.on { display: block; }
   .sv { position: absolute; top: 0; left: 0; background-image: url("splash.png");
-        background-repeat: no-repeat; will-change: transform; }
-  /* size + crop window per element; heights preserve each source aspect ratio */
-  #sv-a   { width: 12vw;   height: 11.90vw;
+        background-repeat: no-repeat; will-change: transform;
+        mix-blend-mode: multiply; cursor: none; }
+  /* size + crop window per element; heights preserve each source aspect ratio.
+     Sized to match the wait screen, where the splash is displayed `contain` on a
+     16:9 panel so the A logo spans ~23.4vw. */
+  #sv-a   { width: 24vw;   height: 23.80vw;
             background-size: 419.22% 237.89%; background-position: 25.856% 8.945%; }
-  #sv-d2  { width: 12vw;   height: 11.64vw;
+  #sv-d2  { width: 24vw;   height: 23.28vw;
             background-size: 410.26% 237.89%; background-position: 72.178% 8.945%; }
-  #sv-txt { width: 34vw;   height: 3.33vw;
+  #sv-txt { width: 68vw;   height: 6.66vw;
             background-size: 123.87% 710.53%; background-position: 47.569% 67.457%; }
 
   /* Keyboard-driven upstream-Wi-Fi setup overlay (no mouse — arrows/Tab/Enter/Esc). */
