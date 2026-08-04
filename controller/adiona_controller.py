@@ -27,6 +27,7 @@ stdlib only — nothing to pip-install on the image.
 import json
 import mimetypes
 import os
+import re
 import socket
 import subprocess
 import threading
@@ -285,6 +286,128 @@ def harden_uplink(iface, force=False):
             pass
 
 
+# The two supported band plans. They exist as a pair because the constraint is
+# that the AP and the uplink must never share a band (see box.conf); offering the
+# four combinations independently would let an operator pick a broken one.
+BAND_PLANS = {
+    # Default. AP on 5 GHz: it carries the video, so it gets the cleaner band and
+    # the better-proven radio. Channel 36 is non-DFS, so the beacon starts at once.
+    "ap5":  {"WIFI_BAND": "a",  "WIFI_CHANNEL": "36", "UPLINK_BAND": "bg"},
+    # Fallback for range: 2.4 GHz carries further, for a headset well away from
+    # the box. Requires an uplink dongle that can do 5 GHz.
+    "ap24": {"WIFI_BAND": "bg", "WIFI_CHANNEL": "6",  "UPLINK_BAND": "a"},
+}
+
+
+def current_band_plan():
+    return "ap24" if CONF.get("WIFI_BAND", "a") == "bg" else "ap5"
+
+
+def iface_supports_5ghz(iface):
+    """True/False if [iface] can use 5 GHz, None if it cannot be determined.
+
+    Read from the phy's actual channel list rather than assumed from the model
+    name: the same USB product id has shipped as both 2.4-only and dual-band, and
+    guessing wrong here would offer an operator a plan that cannot work.
+    """
+    if not iface:
+        return None
+    try:
+        with open("/sys/class/net/%s/phy80211/name" % iface) as fh:
+            phy = fh.read().strip()
+    except OSError:
+        return None
+    try:
+        out = subprocess.run(["iw", "phy", phy, "info"], capture_output=True,
+                             text=True, timeout=8).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        m = re.match(r"\s*\*\s*(\d{4})(?:\.\d+)?\s*MHz", line)
+        if m and 5000 <= int(m.group(1)) < 6000 and "disabled" not in line:
+            return True
+    return False
+
+
+def set_conf_values(updates):
+    """Rewrite KEY="value" lines in box.conf in place, keeping comments intact."""
+    try:
+        with open(CONF_PATH, "r") as fh:
+            lines = fh.readlines()
+    except OSError:
+        return False
+    remaining = dict(updates)
+    out = []
+    for line in lines:
+        s = line.strip()
+        if s and not s.startswith("#") and "=" in s:
+            key = s.split("=", 1)[0].strip()
+            if key in remaining:
+                out.append('%s="%s"\n' % (key, remaining.pop(key)))
+                continue
+        out.append(line)
+    for k, v in remaining.items():
+        out.append('%s="%s"\n' % (k, v))
+    tmp = CONF_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as fh:
+            fh.writelines(out)
+        os.replace(tmp, CONF_PATH)          # atomic; never a half-written config
+    except OSError:
+        return False
+    return True
+
+
+def set_band_plan(plan):
+    """Switch the AP/uplink band split and apply it live.
+
+    Drops the headset: the AP moves to a different band, so the BSS it is joined
+    to ceases to exist and it has to reassociate. Unavoidable, and the on-screen
+    UI says so before the operator commits.
+    """
+    if plan not in BAND_PLANS:
+        return {"ok": False, "message": "Unknown band plan"}
+    if plan == current_band_plan():
+        return {"ok": True, "message": "Already using that band plan"}
+
+    up = wifi_uplink_iface()
+    if plan == "ap24" and up and iface_supports_5ghz(up) is False:
+        return {"ok": False,
+                "message": "The USB adapter is 2.4 GHz only - it cannot take the uplink"}
+
+    vals = BAND_PLANS[plan]
+    if not set_conf_values(vals):
+        return {"ok": False, "message": "Could not write /etc/adiona/box.conf"}
+    CONF.update(vals)
+    global UPLINK_BAND
+    UPLINK_BAND = vals["UPLINK_BAND"]
+
+    rc, out, err = run_nmcli(["con", "modify", AP_CON,
+                              "802-11-wireless.band", vals["WIFI_BAND"],
+                              "802-11-wireless.channel", vals["WIFI_CHANNEL"]],
+                             timeout=20)
+    if rc != 0:
+        return {"ok": False, "message": (err or out).strip() or "AP update failed"}
+
+    # Re-pin saved uplink profiles to the new band BEFORE bouncing anything, so
+    # whatever reconnects comes back on the correct side of the split.
+    pin_all_uplink_profiles()
+
+    rc, out, err = run_nmcli(["-w", "30", "con", "up", AP_CON], timeout=45)
+    if rc != 0:
+        return {"ok": False,
+                "message": "Saved, but the AP did not restart: %s"
+                           % ((err or out).strip() or "unknown error")}
+
+    # Bounce the uplink so it reassociates on its new band rather than sitting on
+    # the old one until something else disturbs it. Best-effort.
+    info = wifi_info()
+    if up and info.get("ssid"):
+        run_nmcli(["-w", "25", "con", "up", info["ssid"], "ifname", up], timeout=40)
+
+    return {"ok": True, "message": "Band plan applied - reconnect the headset"}
+
+
 def pin_uplink_profile(con_name):
     """Apply the uplink policy to one saved Wi-Fi connection profile.
 
@@ -400,7 +523,12 @@ def wifi_info(do_rescan=False):
     """Status + saved + nearby networks for the uplink Wi-Fi adapter."""
     up = wifi_uplink_iface()
     info = {"present": up is not None, "iface": up, "state": None,
-            "ssid": None, "saved": [], "scan": []}
+            "ssid": None, "saved": [], "scan": [],
+            # Band plan, for the on-screen switch. uplink_5ghz is None when there
+            # is no adapter or its capability could not be read; the UI treats
+            # only an explicit False as "cannot switch".
+            "band_plan": current_band_plan(),
+            "uplink_5ghz": iface_supports_5ghz(up)}
     if not up:
         return info
     if do_rescan:
@@ -578,6 +706,8 @@ class Handler(BaseHTTPRequestHandler):
         elif action == "rescan":
             wifi_info(do_rescan=True)
             res = {"ok": True, "message": "rescanned"}
+        elif action == "band_plan":
+            res = set_band_plan(str(data.get("plan", "")).strip())
         else:
             res = {"ok": False, "message": "unknown action"}
         self._send(200, json.dumps(res).encode("utf-8"), "application/json")

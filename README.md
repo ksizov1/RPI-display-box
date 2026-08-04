@@ -96,8 +96,16 @@ better-proven radio (`brcmfmac` AP mode is the standard Pi configuration, while
 `rtw88`'s USB AP support is far less exercised) and it benefits from the cleaner
 band. The dongle does client mode, which is what USB adapters are good at.
 
-`WIFI_BAND` and `UPLINK_BAND` in `box.conf` control this, and can be swapped for
-a venue that needs 2.4 GHz range for the headset — see **Configuration**.
+`WIFI_BAND` and `UPLINK_BAND` in `box.conf` control this. For a venue that needs
+2.4 GHz range for the headset, the pairing can be swapped **on the box itself**:
+press `W`, and use the **Radio band plan** switch at the bottom of the overlay.
+
+The switch offers only the two valid pairings, never four independent band
+choices, because the one arrangement that must not happen is both radios sharing
+a band. It takes two presses (it drops the headset mid-session), and it is greyed
+out when the USB adapter cannot do 5 GHz — read from the adapter's actual channel
+list, since the same USB product id has shipped both 2.4-only and dual-band.
+Changes are written to `box.conf`, so they survive a reboot but not a reflash.
 
 ### Per-box unique name
 

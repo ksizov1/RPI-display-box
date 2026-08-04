@@ -75,6 +75,20 @@
   .wifi-btns button { font-size: 2.2vmin; padding: 1vmin 2.6vmin; border: 2px solid #c2c2c2;
                       border-radius: 1vmin; background: #f3f3f3; color: #111; }
   .wifi-msg { text-align: center; font-size: 2vmin; min-height: 2.6vmin; margin-top: 1vmin; }
+
+  /* Band plan switch. The two radios must never share a band, so this offers the
+     two valid pairings rather than four independent band choices. */
+  .wifi-band { margin: 1.5vmin 0 0.5vmin; padding-top: 1.5vmin;
+               border-top: 1px solid #e0e0e0; text-align: center; }
+  .band-label { font-size: 1.9vmin; color: #555; margin-bottom: 0.8vmin; }
+  .band-current { font-size: 2.2vmin; font-weight: 600; color: #111; margin-bottom: 1vmin; }
+  .band-current b { color: #1a73e8; }
+  #bandToggle { font-size: 2.1vmin; padding: 1vmin 2.6vmin; border: 2px solid #c2c2c2;
+                border-radius: 1vmin; background: #f3f3f3; color: #111; }
+  #bandToggle:focus { outline: none; border-color: #1a73e8; box-shadow: 0 0 0 3px rgba(26,115,232,.35); }
+  #bandToggle:disabled { color: #9aa0a6; background: #f6f6f6; border-color: #e2e2e2; }
+  .band-hint { font-size: 1.7vmin; color: #777; margin-top: 0.8vmin; min-height: 2vmin; }
+  .band-hint.warn { color: #c1121f; }
 </style>
 </head>
 <body>
@@ -103,6 +117,12 @@
         <input id="wifiSsid" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
       <label>Password (blank = use saved)
         <input id="wifiPass" type="password" autocomplete="off"></label>
+    </div>
+    <div class="wifi-band">
+      <div class="band-label">Radio band plan</div>
+      <div id="bandCurrent" class="band-current"></div>
+      <button id="bandToggle">Switch</button>
+      <div id="bandHint" class="band-hint"></div>
     </div>
     <div class="wifi-btns">
       <button id="wifiConnect">Connect</button>
@@ -242,10 +262,100 @@
     if (wifiSel >= wifiItems.length) wifiSel = 0;
     renderList();
   }
+  // ── Band plan ─────────────────────────────────────────────────────────────
+  // The AP and the uplink must never share a band: the two antennas are
+  // centimetres apart and the AP deafens the dongle's receiver. So this offers
+  // the two valid pairings, not four independent band choices.
+  var elBandCurrent = document.getElementById("bandCurrent");
+  var elBandToggle = document.getElementById("bandToggle");
+  var elBandHint = document.getElementById("bandHint");
+  var bandPlan = "ap5", bandArmed = false, bandBusy = false;
+
+  var BAND_TEXT = {
+    ap5:  "Headset <b>5 GHz</b> &nbsp;·&nbsp; Internet <b>2.4 GHz</b>",
+    ap24: "Headset <b>2.4 GHz</b> &nbsp;·&nbsp; Internet <b>5 GHz</b>"
+  };
+
+  function otherPlan() { return bandPlan === "ap5" ? "ap24" : "ap5"; }
+
+  function renderBand(w) {
+    if (w) {
+      bandPlan = w.band_plan === "ap24" ? "ap24" : "ap5";
+      // Only an explicit false blocks the switch. null means "no adapter" or
+      // "could not read the capability", where refusing would be worse than
+      // letting the operator try - the controller re-checks before applying.
+      renderBand.can5 = (w.uplink_5ghz !== false);
+      renderBand.present = !!w.present;
+    }
+    elBandCurrent.innerHTML = BAND_TEXT[bandPlan];
+
+    if (bandBusy) {
+      elBandToggle.disabled = true;
+      elBandToggle.textContent = "Switching…";
+      elBandHint.className = "band-hint";
+      elBandHint.textContent = "Reconfiguring the radios - this takes up to a minute.";
+      return;
+    }
+
+    // Greyed out when the adapter cannot take the uplink on 5 GHz, because the
+    // fallback plan puts it there. Switching would kill internet access.
+    var blocked = (bandPlan === "ap5" && !renderBand.can5);
+    elBandToggle.disabled = blocked;
+    elBandHint.className = "band-hint" + (blocked ? " warn" : "");
+
+    if (blocked) {
+      bandArmed = false;
+      elBandToggle.textContent = "Switch to headset 2.4 GHz";
+      elBandHint.textContent = renderBand.present
+        ? "Unavailable - this USB adapter is 2.4 GHz only, so it cannot take the internet uplink."
+        : "Unavailable - no USB Wi-Fi adapter detected.";
+      return;
+    }
+
+    if (bandArmed) {
+      elBandToggle.textContent = "Press again to confirm";
+      elBandHint.textContent = "The headset will disconnect and must rejoin the same network name.";
+    } else {
+      elBandToggle.textContent = bandPlan === "ap5"
+        ? "Switch to headset 2.4 GHz (longer range)"
+        : "Switch to headset 5 GHz (default)";
+      elBandHint.textContent = bandPlan === "ap5"
+        ? "Use 2.4 GHz for the headset only when it is far from the box."
+        : "5 GHz is the default: cleaner spectrum and more headroom for the video.";
+    }
+  }
+
+  function doBandSwitch() {
+    if (bandBusy || elBandToggle.disabled) return;
+    // Two-press confirm: this drops the headset mid-session, and the operator is
+    // driving a keyboard on a TV where a stray Enter is easy.
+    if (!bandArmed) { bandArmed = true; renderBand(); return; }
+    bandArmed = false;
+    bandBusy = true;
+    renderBand();
+    wifiPost({ action: "band_plan", plan: otherPlan() }).then(function (res) {
+      bandBusy = false;
+      msg(res.message || (res.ok ? "Band plan applied" : "Failed"),
+          res.ok ? "#1a7f37" : "#c1121f");
+      loadWifi();
+    }).catch(function () {
+      bandBusy = false;
+      msg("Band switch failed.", "#c1121f");
+      renderBand();
+    });
+  }
+
+  elBandToggle.addEventListener("click", doBandSwitch);
+  // Leaving the button disarms it, so a confirm cannot be left half-primed.
+  elBandToggle.addEventListener("blur", function () {
+    if (bandArmed) { bandArmed = false; renderBand(); }
+  });
+
   function loadWifi() {
     return fetch("/wifi", { cache: "no-store" }).then(function (r) { return r.json(); }).then(function (w) {
       if (!w.present) msg("No Wi-Fi adapter detected.", "#c1121f");
       buildList(w);
+      renderBand(w);
     }).catch(function () {});
   }
   function wifiShow(open) { wifiOpen = open; wifiEl.classList.toggle("wifi-hidden", !open); }
@@ -253,6 +363,7 @@
     wifiShow(true);
     elApName.textContent = state.ssid || "the headset network";
     elSsid.value = ""; elPass.value = ""; wifiSel = 0;
+    bandArmed = false;          // never reopen with a confirm still primed
     msg("Scanning…");
     loadWifi();
     wifiPost({ action: "rescan" }).then(function () { msg(""); loadWifi(); }).catch(function () {});
