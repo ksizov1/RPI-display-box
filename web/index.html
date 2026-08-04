@@ -40,6 +40,30 @@
   .dot.ok { background: #1a7f37; } .dot.no { background: #c1121f; } .dot.unk { background: #8a8a8a; }
   .hint { color: #8a8a8a; font-size: 0.9em; }
 
+  /* ── Screensaver ───────────────────────────────────────────────────────────
+     The waiting screen is static for hours at a time and burned into a panel
+     during development. This drifts the three brand elements around instead.
+
+     The elements are CROPS OF splash.png via background-position, not separate
+     image files: one asset stays the single source of truth, and there is
+     nothing to regenerate if the splash is ever re-exported. The crop boxes were
+     measured off the actual pixels (logos x764-1664 and x2104-3024, wordmark
+     x360-3444 of 3840x2160), not eyeballed, so nothing clips.
+
+     Background stays white to match the splash the crops carry with them - it is
+     the moving that prevents burn-in, not the colour. */
+  #saver { position: fixed; inset: 0; background: #fff; z-index: 5; display: none; }
+  #saver.on { display: block; }
+  .sv { position: absolute; top: 0; left: 0; background-image: url("splash.png");
+        background-repeat: no-repeat; will-change: transform; }
+  /* size + crop window per element; heights preserve each source aspect ratio */
+  #sv-a   { width: 12vw;   height: 11.90vw;
+            background-size: 419.22% 237.89%; background-position: 25.856% 8.945%; }
+  #sv-d2  { width: 12vw;   height: 11.64vw;
+            background-size: 410.26% 237.89%; background-position: 72.178% 8.945%; }
+  #sv-txt { width: 34vw;   height: 3.33vw;
+            background-size: 123.87% 710.53%; background-position: 47.569% 67.457%; }
+
   /* Keyboard-driven upstream-Wi-Fi setup overlay (no mouse — arrows/Tab/Enter/Esc). */
   #wifi { position: fixed; inset: 0; z-index: 10; display: flex;
           align-items: center; justify-content: center;
@@ -102,6 +126,13 @@
     <div id="uplink"></div>
   </div>
   <div id="version"></div>
+</div>
+
+<!-- Burn-in screensaver; shown after the screen has been unchanged for a while -->
+<div id="saver">
+  <div id="sv-a" class="sv"></div>
+  <div id="sv-d2" class="sv"></div>
+  <div id="sv-txt" class="sv"></div>
 </div>
 
 <!-- Upstream-internet Wi-Fi setup (opened with the 'W' key; keyboard-only) -->
@@ -197,6 +228,71 @@
   function esc(s) { return String(s).replace(/[&<>"]/g, function (c) {
     return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
 
+  // ── Screensaver ───────────────────────────────────────────────────────────
+  // Activates once nothing on screen has changed for IDLE_MS. "Changed" is
+  // measured from the content actually rendered, not from a timer that anything
+  // could reset: the box sits on the waiting screen unattended for hours, and
+  // that is exactly the case that burns in.
+  var IDLE_MS = 3 * 60 * 1000;
+  var saver = document.getElementById("saver");
+  var svItems = [
+    // Distinct directions AND distinct speeds. Equal speeds would trace a
+    // repeating figure and re-burn the same track; unequal ones never close.
+    { el: document.getElementById("sv-a"),   dx:  1.00, dy:  0.66, sp: 47 },
+    { el: document.getElementById("sv-d2"),  dx: -0.82, dy:  1.00, sp: 38 },
+    { el: document.getElementById("sv-txt"), dx:  0.90, dy: -1.00, sp: 31 }
+  ];
+  svItems.forEach(function (it) {
+    var m = Math.sqrt(it.dx * it.dx + it.dy * it.dy);
+    it.dx /= m; it.dy /= m;                   // unit vector, so sp is px/second
+  });
+  var saverOn = false, rafId = 0, lastFrameT = 0;
+  var lastChangeMs = Date.now(), lastSig = null;
+
+  function noteActivity() { lastChangeMs = Date.now(); saverStop(); }
+
+  function saverStart() {
+    if (saverOn) return;
+    saverOn = true;
+    saver.classList.add("on");                // must be displayed before measuring
+    var W = window.innerWidth, H = window.innerHeight;
+    svItems.forEach(function (it, i) {
+      var r = it.el.getBoundingClientRect();
+      it.w = r.width; it.h = r.height;
+      it.x = Math.max(0, (W - it.w) * (0.15 + 0.30 * i));
+      it.y = Math.max(0, (H - it.h) * (0.20 + 0.28 * i));
+    });
+    lastFrameT = 0;
+    rafId = requestAnimationFrame(saverTick);
+  }
+
+  function saverStop() {
+    if (!saverOn) return;
+    saverOn = false;
+    saver.classList.remove("on");
+    cancelAnimationFrame(rafId);
+  }
+
+  function saverTick(t) {
+    if (!saverOn) return;
+    if (!lastFrameT) lastFrameT = t;
+    // Clamp dt so a stalled tab (or a slow frame) cannot teleport an element
+    // through a wall and strand it off-screen.
+    var dt = Math.min(0.05, (t - lastFrameT) / 1000);
+    lastFrameT = t;
+    var W = window.innerWidth, H = window.innerHeight;
+    svItems.forEach(function (it) {
+      it.x += it.dx * it.sp * dt;
+      it.y += it.dy * it.sp * dt;
+      if (it.x < 0) { it.x = 0; it.dx = -it.dx; }
+      else if (it.x > W - it.w) { it.x = W - it.w; it.dx = -it.dx; }
+      if (it.y < 0) { it.y = 0; it.dy = -it.dy; }
+      else if (it.y > H - it.h) { it.y = H - it.h; it.dy = -it.dy; }
+      it.el.style.transform = "translate(" + it.x.toFixed(1) + "px," + it.y.toFixed(1) + "px)";
+    });
+    rafId = requestAnimationFrame(saverTick);
+  }
+
   // ── Poll the controller for what to display ───────────────────────────────
   function poll() {
     fetch("/state", { cache: "no-store" }).then(function (r) { return r.json(); })
@@ -204,6 +300,18 @@
         state = s;
         elVersion.textContent = s.version ? ("Adiona-TV v" + s.version) : "";
         renderOverlay();
+
+        // Signature of everything the waiting screen draws. Any change to it is
+        // a visible change, and restarts the idle countdown.
+        var up = s.uplink || {};
+        var sig = [s.mode, s.target, s.target_name, s.ssid, s.passphrase, s.version,
+                   s.casting, up.internet, up.via, up.wifi_ssid, up.ethernet,
+                   up.wifi_present].join("|");
+        if (sig !== lastSig) { lastSig = sig; noteActivity(); }
+
+        // Never over a live stream: the player's surface covers this page, so it
+        // would be invisible work, and the picture is moving anyway.
+        if (!wifiOpen && !s.casting && (Date.now() - lastChangeMs) > IDLE_MS) saverStart();
       })
       .catch(function () { /* controller momentarily down; keep last state */ });
   }
@@ -406,6 +514,9 @@
   document.getElementById("wifiClose").addEventListener("click", function () { wifiShow(false); });
 
   document.addEventListener("keydown", function (e) {
+    // Someone is at the keyboard: dismiss the screensaver and restart the
+    // countdown before anything else looks at the key.
+    noteActivity();
     if (wifiOpen) { if (e.key === "Escape") { wifiShow(false); e.preventDefault(); } return; }
     if (e.key === "w" || e.key === "W") { openWifi(); }
   });

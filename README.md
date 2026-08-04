@@ -70,6 +70,7 @@ whenever a headset is casting. (If a `cage` build won't stack them, set
 | Stream pauses (headset off-head, app backgrounded) | Last frame holds on screen — no flash back to the splash |
 | Packet loss | Recovers on the next keyframe (≤ 1 s); corrupt frames are suppressed rather than shown |
 | Any network event while live | **Never shown over a running stream** — status only appears on the waiting/reconnecting screens |
+| Waiting screen unchanged for 3 min | **Screensaver** — the two logos and the wordmark drift around the screen. Any change on screen, or any keypress, dismisses it. Never runs over a live stream |
 
 ## Networking
 
