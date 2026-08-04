@@ -11,6 +11,12 @@ on:
   push:
     tags:
       - "v*"
+    # Ordinary pushes to main run the one-minute package preflight only (the
+    # build job filters itself out below). Without this the preflight would run
+    # solely on release tags, i.e. only ever be exercised at the moment it is
+    # most expensive to have wrong -- which is exactly how it shipped broken.
+    branches:
+      - main
 
 jobs:
   # pi-gen only reaches our stage ~40 minutes into the build, so a bad package
@@ -103,6 +109,9 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    # An image build costs 45-75 minutes, so only produce one for a release tag
+    # or a deliberate manual run - never for a routine push to main.
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     steps:
       - name: Checkout
         uses: actions/checkout@v4
