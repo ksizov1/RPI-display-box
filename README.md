@@ -74,9 +74,30 @@ whenever a headset is casting. (If a `cage` build won't stack them, set
 ## Networking
 
 - `wlan0` (built-in radio) → Wi-Fi AP via NetworkManager, `ipv4.method shared`
-  (DHCP + NAT in one profile). LAN is `192.168.50.0/24`, gateway `192.168.50.1`.
-- `eth0` → DHCP client; the internet uplink. NAT from the AP to `eth0` is
-  automatic when a cable is present. No Wi-Fi uplink / logins (by design).
+  (DHCP + NAT in one profile), on **5 GHz**. LAN is `192.168.50.0/24`, gateway
+  `192.168.50.1`.
+- `wlan1` (USB dongle, optional) → internet uplink as a Wi-Fi *client*, pinned to
+  **2.4 GHz**. Configured on-screen with the `W` key.
+- `eth0` → DHCP client; the preferred internet uplink. NAT from the AP is
+  automatic whenever something has a default route.
+
+### The two radios must not share a band
+
+Both radios are dual-band and both can host an AP, so the split is a deliberate
+choice — but they cannot both be on 2.4 GHz. Their antennas sit centimetres
+apart, and the AP transmitting deafens the dongle's receiver. Measured on
+hardware, that looked like auth frames needing 2–3 retries *even when they
+succeeded*, re-association every ~10 s, and eventually `ssid-not-found` with the
+upstream AP plainly in range. Moving the dongle onto a USB extension cable
+measurably helped, which is the signature of exactly this problem.
+
+The AP takes 5 GHz because it carries the video stream: it belongs on the
+better-proven radio (`brcmfmac` AP mode is the standard Pi configuration, while
+`rtw88`'s USB AP support is far less exercised) and it benefits from the cleaner
+band. The dongle does client mode, which is what USB adapters are good at.
+
+`WIFI_BAND` and `UPLINK_BAND` in `box.conf` control this, and can be swapped for
+a venue that needs 2.4 GHz range for the headset — see **Configuration**.
 
 ### Per-box unique name
 
@@ -160,15 +181,23 @@ subnet, RTP port, player latency, scan interval, and the reconnect grace period.
 > (`adionauser`) currently shares the Wi-Fi passphrase, which the waiting screen
 > displays to anyone standing in front of the box.
 
-Two settings are worth a deliberate decision per venue:
+Settings worth a deliberate decision per venue:
 
-- **`WIFI_BAND`** — defaults to `bg` (2.4 GHz) for range. 2.4 GHz is the most
-  contended spectrum at a public event and rate-adapts down hard at distance. If
-  the headset sits within a few metres of the box, `a` (5 GHz, channel 36 or 149)
-  is usually the better link.
+- **`WIFI_BAND` / `UPLINK_BAND`** — the band plan. Defaults are `a` (AP on 5 GHz,
+  channel 36) and `bg` (dongle uplink on 2.4 GHz). **Keep them different**; see
+  *The two radios must not share a band*.
+
+  If a venue needs more range than 5 GHz gives — a headset well away from the box
+  — swap them: `WIFI_BAND="bg"` with `WIFI_CHANNEL` 1, 6 or 11, and
+  `UPLINK_BAND="a"`. Apply with `.\tools\deploy.ps1 -FirstBoot`; no reflash.
+
+  Prefer non-DFS channels for the AP (36–48, 149–165). The 52–144 range needs
+  radar detection, which delays or drops the beacon.
 - **`PLAYER_LATENCY_MS`** — how long the player waits for a late packet before
-  discarding it. 50 ms is the live-edge default; raise to 80–120 only if a weak
-  link shows stutter.
+  discarding it. 120 ms (~2 frame periods at 15 fps) is the default; the floor is
+  the frame period, not network jitter. Raise it if a weak link shows stutter.
+- **`STREAM_TIMEOUT_SEC`** — how long the last frame stays frozen after the
+  stream stops before the splash returns. Default 30 s.
 
 ---
 
@@ -233,18 +262,30 @@ journalctl -u NetworkManager -n 60 --no-pager
   or power-delivery problem, not configuration. Check the PSU first: a Pi 5 on an
   underpowered supply browns out USB under load, and a Wi-Fi dongle transmitting
   is exactly that load. Use the official 5 V/5 A supply.
-- **Both radios on the same band.** The built-in radio runs the AP; if the dongle
-  is a client on the same band, they contend for the same airtime and *both*
-  suffer. Put them on different bands — e.g. keep `WIFI_BAND="bg"` for the AP and
-  join a 5 GHz network with the dongle, or vice versa. This is the most common
-  cause of "works, then unstable" once power management is ruled out.
+- **Both radios on the same band.** This is the most common cause of "works,
+  then unstable" once power management is ruled out, and it is what was actually
+  wrong here. Check the two are still split:
+
+  ```bash
+  iw dev wlan0 info | grep channel     # AP      - expect a 5 GHz channel (36…)
+  iw dev wlan1 link  | grep freq       # uplink  - expect a 2.4 GHz freq (24xx)
+  ```
+
+  If the uplink has drifted onto 5 GHz, its saved profile predates the band plan.
+  The controller pins every saved profile at startup, so restarting
+  `adiona-controller` (or redeploying) is enough; `UPLINK_BAND` in `box.conf`
+  controls it.
+- **Physical separation.** Even on different bands, a dongle plugged directly
+  into the Pi sits centimetres from the AP antenna. A short USB extension cable
+  measurably helped here and costs nothing.
 - **NetworkManager keeps re-scanning.** Background scans on a client interface
   briefly leave the channel, which a marginal link may not survive. Check the
   journal for repeated `scanning` entries.
-- **Chipset.** Realtek `rtl88xxau`-class dongles on out-of-tree drivers are a
-  frequent source of exactly this behaviour. If `dmesg` shows an out-of-tree
-  module, an adapter with an in-kernel driver (MediaTek `mt7601u`/`mt76`, or
-  Ralink) is usually a better bet than debugging the driver.
+- **Chipset.** The dongle in use is an RTL8821CU on the in-kernel `rtw88_8821cu`
+  driver — dual-band, and it reports AP mode as well as client. Prefer adapters
+  with in-kernel drivers; an out-of-tree module (`rtl88xxau` and friends) adds a
+  failure mode that no amount of configuration fixes. `dmesg` naming the module
+  tells you which you have.
 
 Ethernet remains the dependable uplink — the dongle exists for venues where
 running a cable is impractical, and it is the box's least reliable link by nature.

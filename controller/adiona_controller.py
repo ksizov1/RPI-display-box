@@ -84,6 +84,9 @@ AP_PREFIX = AP_GATEWAY.rsplit(".", 1)[0] + "."          # e.g. "192.168.50."
 SCAN_INTERVAL = float(CONF.get("SCAN_INTERVAL_SECONDS", "2"))
 RECONNECT_GRACE = float(CONF.get("RECONNECT_GRACE_SECONDS", "20"))
 PASSPHRASE = CONF.get("WIFI_PASSPHRASE", "")
+# Band the upstream dongle is pinned to, so it can never share the AP's band and
+# desensitise itself against our own transmitter. "" disables the restriction.
+UPLINK_BAND = CONF.get("UPLINK_BAND", "bg").strip()
 PROBE_TIMEOUT = 0.6
 UPLINK_IFACE = "eth0"
 INTERNET_CHECK_INTERVAL = 15.0
@@ -282,6 +285,39 @@ def harden_uplink(iface, force=False):
             pass
 
 
+def pin_uplink_profile(con_name):
+    """Apply the uplink policy to one saved Wi-Fi connection profile.
+
+    Band pinning is the part that matters: NetworkManager will otherwise happily
+    associate on whichever band the upstream SSID is strongest on, including the
+    one the AP is using, which puts both radios back in the same spectrum.
+
+    Also pins the MAC (randomisation makes some APs treat every reassociation as
+    a new station) and disables powersave per-connection, because some drivers
+    ignore the global default from conf.d.
+    """
+    args = ["con", "modify", con_name,
+            "802-11-wireless.cloned-mac-address", "permanent",
+            "802-11-wireless.powersave", "2"]
+    if UPLINK_BAND:
+        args += ["802-11-wireless.band", UPLINK_BAND]
+    run_nmcli(args, timeout=15)
+
+
+def pin_all_uplink_profiles():
+    """Apply the policy to every saved non-AP Wi-Fi profile, once, at startup.
+
+    Without this, a profile saved before the band plan existed keeps autoconnecting
+    on whatever band it likes, and the operator would have to re-enter credentials
+    through the on-screen setup to pick up the new policy.
+    """
+    rc, out, _ = run_nmcli(["-t", "-f", "NAME,TYPE", "con", "show"])
+    for line in out.splitlines():
+        p = _nmcli_split(line)
+        if len(p) >= 2 and p[1] == "802-11-wireless" and p[0] != AP_CON:
+            pin_uplink_profile(p[0])
+
+
 def ethernet_up():
     try:
         with open("/sys/class/net/%s/carrier" % UPLINK_IFACE, "r") as fh:
@@ -416,14 +452,7 @@ def wifi_connect(ssid, password):
     msg = text.splitlines()[-1] if text else ("Connected" if rc == 0 else "Failed")
 
     if rc == 0:
-        # Pin the saved profile so the link is stable across reconnects. A
-        # randomised MAC makes some APs treat every reassociation as a new
-        # station (losing the DHCP lease, sometimes being rate-limited or
-        # blocked outright), and powersave is set per-connection as well as
-        # globally because some drivers ignore the global default.
-        run_nmcli(["con", "modify", ssid,
-                   "802-11-wireless.cloned-mac-address", "permanent",
-                   "802-11-wireless.powersave", "2"], timeout=15)
+        pin_uplink_profile(ssid)
         harden_uplink(up, force=True)
 
     return {"ok": rc == 0, "message": msg}
@@ -555,6 +584,14 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # Bring saved uplink profiles in line with the current band plan before
+    # anything else; a profile saved under an older policy would otherwise keep
+    # autoconnecting on the AP's band.
+    try:
+        pin_all_uplink_profiles()
+    except Exception as e:                                  # never fatal
+        print("[adiona-controller] uplink profile pin skipped: %s" % e)
+
     threading.Thread(target=selection_loop, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", CONTROLLER_PORT), Handler)
     print("[adiona-controller] serving on http://127.0.0.1:%d (web=%s)" %
