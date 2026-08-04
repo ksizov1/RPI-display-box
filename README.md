@@ -188,7 +188,10 @@ sudo systemctl start adiona-kiosk
   Raspberry Pi OS has no INPUT firewall, so this is only a factor if one was
   added).
 - *Packets counted, but still no picture* → the player itself is failing. Run it
-  in the foreground and read the GStreamer error: `journalctl -u adiona-kiosk -f`,
+  in the foreground and read the GStreamer error with `.\tools\deploy.ps1 -Follow`
+  (note that `journalctl -u adiona-kiosk` shows **nothing** from the player — the
+  unit's `PAMName=login` puts those processes in a login-session scope, so they
+  are journalled under `SYSLOG_IDENTIFIER=cage-session.sh`, not the unit),
   or check that the `gstreamer1.0-libav` package is present (it provides
   `avdec_h264`).
 

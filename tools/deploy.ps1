@@ -231,6 +231,16 @@ sudo -n cat /var/lib/NetworkManager/dnsmasq-wlan0.leases 2>/dev/null \
     | awk '{ printf "  lease %-16s %s\n", $3, $2 }' || echo "  (lease file unreadable - run -SetupSudo)"
 '@
 
+# The kiosk session's own log lines are NOT reachable via `journalctl -u
+# adiona-kiosk`. The unit sets PAMName=login, which puts its processes in a login
+# session scope rather than the service cgroup, so they are journalled under the
+# SYSLOG_IDENTIFIER of the ExecStart script (cage-session.sh) instead of the unit.
+# `-u adiona-kiosk` returns zero player lines - verified on the box. The `+` is
+# journalctl's disjunction: match the controller unit OR that identifier.
+$JournalMatch = '_SYSTEMD_UNIT=adiona-controller.service + SYSLOG_IDENTIFIER=cage-session.sh'
+$JournalFollowCmd = "journalctl -f --no-pager -n 20 $JournalMatch"
+$JournalTailCmd   = "journalctl -n __N__ --no-pager $JournalMatch"
+
 $ProbeCmd = @'
 sudo systemctl stop adiona-kiosk
 rc=0
@@ -528,8 +538,8 @@ finally {
 
 if ($Follow) {
     Say 'following journal (Ctrl-C to stop)'
-    & $ssh '-t' @SshOpts $Target 'journalctl -u adiona-kiosk -u adiona-controller -f --no-pager -n 20'
+    & $ssh '-t' @SshOpts $Target $JournalFollowCmd
 }
 elseif ($Logs -gt 0) {
-    & $ssh @SshOpts $Target "journalctl -u adiona-kiosk -u adiona-controller -n $Logs --no-pager"
+    & $ssh @SshOpts $Target ($JournalTailCmd -replace '__N__', $Logs)
 }

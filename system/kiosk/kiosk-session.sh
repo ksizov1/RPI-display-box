@@ -50,7 +50,11 @@ RTP_FLOW_MIN_PPS="${RTP_FLOW_MIN_PPS:-20}"
 chromium_pid=""
 player_pid=""
 player_retry_at=0
-was_casting="false"
+# Consecutive polls with casting=false, for debouncing the new-session edge.
+# Starts at 0 so the first true reading is never itself an edge; only a sustained
+# run of false readings can arm one.
+not_casting_polls=0
+CASTING_EDGE_POLLS="${CASTING_EDGE_POLLS:-3}"
 # Last time RTP was observed arriving, and the running UDP counter it came from.
 # last_rtp_at=0 means "never seen", which is what keeps the player from starting
 # over the splash before any stream actually exists.
@@ -148,22 +152,30 @@ while true; do
     # — so a paused stream holds the last frame rather than flashing the splash,
     # matching the behaviour the browser player used to have.
     state_json="$(curl -sf --max-time 2 "$STATE_URL" 2>/dev/null)"
-    mode="$(printf '%s' "$state_json" \
-            | sed -n 's/.*"mode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
     casting="$(printf '%s' "$state_json" \
             | sed -n 's/.*"casting"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')"
 
-    # A false->true edge means a NEW cast session on the headset: the app was
-    # restarted, Live Stream was toggled, or the resolution changed. Each of those
-    # rebuilds the sender, and a receiver that is already running stays locked to
-    # the previous RTP session and would show nothing. Restart it so it picks up
-    # the new stream. (The sender keeps a stable SSRC within one app run, so an
-    # in-session resolution change is continuous; this covers the process restart.)
-    if [ "$casting" = "true" ] && [ "$was_casting" = "false" ] && running "$player_pid"; then
-        log "new cast session detected - restarting player"
-        stop_player
-    fi
-    [ -n "$casting" ] && was_casting="$casting"
+    # A sustained false->true edge means a NEW cast session on the headset: the app
+    # was restarted, Live Stream was toggled, or the resolution changed. Each of
+    # those rebuilds the sender, and a receiver that is already running stays locked
+    # to the previous RTP session and would show nothing.
+    #
+    # DEBOUNCED, because `casting` comes from a 0.6 s HTTP probe of the headset over
+    # Wi-Fi and occasionally times out on a perfectly healthy link. Acting on a
+    # single false reading tears the player down and rebuilds it for nothing, which
+    # on screen is a black flash and a fresh wait for the next keyframe. Requires
+    # CASTING_EDGE_POLLS consecutive false readings before a true counts as new.
+    case "$casting" in
+        false) not_casting_polls=$(( not_casting_polls + 1 )) ;;
+        true)
+            if [ "$not_casting_polls" -ge "$CASTING_EDGE_POLLS" ] && running "$player_pid"; then
+                log "new cast session detected - restarting player"
+                stop_player
+            fi
+            not_casting_polls=0
+            ;;
+        *) ;;   # controller unreachable this poll - carry the counter unchanged
+    esac
 
     # ── Is RTP actually flowing? ─────────────────────────────────────────────
     now=$(date +%s)
@@ -187,7 +199,13 @@ while true; do
         have_stream=0
     fi
 
-    if [ "$mode" = "live" ] && [ "$have_stream" = "1" ]; then
+    # Gated ONLY on frames actually arriving - deliberately not on the controller's
+    # `mode`. `mode` depends on the headset appearing in `iw station dump` and
+    # answering an HTTP probe, and a single missed poll used to tear the player
+    # down and rebuild it a second later. Arriving RTP is both necessary and
+    # sufficient: if packets are on :5004 there is a stream to show, whatever the
+    # controller currently believes about association.
+    if [ "$have_stream" = "1" ]; then
         if ! running "$player_pid"; then
             # A player that exited on its own (decoder error, socket problem)
             # gets retried on a backoff rather than in a tight respawn loop.
