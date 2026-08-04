@@ -248,14 +248,18 @@
   var svItems = [
     // Distinct directions AND distinct speeds. Equal speeds would trace a
     // repeating figure and re-burn the same track; unequal ones never close.
-    { el: document.getElementById("sv-a"),   dx:  1.00, dy:  0.66, sp: 47 },
-    { el: document.getElementById("sv-d2"),  dx: -0.82, dy:  1.00, sp: 38 },
-    { el: document.getElementById("sv-txt"), dx:  0.90, dy: -1.00, sp: 31 }
+    // `sp` is vw per second, so motion looks the same on a 1080p or a 4K panel.
+    // `place` is the starting position as a fraction of the free space - chosen
+    // so the three do not overlap at t=0, which the collision code assumes.
+    { el: document.getElementById("sv-a"),   dx:  1.00, dy:  0.66, sp: 3.18, place: [0.05, 0.05] },
+    { el: document.getElementById("sv-d2"),  dx: -0.82, dy:  1.00, sp: 2.55, place: [0.95, 0.10] },
+    { el: document.getElementById("sv-txt"), dx:  0.90, dy: -1.00, sp: 2.08, place: [0.50, 0.95] }
   ];
-  svItems.forEach(function (it) {
-    var m = Math.sqrt(it.dx * it.dx + it.dy * it.dy);
-    it.dx /= m; it.dy /= m;                   // unit vector, so sp is px/second
-  });
+
+  function svClamp(it, W, H) {
+    it.x = Math.max(0, Math.min(it.x, W - it.w));
+    it.y = Math.max(0, Math.min(it.y, H - it.h));
+  }
   var saverOn = false, rafId = 0, lastFrameT = 0;
   var lastChangeMs = Date.now(), lastSig = null;
 
@@ -265,12 +269,18 @@
     if (saverOn) return;
     saverOn = true;
     saver.classList.add("on");                // must be displayed before measuring
-    var W = window.innerWidth, H = window.innerHeight;
-    svItems.forEach(function (it, i) {
+    var W = window.innerWidth, H = window.innerHeight, vwpx = W / 100;
+    svItems.forEach(function (it) {
       var r = it.el.getBoundingClientRect();
       it.w = r.width; it.h = r.height;
-      it.x = Math.max(0, (W - it.w) * (0.15 + 0.30 * i));
-      it.y = Math.max(0, (H - it.h) * (0.20 + 0.28 * i));
+      it.x = Math.max(0, (W - it.w) * it.place[0]);
+      it.y = Math.max(0, (H - it.h) * it.place[1]);
+      // Velocity is carried as px/second from here on, because a collision
+      // exchanges velocity components between two elements and a direction +
+      // speed pair cannot represent the result.
+      var m = Math.sqrt(it.dx * it.dx + it.dy * it.dy);
+      it.vx = it.dx / m * it.sp * vwpx;
+      it.vy = it.dy / m * it.sp * vwpx;
     });
     lastFrameT = 0;
     rafId = requestAnimationFrame(saverTick);
@@ -291,13 +301,44 @@
     var dt = Math.min(0.05, (t - lastFrameT) / 1000);
     lastFrameT = t;
     var W = window.innerWidth, H = window.innerHeight;
+
     svItems.forEach(function (it) {
-      it.x += it.dx * it.sp * dt;
-      it.y += it.dy * it.sp * dt;
-      if (it.x < 0) { it.x = 0; it.dx = -it.dx; }
-      else if (it.x > W - it.w) { it.x = W - it.w; it.dx = -it.dx; }
-      if (it.y < 0) { it.y = 0; it.dy = -it.dy; }
-      else if (it.y > H - it.h) { it.y = H - it.h; it.dy = -it.dy; }
+      it.x += it.vx * dt;
+      it.y += it.vy * dt;
+      if (it.x < 0) { it.x = 0; it.vx = -it.vx; }
+      else if (it.x > W - it.w) { it.x = W - it.w; it.vx = -it.vx; }
+      if (it.y < 0) { it.y = 0; it.vy = -it.vy; }
+      else if (it.y > H - it.h) { it.y = H - it.h; it.vy = -it.vy; }
+    });
+
+    // Element vs element, so they bounce off each other instead of sliding
+    // through. Separate along the axis of LEAST penetration (the axis they are
+    // most nearly clear on, i.e. the one they actually met on), then exchange
+    // velocity on that axis: the equal-mass elastic result, which sends them
+    // apart without adding or removing energy. Separation can push an element
+    // past a wall, so re-clamp; any residue resolves next frame, since the
+    // velocities now point away from each other.
+    for (var i = 0; i < svItems.length; i++) {
+      for (var j = i + 1; j < svItems.length; j++) {
+        var a = svItems[i], b = svItems[j];
+        var px = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+        var py = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+        if (px <= 0 || py <= 0) continue;
+        var t;
+        if (px < py) {
+          var sx = (a.x < b.x ? -1 : 1) * px / 2;
+          a.x += sx; b.x -= sx;
+          t = a.vx; a.vx = b.vx; b.vx = t;
+        } else {
+          var sy = (a.y < b.y ? -1 : 1) * py / 2;
+          a.y += sy; b.y -= sy;
+          t = a.vy; a.vy = b.vy; b.vy = t;
+        }
+        svClamp(a, W, H); svClamp(b, W, H);
+      }
+    }
+
+    svItems.forEach(function (it) {
       it.el.style.transform = "translate(" + it.x.toFixed(1) + "px," + it.y.toFixed(1) + "px)";
     });
     rafId = requestAnimationFrame(saverTick);
