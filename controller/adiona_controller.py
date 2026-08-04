@@ -236,6 +236,52 @@ def _nmcli_split(line):
     return out
 
 
+# Throttle for harden_uplink(); the work is idempotent but shells out.
+_hardened = {"iface": None, "at": 0.0}
+UPLINK_HARDEN_INTERVAL = 30.0
+
+
+def harden_uplink(iface, force=False):
+    """Turn off the power management that makes USB Wi-Fi dongles drop.
+
+    Two independent sleep mechanisms bite a USB adapter, and both present the same
+    way: it associates, works for a while, then stalls or gets deauthenticated.
+
+      1. 802.11 power save - the radio dozes between beacons and misses frames.
+         NetworkManager is told to disable it (conf.d/10-adiona-wifi.conf), but
+         some drivers re-enable it on reassociation, so it is also forced here.
+      2. USB autosuspend - the kernel suspends the *device* after an idle period.
+         The adapter then has to be woken, and several cheap chipsets do not come
+         back cleanly. power/control lives on the USB device, one level above the
+         interface, so both paths are attempted.
+
+    Re-applied periodically rather than once, because a re-enumerating dongle (or
+    a driver reset) comes back with the defaults restored.
+    """
+    if not iface:
+        return
+    now = time.monotonic()
+    if not force and _hardened["iface"] == iface and now - _hardened["at"] < UPLINK_HARDEN_INTERVAL:
+        return
+    _hardened.update(iface=iface, at=now)
+
+    try:
+        subprocess.run(["iw", "dev", iface, "set", "power_save", "off"],
+                       capture_output=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    base = "/sys/class/net/%s/device" % iface
+    for rel in ("power/control", "../power/control"):
+        path = os.path.join(base, rel)
+        try:
+            if os.path.exists(path):
+                with open(path, "w") as fh:
+                    fh.write("on")
+        except OSError:
+            pass
+
+
 def ethernet_up():
     try:
         with open("/sys/class/net/%s/carrier" % UPLINK_IFACE, "r") as fh:
@@ -293,6 +339,9 @@ def uplink_status():
     up_if = wifi_uplink_iface()
     wifi_ssid = None
     if up_if:
+        # Cheap and throttled internally; keeps power management off across
+        # driver resets and re-enumeration, not just at connect time.
+        harden_uplink(up_if)
         rc, out, _ = run_nmcli(["-t", "-f", "GENERAL.CONNECTION", "dev", "show", up_if])
         for line in out.splitlines():
             if line.startswith("GENERAL.CONNECTION:"):
@@ -365,6 +414,18 @@ def wifi_connect(ssid, password):
     rc, out, err = run_nmcli(args, timeout=35)
     text = (out or err).strip()
     msg = text.splitlines()[-1] if text else ("Connected" if rc == 0 else "Failed")
+
+    if rc == 0:
+        # Pin the saved profile so the link is stable across reconnects. A
+        # randomised MAC makes some APs treat every reassociation as a new
+        # station (losing the DHCP lease, sometimes being rate-limited or
+        # blocked outright), and powersave is set per-connection as well as
+        # globally because some drivers ignore the global default.
+        run_nmcli(["con", "modify", ssid,
+                   "802-11-wireless.cloned-mac-address", "permanent",
+                   "802-11-wireless.powersave", "2"], timeout=15)
+        harden_uplink(up, force=True)
+
     return {"ok": rc == 0, "message": msg}
 
 

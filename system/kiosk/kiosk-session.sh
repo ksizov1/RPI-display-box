@@ -35,10 +35,27 @@ OVERLAY_MODE="${PLAYER_OVERLAY_MODE:-stack}"
 POLL_SECONDS=1
 PLAYER_RETRY_SECONDS=2
 
+# How long the last frame stays frozen on screen after the stream stops before we
+# give up and go back to the waiting splash. Covers the headset being taken off,
+# the app being backgrounded, or the process exiting: in all of those the app can
+# keep serving :8080 (so `casting` stays true) while sending no frames at all,
+# which is why this is measured from actual packet arrival rather than app state.
+STREAM_TIMEOUT_SEC="${STREAM_TIMEOUT_SEC:-30}"
+
+# Inbound UDP datagrams per second above which the stream counts as flowing. The
+# real stream runs ~150-300 pkt/s; idle background chatter (DHCP/DNS for one
+# headset) is a handful. Anywhere in between separates them safely.
+RTP_FLOW_MIN_PPS="${RTP_FLOW_MIN_PPS:-20}"
+
 chromium_pid=""
 player_pid=""
 player_retry_at=0
 was_casting="false"
+# Last time RTP was observed arriving, and the running UDP counter it came from.
+# last_rtp_at=0 means "never seen", which is what keeps the player from starting
+# over the splash before any stream actually exists.
+last_rtp_at=0
+last_udp_count=""
 
 log() { echo "[adiona-kiosk] $*"; }
 
@@ -95,6 +112,19 @@ stop_player() {
 
 running() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
 
+# Total inbound UDP datagrams since boot: delivered (InDatagrams) PLUS those that
+# found no listener (NoPorts). Both terms are needed because the stream keeps
+# arriving while the player is stopped, and then lands in NoPorts instead.
+#
+# Why the kernel counter rather than something stream-specific: the player holds
+# :5004 exclusively, so nothing else can bind it to observe traffic, and asking
+# GStreamer would mean parsing gst-launch's message stream. This box carries
+# almost no other UDP (a little DHCP/DNS for the one headset) while the stream is
+# ~150-300 packets/s, so the two are never close enough to confuse.
+udp_datagrams() {
+    awk '/^Udp:/ { if (++n == 2) { print $2 + $3; exit } }' /proc/net/snmp 2>/dev/null || echo 0
+}
+
 cleanup() {
     trap - TERM INT EXIT
     stop_player
@@ -135,11 +165,32 @@ while true; do
     fi
     [ -n "$casting" ] && was_casting="$casting"
 
-    if [ "$mode" = "live" ]; then
+    # ── Is RTP actually flowing? ─────────────────────────────────────────────
+    now=$(date +%s)
+    udp_now="$(udp_datagrams)"
+    if [ -n "$last_udp_count" ]; then
+        udp_delta=$(( udp_now - last_udp_count ))
+        # Counters are monotonic; a negative delta means a wrap or a reboot.
+        [ "$udp_delta" -lt 0 ] && udp_delta=0
+        if [ "$udp_delta" -ge "$RTP_FLOW_MIN_PPS" ]; then
+            last_rtp_at=$now
+        fi
+    fi
+    last_udp_count="$udp_now"
+
+    # Frames flowing, or stopped recently enough that we still hold the last one.
+    # The grace window is what makes a brief pause (headset set down for a moment)
+    # freeze rather than flicker back to the splash.
+    if [ "$last_rtp_at" -ne 0 ] && [ $(( now - last_rtp_at )) -lt "$STREAM_TIMEOUT_SEC" ]; then
+        have_stream=1
+    else
+        have_stream=0
+    fi
+
+    if [ "$mode" = "live" ] && [ "$have_stream" = "1" ]; then
         if ! running "$player_pid"; then
             # A player that exited on its own (decoder error, socket problem)
             # gets retried on a backoff rather than in a tight respawn loop.
-            now=$(date +%s)
             if [ -n "$player_pid" ]; then
                 player_pid=""
                 player_retry_at=$((now + PLAYER_RETRY_SECONDS))
@@ -149,7 +200,12 @@ while true; do
             fi
         fi
     else
-        running "$player_pid" && stop_player
+        if running "$player_pid"; then
+            if [ "$have_stream" = "0" ]; then
+                log "no RTP for ${STREAM_TIMEOUT_SEC}s - returning to the waiting screen"
+            fi
+            stop_player
+        fi
         [ -n "$player_pid" ] && player_pid=""
     fi
 

@@ -32,6 +32,12 @@ install -m 0644 files/payload/system/first-boot/adiona-firstboot.service \
 install -m 0644 files/payload/system/network/99-adiona-forward.conf \
         "${ROOTFS_DIR}/etc/sysctl.d/99-adiona-forward.conf"
 
+# NetworkManager: Wi-Fi power save off, no scan MAC randomisation. Aimed at the
+# USB uplink dongle, which otherwise associates and then drops.
+install -d "${ROOTFS_DIR}/etc/NetworkManager/conf.d"
+install -m 0644 files/payload/system/networkmanager/10-adiona-wifi.conf \
+        "${ROOTFS_DIR}/etc/NetworkManager/conf.d/10-adiona-wifi.conf"
+
 # udev: ignore pointer devices so no mouse cursor is ever drawn.
 install -m 0644 files/payload/system/udev/99-adiona-no-pointer.rules \
         "${ROOTFS_DIR}/etc/udev/rules.d/99-adiona-no-pointer.rules"

@@ -375,9 +375,15 @@ sudo install -m 0644 "$SRC/system/controller/adiona-controller.service" \
                      "$SRC/system/first-boot/adiona-firstboot.service" /etc/systemd/system/
 sudo install -m 0644 "$SRC/system/network/99-adiona-forward.conf" /etc/sysctl.d/
 sudo install -m 0644 "$SRC/system/udev/99-adiona-no-pointer.rules" /etc/udev/rules.d/
+sudo install -d /etc/NetworkManager/conf.d
+sudo install -m 0644 "$SRC/system/networkmanager/10-adiona-wifi.conf" /etc/NetworkManager/conf.d/
 sudo install -d /etc/chromium/policies/managed
 sudo install -m 0644 "$SRC/system/chromium/adiona-policy.json" /etc/chromium/policies/managed/
 sudo sysctl -q -p /etc/sysctl.d/99-adiona-forward.conf || true
+# Wi-Fi powersave / MAC-randomisation settings only take effect once NM rereads
+# its config. Reload rather than restart: restarting NM would drop the AP and
+# with it any live stream.
+sudo nmcli general reload conf 2>/dev/null || true
 sudo udevadm control --reload-rules || true   # takes effect on the next replug
 
 # Plymouth theme: files only. Registering a *different* theme needs an initramfs

@@ -200,6 +200,52 @@ build isn't stacking the two clients. Set `PLAYER_OVERLAY_MODE="swap"` in
 to 5 GHz. Do not "fix" it by raising the headset's bitrate: offering the link more
 than it can carry is what causes the problem in the first place.
 
+**Picture freezes instead of returning to the splash** — the box holds the last
+frame for `STREAM_TIMEOUT_SEC` (default 30 s) after packets stop, then goes back
+to the waiting screen and reconnects on its own when frames resume. Lower it for
+a snappier return; raise it to ride out longer pauses.
+
+---
+
+## Troubleshooting the USB Wi-Fi uplink
+
+A USB dongle that associates and then drops is almost always power management,
+not signal. The box disables both mechanisms — 802.11 power save and USB
+autosuspend — via `/etc/NetworkManager/conf.d/10-adiona-wifi.conf` and, because
+some drivers restore the defaults on reassociation, again at runtime from the
+controller every 30 s.
+
+If it is still unstable, work through these in order:
+
+```bash
+IF=wlan1        # the dongle; wlan0 is the built-in AP radio
+
+iw dev $IF get power_save                     # must say "off"
+cat /sys/class/net/$IF/device/../power/control # must say "on"
+dmesg -T | grep -iE "$IF|usb|firmware" | tail -40
+journalctl -u NetworkManager -n 60 --no-pager
+```
+
+- **`dmesg` shows resets, `firmware` errors, or repeated disconnects** — driver
+  or power-delivery problem, not configuration. Check the PSU first: a Pi 5 on an
+  underpowered supply browns out USB under load, and a Wi-Fi dongle transmitting
+  is exactly that load. Use the official 5 V/5 A supply.
+- **Both radios on the same band.** The built-in radio runs the AP; if the dongle
+  is a client on the same band, they contend for the same airtime and *both*
+  suffer. Put them on different bands — e.g. keep `WIFI_BAND="bg"` for the AP and
+  join a 5 GHz network with the dongle, or vice versa. This is the most common
+  cause of "works, then unstable" once power management is ruled out.
+- **NetworkManager keeps re-scanning.** Background scans on a client interface
+  briefly leave the channel, which a marginal link may not survive. Check the
+  journal for repeated `scanning` entries.
+- **Chipset.** Realtek `rtl88xxau`-class dongles on out-of-tree drivers are a
+  frequent source of exactly this behaviour. If `dmesg` shows an out-of-tree
+  module, an adapter with an in-kernel driver (MediaTek `mt7601u`/`mt76`, or
+  Ralink) is usually a better bet than debugging the driver.
+
+Ethernet remains the dependable uplink — the dongle exists for venues where
+running a cable is impractical, and it is the box's least reliable link by nature.
+
 ---
 
 ## Live deploy to a running box

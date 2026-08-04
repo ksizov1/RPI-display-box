@@ -42,36 +42,53 @@ jobs:
           fi
           echo "Checking $(grep -cve '^[[:space:]]*$' "$PKGFILE") package name(s)."
 
+          # Pull SEPARATELY and quietly. `docker run` writes image-pull progress to
+          # STDERR, so folding stderr into the captured output (an earlier version
+          # did) turned every progress line into a "missing package" and failed the
+          # check 100% of the time, whatever the package list actually said.
+          if ! docker pull -q debian:trixie >/dev/null 2>&1; then
+            echo "::warning::could not pull debian:trixie - skipping package preflight"
+            exit 0
+          fi
+
           # Name existence only, against plain Debian trixie - not dependency
           # resolution. The Raspberry Pi archive publishes no amd64 index so it
           # cannot be added here; every package the image installs also exists in
           # Debian, which is what makes this check meaningful.
+          #
+          # Findings are emitted with an explicit MISSING: prefix and nothing else
+          # is parsed, so stray container output can never be mistaken for a result.
+          # stdout only - stderr is left on the console for humans.
           set +e
           out="$(docker run --rm -v "$PWD:/w" -w /w debian:trixie bash -c '
-            apt-get update -qq >/dev/null 2>&1 || { echo "__APTFAIL__"; exit 0; }
+            apt-get update -qq >/dev/null 2>&1 || { echo "APTFAIL:"; exit 0; }
             while read -r pkg; do
               [ -n "$pkg" ] || continue
               case "$pkg" in \#*) continue ;; esac
-              apt-cache show "$pkg" >/dev/null 2>&1 || echo "$pkg"
+              apt-cache show "$pkg" >/dev/null 2>&1 || echo "MISSING:$pkg"
             done < '"$PKGFILE"'
-          ' 2>&1)"
+            echo "DONE:"
+          ')"
           rc=$?
           set -e
 
           # A broken checker must never block a release. Only a POSITIVE finding -
-          # named packages that do not resolve - fails this job; anything else is
-          # reported as a warning and the build proceeds.
+          # named packages that did not resolve - is treated as a failure; anything
+          # else is a warning.
           if [ $rc -ne 0 ]; then
-            echo "::warning::package preflight could not run (docker exit $rc). Build continues."
-            echo "$out"
+            echo "::warning::package preflight could not run (docker exit $rc)"
             exit 0
           fi
-          if printf '%s' "$out" | grep -q '__APTFAIL__'; then
-            echo "::warning::apt-get update failed in the check container. Build continues."
+          if printf '%s\n' "$out" | grep -q '^APTFAIL:'; then
+            echo "::warning::apt-get update failed inside the check container"
+            exit 0
+          fi
+          if ! printf '%s\n' "$out" | grep -q '^DONE:'; then
+            echo "::warning::package preflight did not run to completion"
             exit 0
           fi
 
-          missing="$(printf '%s' "$out" | sed '/^[[:space:]]*$/d')"
+          missing="$(printf '%s\n' "$out" | sed -n 's/^MISSING://p')"
           if [ -n "$missing" ]; then
             echo "::error::Unknown package name(s): $(printf '%s' "$missing" | tr '\n' ' ')"
             echo ""
