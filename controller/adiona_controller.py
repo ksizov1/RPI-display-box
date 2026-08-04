@@ -94,6 +94,14 @@ STATE = {
     "mode": "waiting",          # "live" | "reconnecting" | "waiting"
     "target": None,             # headset IP to stream, or None
     "target_name": None,        # friendly DHCP hostname, if known
+    # True while the selected headset is ACTIVELY casting (serving :8080), as
+    # opposed to merely still associated to the AP. Distinct from `mode`, which is
+    # deliberately sticky so a paused stream holds the last frame instead of
+    # flashing the splash. The kiosk session watches this: a false->true edge means
+    # a NEW cast session (app restarted, Live Stream re-enabled, resolution
+    # changed), and the video player has to be restarted to pick up the new RTP
+    # stream — an already-running receiver stays locked to the previous session.
+    "casting": False,
     "ssid": "",
     "passphrase": PASSPHRASE,
     "uplink": {"ethernet": None, "internet": None},
@@ -414,6 +422,7 @@ def selection_loop():
         with LOCK:
             STATE["mode"] = mode
             STATE["target"] = target
+            STATE["casting"] = bool(target) and target in casting_ips
             STATE["target_name"] = mac_to_host.get(current_mac) if current_mac else None
             STATE["ssid"] = read_ssid()
             STATE["uplink"] = uplink_status()

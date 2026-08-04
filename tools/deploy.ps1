@@ -54,6 +54,23 @@
 .PARAMETER Follow
     After deploying, follow the journal until Ctrl-C.
 
+.PARAMETER SetupSudo
+    One-time setup: grant this user passwordless sudo on the box by installing
+    /etc/sudoers.d/010-adiona-nopasswd. Interactive - you type the box password
+    once (image/pi-gen/config sets it). The new rule is validated with visudo
+    BEFORE it is installed and the whole sudoers set is re-validated after, with
+    the file removed if anything fails, so a bad edit cannot lock sudo out.
+
+.PARAMETER SetupKey
+    One-time setup: create a passphrase-less key at ~/.ssh/adiona_ed25519 and
+    append it to the box's authorized_keys, then use it (with IdentitiesOnly, so
+    ssh stops offering your personal key and asking for ITS passphrase) for every
+    later run. Costs one last prompt. Your personal key is not touched.
+
+.PARAMETER NoAgent
+    Skip the ssh-agent handling and let ssh prompt for the key passphrase per
+    connection.
+
 .PARAMETER Status
     Report what the box is running and exit. No deploy.
 
@@ -79,6 +96,10 @@
 .EXAMPLE
     .\tools\deploy.ps1 -Box 192.168.1.155 -Status
     Ask a specific box what it is running.
+
+.EXAMPLE
+    .\tools\deploy.ps1 -SetupSudo
+    Run this once per box, before the first deploy.
 #>
 
 [CmdletBinding()]
@@ -92,6 +113,9 @@ param(
     [string] $Restart = 'both',
     [int]    $Logs = 0,
     [switch] $Follow,
+    [switch] $SetupSudo,
+    [switch] $SetupKey,
+    [switch] $NoAgent,
     [switch] $Status,
     [switch] $Probe,
     [switch] $DryRun
@@ -100,10 +124,24 @@ param(
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $Target = "$User@$Box"
+
+# A dedicated, passphrase-less key for the boxes (see -SetupKey). Your personal
+# key keeps its passphrase; this one exists so an appliance on a lab LAN can be
+# deployed to without a prompt per connection. IdentitiesOnly matters: without it
+# ssh ALSO offers ~/.ssh/id_ed25519 and prompts for that key's passphrase even
+# though this one would have worked.
+$DeployKey = Join-Path $env:USERPROFILE '.ssh\adiona_ed25519'
+
 # BatchMode is left off on purpose: password auth is a legitimate way in here.
-$SshOpts = @('-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new')
+# AddKeysToAgent hands an unlocked key to the agent on first use, so a
+# passphrase-protected key is typed once per boot rather than once per connection.
+$BaseSshOpts = @('-o', 'ConnectTimeout=10', '-o', 'StrictHostKeyChecking=accept-new',
+                 '-o', 'AddKeysToAgent=yes')
+$SshOpts = $BaseSshOpts
+if (Test-Path $DeployKey) { $SshOpts += @('-i', $DeployKey, '-o', 'IdentitiesOnly=yes') }
 
 function Say  { param([string] $Message) Write-Host "==> $Message" -ForegroundColor Cyan }
+function Note { param([string] $Message) Write-Host "    $Message" -ForegroundColor DarkGray }
 function Fail { param([string] $Message) Write-Host "deploy: $Message" -ForegroundColor Red; exit 1 }
 
 function Get-Tool {
@@ -113,31 +151,150 @@ function Get-Tool {
     return $cmd.Source
 }
 
+function Initialize-SshAgent {
+    # Get the key into the Windows ssh-agent so ssh stops asking for its
+    # passphrase on every single connection. ssh-add exit codes: 0 = agent has
+    # keys, 1 = agent reachable but empty, 2 = no agent.
+    # With the dedicated deploy key in place there is no passphrase to cache.
+    if ($NoAgent -or (Test-Path $DeployKey)) { return }
+    $sshAdd = Get-Command 'ssh-add.exe' -ErrorAction SilentlyContinue
+    if (-not $sshAdd) { return }
+
+    # 2>$null: "Error connecting to agent" is the normal no-agent case, not news.
+    & $sshAdd.Source -l 2>$null > $null
+    if ($LASTEXITCODE -eq 0) { return }        # a key is already loaded
+
+    if ($LASTEXITCODE -eq 2) {
+        $svc = Get-Service ssh-agent -ErrorAction SilentlyContinue
+        if (-not $svc) { return }
+        if ($svc.StartType -eq 'Disabled') {
+            Note 'ssh-agent is disabled, so the key passphrase is asked for every connection.'
+            Note 'Enable it once (elevated):  Set-Service ssh-agent -StartupType Automatic'
+            return
+        }
+        try { Start-Service ssh-agent -ErrorAction Stop } catch {
+            Note 'could not start ssh-agent; continuing with per-connection prompts'
+            return
+        }
+    }
+
+    $key = Join-Path $env:USERPROFILE '.ssh\id_ed25519'
+    if (-not (Test-Path $key)) { $key = Join-Path $env:USERPROFILE '.ssh\id_rsa' }
+    if (-not (Test-Path $key)) { return }      # password auth; nothing to cache
+
+    Say 'loading your SSH key into the agent (passphrase asked once, then cached)'
+    & $sshAdd.Source $key
+    if ($LASTEXITCODE -ne 0) { Note 'ssh-add failed; continuing with per-connection prompts' }
+}
+
+function Invoke-RemoteScript {
+    # Send a shell script over stdin (`ssh <target> bash -s`) instead of passing it
+    # as an argument. PowerShell strips embedded double quotes when it hands an
+    # argument to a native exe, which silently mangles any non-trivial shell
+    # one-liner; stdin is immune, so the script below can be written normally.
+    param([string] $Script)
+    $tmp = Join-Path ([IO.Path]::GetTempPath()) ("adiona-cmd-" + [Guid]::NewGuid().ToString('N').Substring(0, 8) + '.sh')
+    try {
+        [IO.File]::WriteAllText($tmp, ($Script -replace "`r`n", "`n"), (New-Object Text.UTF8Encoding($false)))
+        $argLine = "$($SshOpts -join ' ') $Target bash -s"
+        $p = Start-Process -FilePath $ssh -ArgumentList $argLine `
+            -RedirectStandardInput $tmp -NoNewWindow -Wait -PassThru
+        return $p.ExitCode
+    }
+    finally { Remove-Item $tmp -Force -ErrorAction SilentlyContinue }
+}
+
 # ---------------------------------------------------------------------------
 # Debug-only modes. One connection each, no file transfer, so they are safe to
 # run against a box mid-session.
 # ---------------------------------------------------------------------------
 
+# iw lives in /usr/sbin, which is NOT on a non-root user's PATH on Debian - hence
+# the explicit path. The lease file is root-only, hence sudo (-SetupSudo first).
 $StatusCmd = @'
-echo "--- identity ---"; echo "hostname: $(hostname)   ssid: $(cat /etc/adiona/ssid 2>/dev/null || echo ?)"; echo "image VERSION: $(cat /opt/adiona/VERSION 2>/dev/null || echo ?)"; echo "last live deploy: $(cat /etc/adiona/.deployed 2>/dev/null || echo none - running the flashed image)"; echo "uptime:$(uptime -p | sed s/^up//)"; echo "--- services ---"; for u in adiona-controller adiona-kiosk; do printf "%-20s %s\n" $u $(systemctl is-active $u); done; echo "--- controller /state ---"; curl -s --max-time 3 http://127.0.0.1:8090/state || echo "(no answer on :8090)"; echo; echo "--- wifi ---"; echo "associated stations: $(iw dev wlan0 station dump 2>/dev/null | grep -c ^Station)"
-'@ -replace "`r`n", ' '
+echo "--- identity ---"
+echo "hostname:         $(hostname)"
+echo "ssid:             $(cat /etc/adiona/ssid 2>/dev/null || echo '?')"
+echo "VERSION:          $(cat /opt/adiona/VERSION 2>/dev/null || echo '?')"
+echo "last live deploy: $(cat /etc/adiona/.deployed 2>/dev/null || echo 'none - running the flashed image')"
+echo "uptime:          $(uptime -p | sed 's/^up//')"
+echo "--- services ---"
+for u in adiona-controller adiona-kiosk; do
+    printf "%-20s %s\n" "$u" "$(systemctl is-active "$u")"
+done
+echo "--- controller /state ---"
+curl -s --max-time 3 http://127.0.0.1:8090/state || echo "(no answer on :8090)"
+echo
+echo "--- headsets ---"
+echo "associated stations: $(/usr/sbin/iw dev wlan0 station dump 2>/dev/null | grep -c '^Station')"
+sudo -n cat /var/lib/NetworkManager/dnsmasq-wlan0.leases 2>/dev/null \
+    | awk '{ printf "  lease %-16s %s\n", $3, $2 }' || echo "  (lease file unreadable - run -SetupSudo)"
+'@
 
 $ProbeCmd = @'
-sudo systemctl stop adiona-kiosk; rc=0; /opt/adiona/kiosk/adiona-player.sh --probe || rc=$?; sudo systemctl start adiona-kiosk; exit $rc
+sudo systemctl stop adiona-kiosk
+rc=0
+/opt/adiona/kiosk/adiona-player.sh --probe || rc=$?
+sudo systemctl start adiona-kiosk
+exit $rc
+'@
+
+# One-time, interactive (-t, so sudo can prompt for the box password). The rule is
+# validated before it is installed and the whole sudoers set after, reverting on
+# failure: a malformed file in /etc/sudoers.d makes sudo refuse to run AT ALL,
+# which on a box you can only reach over ssh is a reflash.
+$SudoSetupCmd = @'
+u=__USER__; t=$(mktemp); printf '%s ALL=(ALL) NOPASSWD: ALL\n' $u > $t; sudo visudo -cf $t || { rm -f $t; echo 'refused: generated rule is invalid'; exit 1; }; sudo install -m 0440 -o root -g root $t /etc/sudoers.d/010-adiona-nopasswd; rm -f $t; sudo visudo -c >/dev/null || { sudo rm -f /etc/sudoers.d/010-adiona-nopasswd; echo 'sudoers set failed validation - change reverted'; exit 1; }; if sudo -n true; then echo 'OK: passwordless sudo is active for' $u; else echo 'still prompting - inspect /etc/sudoers.d/010-adiona-nopasswd'; exit 1; fi
 '@ -replace "`r`n", ' '
 
 $ssh = Get-Tool 'ssh.exe'
 
+if ($SetupKey) {
+    # Authenticate the old way for this one run - the new key isn't installed yet.
+    $SshOpts = $BaseSshOpts
+    if (-not (Test-Path $DeployKey)) {
+        Say "generating a passphrase-less deploy key at $DeployKey"
+        $keygen = Get-Tool 'ssh-keygen.exe'
+        & $keygen -t ed25519 -N '""' -C 'adiona-tv deploy' -f $DeployKey
+        if ($LASTEXITCODE -ne 0) { Fail "ssh-keygen failed ($LASTEXITCODE)" }
+    }
+    else { Say "using the existing deploy key at $DeployKey" }
+
+    $pub = (Get-Content "$DeployKey.pub" -Raw).Trim()
+    Say "installing it on $Target (expect ONE last prompt)"
+    # Double-quoted here-string so $pub interpolates - which means NO bash $(...)
+    # in here, or PowerShell would try to evaluate it as a subexpression.
+    $install = @"
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+grep -qxF '$pub' ~/.ssh/authorized_keys || echo '$pub' >> ~/.ssh/authorized_keys
+printf 'keys in authorized_keys: '
+wc -l < ~/.ssh/authorized_keys
+"@
+    $rc = Invoke-RemoteScript $install
+    if ($rc -ne 0) { Fail "could not install the key (exit $rc)" }
+    Say 'done - subsequent runs should not prompt at all'
+    exit 0
+}
+
+Initialize-SshAgent
+
+if ($SetupSudo) {
+    # The one mode that must stay interactive: sudo has to prompt for the box
+    # password, so it needs a tty and cannot have stdin taken by a script.
+    Say "granting passwordless sudo to $User on $Box (expect one password prompt)"
+    & $ssh '-t' @SshOpts $Target ($SudoSetupCmd -replace '__USER__', $User)
+    exit $LASTEXITCODE
+}
+
 if ($Status) {
     Say "status of $Target"
-    & $ssh @SshOpts $Target $StatusCmd
-    exit $LASTEXITCODE
+    exit (Invoke-RemoteScript $StatusCmd)
 }
 
 if ($Probe) {
     Say "probing RTP on $Target (kiosk stopped for the duration)"
-    & $ssh '-t' @SshOpts $Target $ProbeCmd
-    exit $LASTEXITCODE
+    exit (Invoke-RemoteScript $ProbeCmd)
 }
 
 # ---------------------------------------------------------------------------

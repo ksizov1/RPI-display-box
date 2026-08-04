@@ -38,7 +38,11 @@ set -euo pipefail
 # shellcheck source=/dev/null
 [ -f /etc/adiona/box.conf ] && source /etc/adiona/box.conf
 RTP_PORT="${RTP_PORT:-5004}"
-PLAYER_LATENCY_MS="${PLAYER_LATENCY_MS:-50}"
+# Jitter buffer. The floor is the FRAME PERIOD, not network jitter: at 15 fps
+# frames are 66 ms apart and arrive as bursts, so a buffer shorter than that
+# drops packets it should have waited for and partial frames decode as heavy
+# blocking that looks like a codec mismatch. ~2 frame periods. See box.conf.
+PLAYER_LATENCY_MS="${PLAYER_LATENCY_MS:-120}"
 
 # RTP has no in-band stream description, so the receiver must be told what the
 # payload is. Matches CastingPlugin's RtpSender: dynamic PT 96, H.264, 90 kHz.

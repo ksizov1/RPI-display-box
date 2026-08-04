@@ -155,8 +155,10 @@ Edit `config/box.conf` **before building** to change fleet defaults — most
 importantly `WIFI_PASSPHRASE`. Also tunable: SSID prefix, Wi-Fi band/channel, LAN
 subnet, RTP port, player latency, scan interval, and the reconnect grace period.
 
-> Change `WIFI_PASSPHRASE` (and the image's default `adiona`/`adiona` login in
-> `image/pi-gen/config`) before deploying to customers.
+> Change `WIFI_PASSPHRASE` before deploying to customers — and change
+> `FIRST_USER_PASS` in `image/pi-gen/config` with it. The SSH login
+> (`adionauser`) currently shares the Wi-Fi passphrase, which the waiting screen
+> displays to anyone standing in front of the box.
 
 Two settings are worth a deliberate decision per venue:
 

@@ -38,6 +38,7 @@ PLAYER_RETRY_SECONDS=2
 chromium_pid=""
 player_pid=""
 player_retry_at=0
+was_casting="false"
 
 log() { echo "[adiona-kiosk] $*"; }
 
@@ -116,8 +117,23 @@ while true; do
     # casting, and keeps it sticky while that headset stays associated to the AP
     # — so a paused stream holds the last frame rather than flashing the splash,
     # matching the behaviour the browser player used to have.
-    mode="$(curl -sf --max-time 2 "$STATE_URL" 2>/dev/null \
+    state_json="$(curl -sf --max-time 2 "$STATE_URL" 2>/dev/null)"
+    mode="$(printf '%s' "$state_json" \
             | sed -n 's/.*"mode"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    casting="$(printf '%s' "$state_json" \
+            | sed -n 's/.*"casting"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')"
+
+    # A false->true edge means a NEW cast session on the headset: the app was
+    # restarted, Live Stream was toggled, or the resolution changed. Each of those
+    # rebuilds the sender, and a receiver that is already running stays locked to
+    # the previous RTP session and would show nothing. Restart it so it picks up
+    # the new stream. (The sender keeps a stable SSRC within one app run, so an
+    # in-session resolution change is continuous; this covers the process restart.)
+    if [ "$casting" = "true" ] && [ "$was_casting" = "false" ] && running "$player_pid"; then
+        log "new cast session detected - restarting player"
+        stop_player
+    fi
+    [ -n "$casting" ] && was_casting="$casting"
 
     if [ "$mode" = "live" ]; then
         if ! running "$player_pid"; then

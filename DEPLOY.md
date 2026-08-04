@@ -50,12 +50,47 @@ Requirements the script itself enforces or documents:
 
 - `ssh.exe` and `tar.exe` (both ship with Windows 10/11).
 - **Passwordless sudo on the box.** The payload is fed to `ssh` on stdin, so
-  `sudo` has no console to prompt from. Add a `/etc/sudoers.d` NOPASSWD entry for
-  `adionauser` once, by hand.
+  `sudo` has no console to prompt from. The image does not set this up, so run
+  this **once per box**, before the first deploy:
+
+  ```powershell
+  .\tools\deploy.ps1 -SetupSudo      # asks for the box password once
+  ```
+
+  It installs `/etc/sudoers.d/010-adiona-nopasswd`, validating the rule with
+  `visudo` before installing it and re-validating the whole sudoers set after,
+  reverting on failure — a malformed file there makes `sudo` refuse to run at
+  all, which on a box reachable only over SSH means a reflash.
 - Key-based SSH auth is strongly recommended — Debian trixie's sshd applies
   `PerSourcePenalties`, so a burst of connections gets you temporarily blocked.
   A deploy is deliberately **one** connection; only `-Status` / `-Probe` /
   `-Logs` / `-Follow` open a second.
+
+### Stop the SSH passphrase prompts
+
+```powershell
+.\tools\deploy.ps1 -SetupKey      # one last prompt, then never again
+```
+
+This creates a **passphrase-less** key at `~/.ssh/adiona_ed25519`, appends it to
+the box's `authorized_keys`, and uses it for every later run. Your personal key
+keeps its passphrase and is not touched.
+
+It passes `-o IdentitiesOnly=yes` with it, which is the part that actually
+silences the prompt: without it `ssh` also offers `~/.ssh/id_ed25519` and asks for
+*that* key's passphrase even though the deploy key would have authenticated.
+
+A passphrase-less key is a deliberate trade for an appliance on a lab LAN: it
+grants only `adionauser` on the boxes. To revoke, delete its line from
+`~/.ssh/authorized_keys` on the box and delete `~/.ssh/adiona_ed25519*` locally.
+
+If you would rather keep a passphrase, the script falls back to loading your key
+into the Windows `ssh-agent` — but that service is `Disabled` by default and
+enabling it needs one elevated command:
+
+```powershell
+Set-Service ssh-agent -StartupType Automatic   # elevated, once
+```
 
 ### Targeting a box
 
