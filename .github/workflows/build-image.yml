@@ -13,11 +13,18 @@ on:
       - "v*"
 
 jobs:
-  # pi-gen only reaches our stage ~40 minutes into the build, so a single bad
-  # package name costs a whole build to discover. This resolves the name list
-  # first, in about a minute, against the same two archives the image uses.
+  # pi-gen only reaches our stage ~40 minutes into the build, so a bad package
+  # name costs most of a build to discover. This resolves the name list in about
+  # a minute, IN PARALLEL with the build.
+  #
+  # Deliberately NOT a gate (no `needs` on it, continue-on-error). It blocked two
+  # correct releases while the fault was in the check itself, which is a far worse
+  # outcome than the rare mistake it guards against: you still see the answer a
+  # minute in and can cancel the build yourself, but a broken checker can no
+  # longer stop a good image from being produced.
   preflight-packages:
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -79,7 +86,6 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
-    needs: preflight-packages
     steps:
       - name: Checkout
         uses: actions/checkout@v4
