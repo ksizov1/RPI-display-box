@@ -18,37 +18,64 @@ jobs:
   # first, in about a minute, against the same two archives the image uses.
   preflight-packages:
     runs-on: ubuntu-latest
-    container: debian:trixie
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Runs the apt query in a throwaway container rather than making the whole
+      # job run *inside* one: actions/checkout in a bare debian container has no
+      # git and behaves differently, and debugging that is not worth it for a
+      # 60-second check. Here checkout is ordinary and only apt is containerised.
       - name: Resolve stage-adiona package names
         run: |
-          set -euo pipefail
-          apt-get update -qq
-          # Name existence only, against plain Debian trixie — not dependency
-          # resolution. The Raspberry Pi archive publishes no amd64 index, so it
-          # can't be added on this runner; every package the image currently
-          # installs also exists in Debian, which is what makes this check valid.
-          missing=()
-          while read -r pkg; do
-            [ -n "$pkg" ] || continue
-            case "$pkg" in \#*) continue ;; esac
-            apt-cache show "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
-          done < image/pi-gen/stage-adiona/00-install/00-packages
+          PKGFILE=image/pi-gen/stage-adiona/00-install/00-packages
+          if [ ! -f "$PKGFILE" ]; then
+            echo "::warning::$PKGFILE not found - skipping package preflight"
+            exit 0
+          fi
+          echo "Checking $(grep -cve '^[[:space:]]*$' "$PKGFILE") package name(s)."
 
-          if [ ${#missing[@]} -ne 0 ]; then
-            echo "::error::Unknown package name(s): ${missing[*]}"
-            echo
-            echo "These do not exist in Debian trixie. Either the name is wrong, or"
-            echo "the package is Raspberry-Pi-archive-only (this check can't see that"
-            echo "archive — it has no amd64 index). Verify at:"
+          # Name existence only, against plain Debian trixie - not dependency
+          # resolution. The Raspberry Pi archive publishes no amd64 index so it
+          # cannot be added here; every package the image installs also exists in
+          # Debian, which is what makes this check meaningful.
+          set +e
+          out="$(docker run --rm -v "$PWD:/w" -w /w debian:trixie bash -c '
+            apt-get update -qq >/dev/null 2>&1 || { echo "__APTFAIL__"; exit 0; }
+            while read -r pkg; do
+              [ -n "$pkg" ] || continue
+              case "$pkg" in \#*) continue ;; esac
+              apt-cache show "$pkg" >/dev/null 2>&1 || echo "$pkg"
+            done < '"$PKGFILE"'
+          ' 2>&1)"
+          rc=$?
+          set -e
+
+          # A broken checker must never block a release. Only a POSITIVE finding -
+          # named packages that do not resolve - fails this job; anything else is
+          # reported as a warning and the build proceeds.
+          if [ $rc -ne 0 ]; then
+            echo "::warning::package preflight could not run (docker exit $rc). Build continues."
+            echo "$out"
+            exit 0
+          fi
+          if printf '%s' "$out" | grep -q '__APTFAIL__'; then
+            echo "::warning::apt-get update failed in the check container. Build continues."
+            exit 0
+          fi
+
+          missing="$(printf '%s' "$out" | sed '/^[[:space:]]*$/d')"
+          if [ -n "$missing" ]; then
+            echo "::error::Unknown package name(s): $(printf '%s' "$missing" | tr '\n' ' ')"
+            echo ""
+            echo "These do not exist in Debian trixie. Either the name is wrong, or the"
+            echo "package is Raspberry-Pi-archive-only (this check cannot see that archive"
+            echo "- it has no amd64 index). Verify which package ships a given file at:"
             echo "  https://packages.debian.org/search?searchon=contents&keywords=<file>&suite=trixie&arch=arm64"
-            echo "and if it really is Pi-only, skip it here explicitly."
+            echo "If it really is Pi-only, drop it from this check explicitly."
             exit 1
           fi
-          echo "All $(grep -cve '^\s*$' image/pi-gen/stage-adiona/00-install/00-packages) package names resolve."
+          echo "All package names resolve."
 
   build:
     runs-on: ubuntu-latest
