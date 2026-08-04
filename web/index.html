@@ -80,14 +80,16 @@
      two valid pairings rather than four independent band choices. */
   .wifi-band { margin: 1.5vmin 0 0.5vmin; padding-top: 1.5vmin;
                border-top: 1px solid #e0e0e0; text-align: center; }
-  .band-label { font-size: 1.9vmin; color: #555; margin-bottom: 0.8vmin; }
-  .band-current { font-size: 2.2vmin; font-weight: 600; color: #111; margin-bottom: 1vmin; }
-  .band-current b { color: #1a73e8; }
-  #bandToggle { font-size: 2.1vmin; padding: 1vmin 2.6vmin; border: 2px solid #c2c2c2;
-                border-radius: 1vmin; background: #f3f3f3; color: #111; }
+  .band-row { display: flex; align-items: center; justify-content: center;
+              gap: 2vmin; flex-wrap: wrap; }
+  .band-current { font-size: 2.1vmin; color: #333; white-space: nowrap; }
+  .band-current b { color: #1a73e8; font-weight: 700; }
+  #bandToggle { font-size: 2vmin; padding: 0.8vmin 2.2vmin; border: 2px solid #c2c2c2;
+                border-radius: 1vmin; background: #f3f3f3; color: #111; white-space: nowrap; }
   #bandToggle:focus { outline: none; border-color: #1a73e8; box-shadow: 0 0 0 3px rgba(26,115,232,.35); }
   #bandToggle:disabled { color: #9aa0a6; background: #f6f6f6; border-color: #e2e2e2; }
-  .band-hint { font-size: 1.7vmin; color: #777; margin-top: 0.8vmin; min-height: 2vmin; }
+  .band-hint { font-size: 1.7vmin; color: #777; margin-top: 0.8vmin; }
+  .band-hint:empty { display: none; }   /* reserve no space when it has nothing to say */
   .band-hint.warn { color: #c1121f; }
 </style>
 </head>
@@ -118,17 +120,21 @@
       <label>Password (blank = use saved)
         <input id="wifiPass" type="password" autocomplete="off"></label>
     </div>
-    <div class="wifi-band">
-      <div class="band-label">Radio band plan</div>
-      <div id="bandCurrent" class="band-current"></div>
-      <button id="bandToggle">Switch</button>
-      <div id="bandHint" class="band-hint"></div>
-    </div>
     <div class="wifi-btns">
       <button id="wifiConnect">Connect</button>
       <button id="wifiForget">Forget</button>
       <button id="wifiRescan">Rescan</button>
       <button id="wifiClose">Close (Esc)</button>
+    </div>
+    <div class="wifi-band">
+      <div class="band-row">
+        <span id="bandCurrent" class="band-current"></span>
+        <button id="bandToggle">Switch</button>
+      </div>
+      <!-- Carries text ONLY when it says something the operator needs: the
+           reason the switch is unavailable, or the confirm warning. Empty and
+           collapsed the rest of the time. -->
+      <div id="bandHint" class="band-hint"></div>
     </div>
     <div id="wifiMsg" class="wifi-msg"></div>
   </div>
@@ -302,10 +308,12 @@
     var blocked = (bandPlan === "ap5" && !renderBand.can5);
     elBandToggle.disabled = blocked;
     elBandHint.className = "band-hint" + (blocked ? " warn" : "");
+    elBandToggle.textContent = bandPlan === "ap5"
+      ? "Switch to headset 2.4 GHz"
+      : "Switch to headset 5 GHz";
 
     if (blocked) {
       bandArmed = false;
-      elBandToggle.textContent = "Switch to headset 2.4 GHz";
       elBandHint.textContent = renderBand.present
         ? "Unavailable - this USB adapter is 2.4 GHz only, so it cannot take the internet uplink."
         : "Unavailable - no USB Wi-Fi adapter detected.";
@@ -316,12 +324,9 @@
       elBandToggle.textContent = "Press again to confirm";
       elBandHint.textContent = "The headset will disconnect and must rejoin the same network name.";
     } else {
-      elBandToggle.textContent = bandPlan === "ap5"
-        ? "Switch to headset 2.4 GHz (longer range)"
-        : "Switch to headset 5 GHz (default)";
-      elBandHint.textContent = bandPlan === "ap5"
-        ? "Use 2.4 GHz for the headset only when it is far from the box."
-        : "5 GHz is the default: cleaner spectrum and more headroom for the video.";
+      // Nothing to say in the resting state - the row already reads as a
+      // statement of the current split plus what the button would change it to.
+      elBandHint.textContent = "";
     }
   }
 
