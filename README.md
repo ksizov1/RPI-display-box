@@ -259,37 +259,33 @@ a snappier return; raise it to ride out longer pauses.
 
 ## Troubleshooting the USB Wi-Fi uplink
 
-A USB dongle that associates and then drops is almost always power management,
-not signal. The box disables both mechanisms — 802.11 power save and USB
-autosuspend — via `/etc/NetworkManager/conf.d/10-adiona-wifi.conf` and, because
-some drivers restore the defaults on reassociation, again at runtime from the
-controller every 30 s.
+A USB dongle that associates and then drops is *conventionally* blamed on power
+management. On this box it was not: 802.11 power save and USB autosuspend were
+both measured as already disabled while the link went on failing, and the actual
+cause was **both radios sharing 2.4 GHz** with their antennas centimetres apart.
+Radio power management is therefore left at the driver default — keeping the
+radios permanently awake fixed nothing and cost idle power and heat.
 
-If it is still unstable, work through these in order:
+So check the band split first, and treat power management as a late hypothesis
+rather than a first guess.
 
 ```bash
 IF=wlan1        # the dongle; wlan0 is the built-in AP radio
 
-iw dev $IF get power_save                     # must say "off"
-cat /sys/class/net/$IF/device/../power/control # must say "on"
+iw dev wlan0 info | grep channel      # AP     - expect 5 GHz (36…)
+iw dev $IF link  | grep freq          # uplink - expect 2.4 GHz (24xx)
 dmesg -T | grep -iE "$IF|usb|firmware" | tail -40
 journalctl -u NetworkManager -n 60 --no-pager
+vcgencmd get_throttled                # 0x0 = supply is fine
 ```
 
 - **`dmesg` shows resets, `firmware` errors, or repeated disconnects** — driver
   or power-delivery problem, not configuration. Check the PSU first: a Pi 5 on an
   underpowered supply browns out USB under load, and a Wi-Fi dongle transmitting
   is exactly that load. Use the official 5 V/5 A supply.
-- **Both radios on the same band.** This is the most common cause of "works,
-  then unstable" once power management is ruled out, and it is what was actually
-  wrong here. Check the two are still split:
-
-  ```bash
-  iw dev wlan0 info | grep channel     # AP      - expect a 5 GHz channel (36…)
-  iw dev wlan1 link  | grep freq       # uplink  - expect a 2.4 GHz freq (24xx)
-  ```
-
-  If the uplink has drifted onto 5 GHz, its saved profile predates the band plan.
+- **Both radios on the same band.** Check this first — it is what was actually
+  wrong here, and it is invisible unless you look. If the uplink has drifted onto
+  5 GHz, its saved profile predates the band plan.
   The controller pins every saved profile at startup, so restarting
   `adiona-controller` (or redeploying) is enough; `UPLINK_BAND` in `box.conf`
   controls it.

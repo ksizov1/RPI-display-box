@@ -240,50 +240,13 @@ def _nmcli_split(line):
     return out
 
 
-# Throttle for harden_uplink(); the work is idempotent but shells out.
-_hardened = {"iface": None, "at": 0.0}
-UPLINK_HARDEN_INTERVAL = 30.0
-
-
-def harden_uplink(iface, force=False):
-    """Turn off the power management that makes USB Wi-Fi dongles drop.
-
-    Two independent sleep mechanisms bite a USB adapter, and both present the same
-    way: it associates, works for a while, then stalls or gets deauthenticated.
-
-      1. 802.11 power save - the radio dozes between beacons and misses frames.
-         NetworkManager is told to disable it (conf.d/10-adiona-wifi.conf), but
-         some drivers re-enable it on reassociation, so it is also forced here.
-      2. USB autosuspend - the kernel suspends the *device* after an idle period.
-         The adapter then has to be woken, and several cheap chipsets do not come
-         back cleanly. power/control lives on the USB device, one level above the
-         interface, so both paths are attempted.
-
-    Re-applied periodically rather than once, because a re-enumerating dongle (or
-    a driver reset) comes back with the defaults restored.
-    """
-    if not iface:
-        return
-    now = time.monotonic()
-    if not force and _hardened["iface"] == iface and now - _hardened["at"] < UPLINK_HARDEN_INTERVAL:
-        return
-    _hardened.update(iface=iface, at=now)
-
-    try:
-        subprocess.run(["iw", "dev", iface, "set", "power_save", "off"],
-                       capture_output=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-    base = "/sys/class/net/%s/device" % iface
-    for rel in ("power/control", "../power/control"):
-        path = os.path.join(base, rel)
-        try:
-            if os.path.exists(path):
-                with open(path, "w") as fh:
-                    fh.write("on")
-        except OSError:
-            pass
+# NOTE: an earlier harden_uplink() lived here and forced 802.11 power save off
+# and USB autosuspend off every 30 s, on the theory that they were behind an
+# unstable USB uplink. They were not. Both were measured as already applied on a
+# box whose link was still failing, and the real cause turned out to be the AP
+# and the dongle sharing 2.4 GHz with their antennas centimetres apart. Keeping
+# the radios awake fixed nothing and cost idle power and heat, so radio power
+# management is now left entirely at the driver default.
 
 
 # The two supported band plans. They exist as a pair because the constraint is
@@ -415,13 +378,17 @@ def pin_uplink_profile(con_name):
     associate on whichever band the upstream SSID is strongest on, including the
     one the AP is using, which puts both radios back in the same spectrum.
 
-    Also pins the MAC (randomisation makes some APs treat every reassociation as
-    a new station) and disables powersave per-connection, because some drivers
-    ignore the global default from conf.d.
+    Also pins the MAC - not a power setting: randomisation makes some APs treat
+    every reassociation as a new station.
+
+    powersave is explicitly reset to 0 (driver default) rather than simply left
+    alone. Profiles saved by an earlier version have powersave=2 baked into them,
+    and a stored property persists until something overwrites it, so restoring
+    the default has to be done actively or those boxes keep their radios awake.
     """
     args = ["con", "modify", con_name,
             "802-11-wireless.cloned-mac-address", "permanent",
-            "802-11-wireless.powersave", "2"]
+            "802-11-wireless.powersave", "0"]
     if UPLINK_BAND:
         args += ["802-11-wireless.band", UPLINK_BAND]
     run_nmcli(args, timeout=15)
@@ -498,9 +465,6 @@ def uplink_status():
     up_if = wifi_uplink_iface()
     wifi_ssid = None
     if up_if:
-        # Cheap and throttled internally; keeps power management off across
-        # driver resets and re-enumeration, not just at connect time.
-        harden_uplink(up_if)
         rc, out, _ = run_nmcli(["-t", "-f", "GENERAL.CONNECTION", "dev", "show", up_if])
         for line in out.splitlines():
             if line.startswith("GENERAL.CONNECTION:"):
@@ -581,7 +545,6 @@ def wifi_connect(ssid, password):
 
     if rc == 0:
         pin_uplink_profile(ssid)
-        harden_uplink(up, force=True)
 
     return {"ok": rc == 0, "message": msg}
 
