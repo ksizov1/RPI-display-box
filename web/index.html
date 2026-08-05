@@ -50,16 +50,19 @@
      measured off the actual pixels (logos x764-1664 and x2104-3024, wordmark
      x360-3444 of 3840x2160), not eyeballed, so nothing clips.
 
-     Dimmed to half brightness with a filter on the WHOLE layer, not on the tiles
-     individually: the crops carry the splash's white background with them, so
-     background and tiles must be dimmed by the identical operation or they land
-     a level apart and the tile rectangles show as seams.
+     Half brightness comes from a pre-dimmed backdrop plus mix-blend-mode:
+     multiply, NOT from a filter. Multiply against #808080 does both jobs at
+     once: the white background each crop carries multiplies into the grey and
+     disappears (255 x 128 / 255 = 128, an exact match, so no tile rectangles and
+     no seams), while the artwork multiplies to half its value - the same result
+     brightness(0.5) gave.
 
-     mix-blend-mode: multiply then makes those white tile backgrounds vanish into
-     the backdrop (white x anything = anything), so the elements can overlap
-     without one painting a grey rectangle over another. */
-  #saver { position: fixed; inset: 0; background: #fff; z-index: 5; display: none;
-           filter: brightness(0.5); cursor: none; }
+     It replaced `filter: brightness(0.5)` on this layer because that filtered
+     the ENTIRE viewport every frame; multiply touches only the three element
+     rectangles. On a Pi driving a TV this runs unattended for hours, so the
+     difference is heat, not just frame time. */
+  #saver { position: fixed; inset: 0; background: #808080; z-index: 5; display: none;
+           cursor: none; }
   #saver.on { display: block; }
   .sv { position: absolute; top: 0; left: 0; background-image: url("splash.png");
         background-repeat: no-repeat; will-change: transform;
@@ -244,6 +247,8 @@
   // could reset: the box sits on the waiting screen unattended for hours, and
   // that is exactly the case that burns in.
   var IDLE_MS = 3 * 60 * 1000;
+  var SAVER_FPS = 20;                  // see saverTick - deliberately not 60
+  var SAVER_FRAME_MS = 1000 / SAVER_FPS;
   var saver = document.getElementById("saver");
   var svItems = [
     // Distinct directions AND distinct speeds. Equal speeds would trace a
@@ -295,10 +300,22 @@
 
   function saverTick(t) {
     if (!saverOn) return;
+    rafId = requestAnimationFrame(saverTick);
+
+    // Run the animation at SAVER_FPS, not at the display's refresh rate. Nothing
+    // here needs 60 fps - the elements drift at a few tens of px/s - and this is
+    // a Pi driving a TV that sits idle for hours, so two thirds of the
+    // compositing work is two thirds of the heat for no visible difference.
+    // Returning early leaves the transforms untouched, so no recomposite happens
+    // on the skipped frames.
     if (!lastFrameT) lastFrameT = t;
-    // Clamp dt so a stalled tab (or a slow frame) cannot teleport an element
-    // through a wall and strand it off-screen.
-    var dt = Math.min(0.05, (t - lastFrameT) / 1000);
+    var elapsed = t - lastFrameT;
+    if (elapsed < SAVER_FRAME_MS) return;
+    // Clamp only against real stalls (a throttled tab), not against ordinary
+    // frame jitter - clamping near the frame interval would quietly slow
+    // everything down. 0.25 s of travel is ~15 px, far too little to tunnel
+    // through anything.
+    var dt = Math.min(0.25, elapsed / 1000);
     lastFrameT = t;
     var W = window.innerWidth, H = window.innerHeight;
 
@@ -341,8 +358,7 @@
     svItems.forEach(function (it) {
       it.el.style.transform = "translate(" + it.x.toFixed(1) + "px," + it.y.toFixed(1) + "px)";
     });
-    rafId = requestAnimationFrame(saverTick);
-  }
+  }                                    // next frame was already queued at the top
 
   // ── Poll the controller for what to display ───────────────────────────────
   function poll() {
