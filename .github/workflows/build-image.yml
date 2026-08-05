@@ -1,5 +1,16 @@
 name: Build Adiona-TV image
 
+# Tagging a commit that was just pushed produces TWO runs seconds apart - one for
+# the branch, one for the tag - and only the tag one builds an image. Identical
+# names in the Actions list made it look like the build had failed to start, so
+# each run says which it is.
+run-name: >-
+  ${{ startsWith(github.ref, 'refs/tags/v')
+      && format('Image {0}', github.ref_name)
+      || (github.event_name == 'workflow_dispatch'
+          && format('Image (manual, {0})', github.ref_name)
+          || format('Preflight only, no image ({0})', github.ref_name)) }}
+
 # Builds the flashable 64-bit Raspberry Pi OS image in the cloud and uploads it
 # as a build artifact — no local Linux/Docker needed. Run it from the Actions
 # tab (workflow_dispatch) or on a version tag.
