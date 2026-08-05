@@ -102,9 +102,26 @@ $env:ADIONA_BOX = 'adiona-tv-1f3a.local'    # for the rest of the session
 ```
 
 The box is a DHCP client on `eth0`, so with an Ethernet uplink it is reachable at
-`<hostname>.local` (avahi is installed). Failing that, join its Wi-Fi and use
-`192.168.50.1`, or use a keyboard on the box — `Ctrl+Alt+F2` reaches a login shell
-(the kiosk runs `cage -s`, which permits VT switching).
+`<hostname>.local`. The hostname is derived from the Pi's Wi-Fi MAC, not from the
+card, so **reflashing the same Pi keeps the same name**.
+
+You should not normally have to think about this: the script tries the `.local`
+name, then the bare name (most routers answer that from the DHCP lease, by a
+different mechanism that survives mDNS being broken), then the last IP that
+worked — proving each with a TCP connect to sshd, so a name pointing at a stale
+lease is rejected rather than hung on. It prints which one it used.
+
+`.local` on Windows is genuinely unreliable, and not because of the box: the
+query is multicast and the reply must return on the same interface, so a machine
+carrying dead APIPA adapters (a disconnected second NIC, Bluetooth PAN) can send
+it somewhere that never answers, and which interface wins shifts as adapters come
+and go. Failures are then negatively cached for minutes. **None of this affects a
+customer** — nothing in the streaming path resolves a name at all.
+
+If all three candidates fail the box is genuinely unreachable: off, still
+booting, or on another network. Join its Wi-Fi and use `192.168.50.1`, or use a
+keyboard on the box — `Ctrl+Alt+F2` reaches a login shell (the kiosk runs
+`cage -s`, which permits VT switching).
 
 Credentials come from `image/pi-gen/config`: `adionauser` / `stoPdrunKdrivinG`.
 

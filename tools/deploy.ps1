@@ -30,6 +30,15 @@
 .PARAMETER Box
     Target hostname or IP. Defaults to $env:ADIONA_BOX, else adiona-tv-6ced.local.
 
+    A name is resolved by trying, in order: the name as given (mDNS), the bare
+    name without .local (which most routers answer from the DHCP lease, by a
+    different mechanism that survives mDNS being broken), and the last IP that
+    worked. Each candidate is proven with a TCP connect to sshd, so a name that
+    resolves to a stale lease is rejected rather than hung on. The winning
+    address is cached in %LOCALAPPDATA%\adiona-deploy\last-known-good.json.
+
+    An IP given here is used as-is, no probing.
+
 .PARAMETER User
     SSH login. Defaults to $env:ADIONA_USER, else adionauser.
 
@@ -123,7 +132,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
-$Target = "$User@$Box"
+# $Target is set after Resolve-Box runs, further down.
 
 # A dedicated, passphrase-less key for the boxes (see -SetupKey). Your personal
 # key keeps its passphrase; this one exists so an appliance on a lab LAN can be
@@ -143,6 +152,118 @@ if (Test-Path $DeployKey) { $SshOpts += @('-i', $DeployKey, '-o', 'IdentitiesOnl
 function Say  { param([string] $Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 function Note { param([string] $Message) Write-Host "    $Message" -ForegroundColor DarkGray }
 function Fail { param([string] $Message) Write-Host "deploy: $Message" -ForegroundColor Red; exit 1 }
+
+# ---------------------------------------------------------------------------
+# Finding the box.
+#
+# The default target is an mDNS name, and mDNS on Windows is unreliable in a way
+# that has nothing to do with the box: the query is multicast to 224.0.0.251 and
+# the answer has to return on the same interface, so a machine carrying dead
+# APIPA adapters (a disconnected second NIC, Bluetooth PAN) can send it somewhere
+# that will never answer, and which interface wins shifts as adapters come and
+# go. A failed lookup is then negatively cached for minutes, and .local is also
+# claimed by LLMNR and by Bonjour if some other app installed it.
+#
+# None of this touches the product: nothing in the streaming path resolves a name
+# (the headset addresses the box by gateway IP, the box finds headsets from DHCP
+# leases, the player just binds a port). It only breaks deploys, so it is fixed
+# here rather than in the image.
+#
+# Three ways to find the same box, cheapest first. Each candidate is proven with
+# a real TCP connect to sshd, which tests resolution and reachability together -
+# a name that resolves to a stale lease is worse than one that does not resolve.
+# ---------------------------------------------------------------------------
+
+function Get-BoxCacheFile {
+    $dir = Join-Path $env:LOCALAPPDATA 'adiona-deploy'
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    return (Join-Path $dir 'last-known-good.json')
+}
+
+function Get-CachedBoxIp {
+    param([string] $Key)
+    $f = Get-BoxCacheFile
+    if (-not (Test-Path $f)) { return $null }
+    try {
+        $map = Get-Content $f -Raw | ConvertFrom-Json
+        return $map.$Key
+    } catch { return $null }
+}
+
+function Set-CachedBoxIp {
+    param([string] $Key, [string] $Ip)
+    if (-not $Ip) { return }
+    $f = Get-BoxCacheFile
+    $map = @{}
+    if (Test-Path $f) {
+        try { (Get-Content $f -Raw | ConvertFrom-Json).PSObject.Properties |
+                ForEach-Object { $map[$_.Name] = $_.Value } } catch { }
+    }
+    $map[$Key] = $Ip
+    try { $map | ConvertTo-Json | Set-Content -Path $f -Encoding utf8 } catch { }
+}
+
+function Test-BoxReachable {
+    param([string] $HostName, [int] $TimeoutMs = 2500)
+    $c = $null
+    try {
+        $c = New-Object System.Net.Sockets.TcpClient
+        # BeginConnect resolves the name itself, so an unresolvable host fails
+        # here exactly like an unreachable one - which is what we want.
+        $iar = $c.BeginConnect($HostName, 22, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
+        $c.EndConnect($iar)
+        return $true
+    } catch { return $false }
+    finally { if ($c) { $c.Close() } }
+}
+
+function Get-Ipv4For {
+    param([string] $HostName)
+    $ip = $null
+    if ([System.Net.IPAddress]::TryParse($HostName, [ref] $ip)) { return $HostName }
+    try {
+        return ([System.Net.Dns]::GetHostAddresses($HostName) |
+                Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                Select-Object -First 1).IPAddressToString
+    } catch { return $null }
+}
+
+function Resolve-Box {
+    param([string] $Configured)
+
+    $parsed = $null
+    if ([System.Net.IPAddress]::TryParse($Configured, [ref] $parsed)) { return $Configured }
+
+    $tried = @()
+    $candidates = @([pscustomobject]@{ Host = $Configured; How = 'mDNS name' })
+    if ($Configured -like '*.local') {
+        # Not mDNS at all: most routers register DHCP client hostnames in their
+        # own DNS, so the bare name resolves by a completely separate mechanism
+        # and survives mDNS being broken.
+        $candidates += [pscustomobject]@{ Host = ($Configured -replace '\.local$', ''); How = 'router DNS (short name)' }
+    }
+    $cached = Get-CachedBoxIp $Configured
+    if ($cached) { $candidates += [pscustomobject]@{ Host = $cached; How = 'last known good IP' } }
+
+    foreach ($c in $candidates) {
+        if (Test-BoxReachable $c.Host) {
+            if ($c.How -ne 'mDNS name') { Note "found via $($c.How): $($c.Host)" }
+            Set-CachedBoxIp $Configured (Get-Ipv4For $c.Host)
+            return $c.Host
+        }
+        $tried += "$($c.Host) [$($c.How)]"
+    }
+
+    Fail (@"
+could not reach $Configured on port 22. Tried:
+      $($tried -join "`n      ")
+    The box may be off, still booting, or on another network. If you know its
+    address, use it directly - it is cached for next time:
+      .\tools\deploy.ps1 -Box 192.168.1.168
+      `$env:ADIONA_BOX = '192.168.1.168'   # for the rest of the session
+"@)
+}
 
 function Get-Tool {
     param([string] $Name)
@@ -258,6 +379,12 @@ u=__USER__; t=$(mktemp); printf '%s ALL=(ALL) NOPASSWD: ALL\n' $u > $t; sudo vis
 '@ -replace "`r`n", ' '
 
 $ssh = Get-Tool 'ssh.exe'
+
+# Locate the box before anything needs $Target. Every mode below - deploy, the
+# setup switches, the debug modes - goes through this, so none of them can fail
+# on a name lookup that the next candidate would have solved.
+$Box = Resolve-Box $Box
+$Target = "$User@$Box"
 
 if ($SetupKey) {
     # Authenticate the old way for this one run - the new key isn't installed yet.
