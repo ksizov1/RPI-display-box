@@ -409,10 +409,29 @@ function Reset-KnownHosts {
     # being done for you. Entries can be filed under any of the names the box has
     # been reached by, so clear them all.
     $keygen = Get-Tool 'ssh-keygen.exe'
-    foreach ($h in ($Hosts | Where-Object { $_ } | Select-Object -Unique)) {
-        & $keygen -R $h 2>&1 | Out-Null
-        Note "cleared known_hosts entry for $h"
+    # ssh-keygen -R writes "Host ... not found in known_hosts" to STDERR when
+    # there is nothing to remove, which is a normal outcome here. Windows
+    # PowerShell turns native stderr into a NativeCommandError, and this script
+    # runs with ErrorActionPreference=Stop, so that benign message aborted the
+    # whole run. Ask first with -F (silent, exit code only) and relax the
+    # preference around the native calls.
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        foreach ($h in ($Hosts | Where-Object { $_ } | Select-Object -Unique)) {
+            $present = $false
+            try {
+                & $keygen -F $h 2>$null | Out-Null
+                $present = ($LASTEXITCODE -eq 0)
+            } catch { $present = $false }
+
+            if ($present) {
+                try { & $keygen -R $h 2>$null | Out-Null } catch { }
+                Note "cleared stale known_hosts entry for $h"
+            }
+        }
     }
+    finally { $ErrorActionPreference = $prev }
 }
 
 function Invoke-SetupKey {
