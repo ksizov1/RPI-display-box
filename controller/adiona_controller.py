@@ -371,27 +371,80 @@ def set_band_plan(plan):
     return {"ok": True, "message": "Band plan applied - reconnect the headset"}
 
 
-def pin_uplink_profile(con_name):
+def profile_ssid(con_name):
+    """The SSID a saved profile actually targets (its name need not match)."""
+    rc, out, _ = run_nmcli(["-t", "-f", "802-11-wireless.ssid", "con", "show", con_name])
+    for line in out.splitlines():
+        if line.startswith("802-11-wireless.ssid:"):
+            return line.split(":", 1)[1].strip()
+    return con_name
+
+
+def bands_visible_for(ssid, iface):
+    """Bands ('bg'/'a') this SSID is currently on air on. Empty set = don't know.
+
+    Scanning is a property of the device, not of a connection profile, so this
+    still sees a 5 GHz BSS while the profile is pinned to 2.4 GHz - which is what
+    lets a box that has pinned itself into a corner notice and climb back out.
+    """
+    if not ssid or not iface:
+        return set()
+    rc, out, _ = run_nmcli(["-t", "-f", "SSID,FREQ", "dev", "wifi", "list", "ifname", iface])
+    bands = set()
+    for line in out.splitlines():
+        p = _nmcli_split(line)
+        if len(p) >= 2 and p[0] == ssid:
+            m = re.match(r"\s*(\d+)", p[1])
+            if m:
+                f = int(m.group(1))
+                if 2400 <= f < 2500:
+                    bands.add("bg")
+                elif 5000 <= f < 6000:
+                    bands.add("a")
+    return bands
+
+
+def pin_uplink_profile(con_name, iface=None):
     """Apply the uplink policy to one saved Wi-Fi connection profile.
 
-    Band pinning is the part that matters: NetworkManager will otherwise happily
-    associate on whichever band the upstream SSID is strongest on, including the
-    one the AP is using, which puts both radios back in the same spectrum.
+    Band pinning keeps the uplink off the AP's band, where the two antennas are
+    centimetres apart and the AP deafens the dongle's receiver.
+
+    But 802-11-wireless.band is a HARD restriction in NetworkManager, not a
+    preference: a profile pinned to a band its network is not on simply never
+    associates, and NM reports 'ssid-not-found' - which reads on screen as the
+    network being out of range while every other device in the room is connected
+    to it. So the band is only pinned when the SSID is actually on air there, and
+    is otherwise explicitly CLEARED rather than left alone. Clearing matters as
+    much as setting: a stored property persists until overwritten, so a box
+    already pinned into a corner only recovers if something actively frees it.
+
+    Connectivity wins over interference when the two conflict. An uplink sharing
+    the AP's band degrades the stream; an uplink that cannot associate at all
+    takes out licence validation and every other internet-dependent feature.
 
     Also pins the MAC - not a power setting: randomisation makes some APs treat
     every reassociation as a new station.
 
-    powersave is explicitly reset to 0 (driver default) rather than simply left
-    alone. Profiles saved by an earlier version have powersave=2 baked into them,
-    and a stored property persists until something overwrites it, so restoring
-    the default has to be done actively or those boxes keep their radios awake.
+    powersave is explicitly reset to 0 (driver default), because profiles saved
+    by an earlier version have powersave=2 stored in them.
     """
-    args = ["con", "modify", con_name,
-            "802-11-wireless.cloned-mac-address", "permanent",
-            "802-11-wireless.powersave", "0"]
+    band = ""                                   # empty = no restriction
     if UPLINK_BAND:
-        args += ["802-11-wireless.band", UPLINK_BAND]
-    run_nmcli(args, timeout=15)
+        ssid = profile_ssid(con_name)
+        seen = bands_visible_for(ssid, iface or wifi_uplink_iface())
+        if UPLINK_BAND in seen:
+            band = UPLINK_BAND
+        elif seen:
+            print("[adiona-controller] '%s' is not on air on %s (seen on: %s) - "
+                  "leaving its band unrestricted so it can still connect"
+                  % (ssid, UPLINK_BAND, ",".join(sorted(seen))))
+        # seen empty: no scan data, so we cannot tell. Fail open.
+
+    run_nmcli(["con", "modify", con_name,
+               "802-11-wireless.cloned-mac-address", "permanent",
+               "802-11-wireless.powersave", "0",
+               "802-11-wireless.band", band], timeout=15)
 
 
 def pin_all_uplink_profiles():
@@ -400,12 +453,17 @@ def pin_all_uplink_profiles():
     Without this, a profile saved before the band plan existed keeps autoconnecting
     on whatever band it likes, and the operator would have to re-enter credentials
     through the on-screen setup to pick up the new policy.
+
+    This runs on EVERY start, which is what makes pin_uplink_profile's clearing
+    behaviour the self-repair path: a box left unable to associate by an earlier,
+    unconditional pin frees itself on the next controller start.
     """
+    iface = wifi_uplink_iface()
     rc, out, _ = run_nmcli(["-t", "-f", "NAME,TYPE", "con", "show"])
     for line in out.splitlines():
         p = _nmcli_split(line)
         if len(p) >= 2 and p[1] == "802-11-wireless" and p[0] != AP_CON:
-            pin_uplink_profile(p[0])
+            pin_uplink_profile(p[0], iface)
 
 
 def ethernet_up():
