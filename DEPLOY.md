@@ -57,6 +57,24 @@ Requirements the script itself enforces or documents:
   .\tools\deploy.ps1 -SetupSudo      # asks for the box password once
   ```
 
+### After flashing a card
+
+A new card breaks three things at once: it regenerates its SSH host keys (so
+`ssh` refuses with REMOTE HOST IDENTIFICATION HAS CHANGED), and it starts with no
+`authorized_keys` and no sudoers rule. One command fixes all three:
+
+```powershell
+.\tools\deploy.ps1 -Reflashed
+```
+
+Two prompts — the SSH password once, then the sudo password once. It installs the
+key first so the sudo step can authenticate with it rather than asking again.
+
+Clearing a *changed* host key is deliberately not automatic anywhere else. It is
+the same warning a genuine interception produces, and it should only be waved
+away when you know you just reflashed the box — which is what passing this switch
+asserts.
+
   It installs `/etc/sudoers.d/010-adiona-nopasswd`, validating the rule with
   `visudo` before installing it and re-validating the whole sudoers set after,
   reverting on failure — a malformed file there makes `sudo` refuse to run at

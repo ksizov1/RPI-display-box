@@ -76,6 +76,18 @@
     ssh stops offering your personal key and asking for ITS passphrase) for every
     later run. Costs one last prompt. Your personal key is not touched.
 
+.PARAMETER Reflashed
+    Everything a freshly flashed card needs, in one command: clear the stale SSH
+    host keys, install the deploy key, then grant passwordless sudo.
+
+    A new card regenerates its host keys on first boot and starts with no
+    authorized_keys and no sudoers rule, so all three break at once. Clearing a
+    CHANGED host key is deliberately not automatic anywhere else - it is the same
+    warning a real interception produces, and it should only be waved away when
+    you know you just reflashed the box, which is what passing this switch means.
+
+    Expect two prompts: the SSH password once, then the sudo password once.
+
 .PARAMETER NoAgent
     Skip the ssh-agent handling and let ssh prompt for the key passphrase per
     connection.
@@ -124,6 +136,7 @@ param(
     [switch] $Follow,
     [switch] $SetupSudo,
     [switch] $SetupKey,
+    [switch] $Reflashed,
     [switch] $NoAgent,
     [switch] $Status,
     [switch] $Probe,
@@ -383,12 +396,28 @@ $ssh = Get-Tool 'ssh.exe'
 # Locate the box before anything needs $Target. Every mode below - deploy, the
 # setup switches, the debug modes - goes through this, so none of them can fail
 # on a name lookup that the next candidate would have solved.
+$ConfiguredBox = $Box
 $Box = Resolve-Box $Box
 $Target = "$User@$Box"
 
-if ($SetupKey) {
+function Reset-KnownHosts {
+    param([string[]] $Hosts)
+    # A reflashed card regenerates its SSH host keys on first boot, so ssh
+    # refuses to connect with REMOTE HOST IDENTIFICATION HAS CHANGED. That is the
+    # correct behaviour and the same warning a real interception produces, which
+    # is exactly why clearing it lives behind an explicit switch rather than
+    # being done for you. Entries can be filed under any of the names the box has
+    # been reached by, so clear them all.
+    $keygen = Get-Tool 'ssh-keygen.exe'
+    foreach ($h in ($Hosts | Where-Object { $_ } | Select-Object -Unique)) {
+        & $keygen -R $h 2>&1 | Out-Null
+        Note "cleared known_hosts entry for $h"
+    }
+}
+
+function Invoke-SetupKey {
     # Authenticate the old way for this one run - the new key isn't installed yet.
-    $SshOpts = $BaseSshOpts
+    $script:SshOpts = $BaseSshOpts
     if (-not (Test-Path $DeployKey)) {
         Say "generating a passphrase-less deploy key at $DeployKey"
         $keygen = Get-Tool 'ssh-keygen.exe'
@@ -411,18 +440,45 @@ wc -l < ~/.ssh/authorized_keys
     $rc = Invoke-RemoteScript $install
     if ($rc -ne 0) { Fail "could not install the key (exit $rc)" }
     Say 'done - subsequent runs should not prompt at all'
-    exit 0
+    # The key is on the box now, so anything that runs after this in the same
+    # invocation (see -Reflashed) should authenticate with it.
+    $script:SshOpts = $BaseSshOpts
+    if (Test-Path $DeployKey) { $script:SshOpts += @('-i', $DeployKey, '-o', 'IdentitiesOnly=yes') }
+    return 0
 }
 
-Initialize-SshAgent
-
-if ($SetupSudo) {
+function Invoke-SetupSudo {
     # The one mode that must stay interactive: sudo has to prompt for the box
     # password, so it needs a tty and cannot have stdin taken by a script.
     Say "granting passwordless sudo to $User on $Box (expect one password prompt)"
     & $ssh '-t' @SshOpts $Target ($SudoSetupCmd -replace '__USER__', $User)
-    exit $LASTEXITCODE
+    return $LASTEXITCODE
 }
+
+# Everything a freshly flashed card needs, in one command. Key first, then sudo:
+# with the key already installed, the sudo step authenticates with it, so the two
+# prompts are the SSH password once and the sudo password once - rather than the
+# SSH password twice plus sudo.
+if ($Reflashed) {
+    Say "post-reflash recovery for $Target"
+    Reset-KnownHosts @($ConfiguredBox,
+                       ($ConfiguredBox -replace '\.local$', ''),
+                       (Get-CachedBoxIp $ConfiguredBox),
+                       $Box)
+    $rc = Invoke-SetupKey
+    if ($rc -ne 0) { Fail "key setup failed (exit $rc)" }
+    Initialize-SshAgent
+    $rc = Invoke-SetupSudo
+    if ($rc -ne 0) { Fail "sudo setup failed (exit $rc)" }
+    Say 'box is reachable again - run .\tools\deploy.ps1 to push the working tree'
+    exit 0
+}
+
+if ($SetupKey) { exit (Invoke-SetupKey) }
+
+Initialize-SshAgent
+
+if ($SetupSudo) { exit (Invoke-SetupSudo) }
 
 if ($Status) {
     Say "status of $Target"
