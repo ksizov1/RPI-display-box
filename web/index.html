@@ -128,6 +128,40 @@
   .band-hint { font-size: 1.7vmin; color: #777; margin-top: 0.8vmin; }
   .band-hint:empty { display: none; }   /* reserve no space when it has nothing to say */
   .band-hint.warn { color: #c1121f; }
+
+  /* Keyboard-driven USB wheel setup overlay. Same shell as the Wi-Fi overlay —
+     the operator drives both from the same keyboard on the same TV, so they
+     deliberately look and behave identically. */
+  #wheel { position: fixed; inset: 0; z-index: 10; display: flex;
+           align-items: center; justify-content: center;
+           background: rgba(255, 255, 255, 0.98);
+           font-family: system-ui, "DejaVu Sans", sans-serif; color: #1a1a1a; }
+  #wheel.wheel-hidden { display: none; }
+  .whl-dev { font-size: 2.2vmin; text-align: center; color: #555; margin-bottom: 2vmin; }
+  .whl-dev b { color: #111; }
+  .whl-rows { border: 2px solid #ccc; border-radius: 1vmin; background: #fff; }
+  .whl-row { display: flex; align-items: center; gap: 1.5vmin; padding: 1.1vmin 1.6vmin;
+             font-size: 2.2vmin; border-bottom: 1px solid #eee; }
+  .whl-row:last-child { border-bottom: none; }
+  .whl-row.sel { background: #e8f0fe; }
+  .whl-row .role { width: 11ch; font-weight: 600; }
+  .whl-row .code { width: 13ch; color: #1a73e8; font-weight: 600; font-size: 2vmin; }
+  .whl-row .code.unset { color: #c1121f; }
+  .whl-row .act { flex: 1; color: #777; font-size: 1.8vmin; }
+  /* Bipolar bar: the fill grows left or right from a centre tick, so a steering
+     axis reading backwards is visible at a glance rather than only at full lock. */
+  .bar { position: relative; width: 26vmin; height: 1.8vmin; background: #eee;
+         border-radius: 0.9vmin; overflow: hidden; flex: none; }
+  .bar i { position: absolute; top: 0; bottom: 0; background: #1a73e8; display: block; }
+  .bar::after { content: ""; position: absolute; left: 50%; top: 0; bottom: 0;
+                width: 1px; background: #bbb; }
+  .whl-axes { margin-top: 2vmin; max-height: 30vh; overflow-y: auto;
+              border-top: 1px solid #e0e0e0; padding-top: 1.5vmin; }
+  .whl-axis { display: flex; align-items: center; gap: 1.5vmin; font-size: 1.9vmin;
+              padding: 0.4vmin 1.6vmin; color: #444; }
+  .whl-axis.hot { background: #fff4e5; border-radius: 0.6vmin; font-weight: 700; }
+  .whl-axis .an { width: 15ch; }
+  .whl-axis .ex { width: 8ch; color: #999; font-size: 1.6vmin; text-align: right; }
 </style>
 </head>
 <body>
@@ -184,6 +218,25 @@
   </div>
 </div>
 
+<!-- USB wheel setup (opened with the 'C' key; keyboard-only).
+     Lives here rather than in the headset because the person mapping the wheel
+     is standing at this box with the wheel in their hands, and this is a big
+     screen. The headset never learns anything about the device. -->
+<div id="wheel" class="wheel-hidden">
+  <div class="wifi-card">
+    <div class="wifi-title">Steering wheel setup</div>
+    <div id="whlDev" class="whl-dev"></div>
+    <div id="whlRows" class="whl-rows" tabindex="0" role="listbox"
+         aria-label="Wheel axis assignments"></div>
+    <div id="whlAxes" class="whl-axes"></div>
+    <div class="wifi-btns">
+      <button id="whlSave">Save (S)</button>
+      <button id="whlClose">Close (Esc)</button>
+    </div>
+    <div id="whlMsg" class="wifi-msg"></div>
+  </div>
+</div>
+
 <script>
 (function () {
   "use strict";
@@ -235,7 +288,19 @@
                (dot(null) + "Internet status unknown");
     var hint = up.wifi_present ?
       "&nbsp;&nbsp;&nbsp;<span class='hint'>Keyboard: press W to set up internet (upstream Wi-Fi)</span>" : "";
-    elUplink.innerHTML = line + hint;
+
+    // Wheel line. Worth its own row on the splash: at an event the first thing
+    // that goes wrong is a wheel that did not enumerate, and this answers it
+    // from across the room without an SSH session.
+    var wh = state.wheel || {};
+    var wline = "";
+    if (wh.present) {
+      wline = "<br>" + dot(!!wh.mapped) + "Wheel: <b>" + esc(wh.name || "unknown") + "</b>" +
+        (wh.range_deg ? (" &nbsp;·&nbsp; " + wh.range_deg + "°") : "") +
+        (wh.mapped ? "" : " &nbsp;·&nbsp; not mapped") +
+        "&nbsp;&nbsp;&nbsp;<span class='hint'>Keyboard: press C for wheel setup</span>";
+    }
+    elUplink.innerHTML = line + hint + wline;
   }
 
   function esc(s) { return String(s).replace(/[&<>"]/g, function (c) {
@@ -371,14 +436,20 @@
         // Signature of everything the waiting screen draws. Any change to it is
         // a visible change, and restarts the idle countdown.
         var up = s.uplink || {};
+        var wh = s.wheel || {};
         var sig = [s.mode, s.target, s.target_name, s.ssid, s.passphrase, s.version,
                    s.casting, up.internet, up.via, up.wifi_ssid, up.ethernet,
-                   up.wifi_present].join("|");
+                   up.wifi_present,
+                   // Summary fields only. Axis values change constantly and would
+                   // keep the idle countdown permanently reset — the very case
+                   // the screensaver exists for.
+                   wh.present, wh.name, wh.range_deg, wh.mapped].join("|");
         if (sig !== lastSig) { lastSig = sig; noteActivity(); }
 
         // Never over a live stream: the player's surface covers this page, so it
         // would be invisible work, and the picture is moving anyway.
-        if (!wifiOpen && !s.casting && (Date.now() - lastChangeMs) > IDLE_MS) saverStart();
+        if (!wifiOpen && !wheelOpen && !s.casting &&
+            (Date.now() - lastChangeMs) > IDLE_MS) saverStart();
       })
       .catch(function () { /* controller momentarily down; keep last state */ });
   }
@@ -580,12 +651,246 @@
   document.getElementById("wifiRescan").addEventListener("click", doRescan);
   document.getElementById("wifiClose").addEventListener("click", function () { wifiShow(false); });
 
+  // ── USB wheel setup overlay (keyboard-only: C opens, arrows/Enter/S/Esc) ──
+  // Two presses per role: Enter arms detection (which zeroes the service's
+  // per-axis excursion counters), you move the control, Enter again assigns
+  // whichever axis moved most. Detecting by largest excursion rather than by
+  // "which axis is non-zero" means a wheel resting off-centre, or a pedal that
+  // idles at half scale, cannot be mistaken for the one you just moved.
+  var wheelEl = document.getElementById("wheel");
+  var whlRowsEl = document.getElementById("whlRows");
+  var whlAxesEl = document.getElementById("whlAxes");
+  var elWhlDev = document.getElementById("whlDev");
+  var elWhlMsg = document.getElementById("whlMsg");
+  var wheelOpen = false, whlSel = 0, whlArmed = false, whlTimer = 0;
+  var whl = { present: false, axes: {}, map: {}, range_deg: 900 };
+
+  var WHL_ROLES = [
+    { key: "steer", label: "Steering" },
+    { key: "gas",   label: "Gas" },
+    { key: "brake", label: "Brake" }
+  ];
+  var WHL_RANGE_ROW = WHL_ROLES.length;          // the range row sits after the roles
+  var WHL_CENTRE_ROW = WHL_ROLES.length + 1;     // then the centre row
+  var WHL_AC_ROW = WHL_ROLES.length + 2;         // then spring-to-centre strength
+  var WHL_LAST_ROW = WHL_AC_ROW;
+
+  function whlPost(p) {
+    return fetch("/wheel", { method: "POST", body: JSON.stringify(p) })
+      .then(function (r) { return r.json(); });
+  }
+  function whlMsg(text, color) {
+    elWhlMsg.style.color = color || "#555";
+    elWhlMsg.textContent = text;
+  }
+
+  // The axis that has moved most since the last arm. Null until something has
+  // moved meaningfully, so a still wheel never assigns a random axis.
+  function hottestAxis() {
+    var best = null, bestEx = 0.25;
+    for (var code in whl.axes) {
+      if (whl.axes[code].excursion > bestEx) { bestEx = whl.axes[code].excursion; best = code; }
+    }
+    return best;
+  }
+
+  function bar(v, bipolar) {
+    // v is -1..1 for steering, 0..1 for pedals.
+    var pct, left;
+    if (bipolar) {
+      pct = Math.min(50, Math.abs(v) * 50);
+      left = v < 0 ? (50 - pct) : 50;
+    } else {
+      pct = Math.min(100, Math.max(0, v) * 100); left = 0;
+    }
+    return '<span class="bar"><i style="left:' + left + '%;width:' + pct + '%"></i></span>';
+  }
+
+  function renderWheel() {
+    if (!whl.present) {
+      elWhlDev.innerHTML = "<b>No wheel detected.</b> Plug a USB wheel into this box.";
+      whlRowsEl.innerHTML = ""; whlAxesEl.innerHTML = "";
+      return;
+    }
+    elWhlDev.innerHTML = "<b>" + esc(whl.name || "unknown device") + "</b>" +
+      (whl.mapped ? "" : " &nbsp;·&nbsp; not yet mapped");
+
+    var hot = whlArmed ? hottestAxis() : null;
+    var rows = "";
+    WHL_ROLES.forEach(function (r, i) {
+      var m = whl.map ? whl.map[r.key] : null;
+      var code = m ? m.code : null;
+      var live = (code && whl.axes[code]) ? whl.axes[code].value : 0;
+      var act;
+      if (whlArmed && i === whlSel) {
+        act = hot ? ("detected <b>" + esc(hot) + "</b> — Enter to assign")
+                  : "move the control now…";
+      } else {
+        act = (i === whlSel) ? "Enter to reassign" : "";
+      }
+      rows += '<div class="whl-row' + (i === whlSel ? " sel" : "") + '">' +
+              '<span class="role">' + r.label + '</span>' +
+              '<span class="code' + (code ? "" : " unset") + '">' +
+                esc(code || "not set") + '</span>' +
+              bar(live, r.key === "steer") +
+              '<span class="act">' + act + '</span></div>';
+    });
+    rows += '<div class="whl-row' + (whlSel === WHL_RANGE_ROW ? " sel" : "") + '">' +
+            '<span class="role">Range</span>' +
+            '<span class="code">' + (whl.range_deg || 900) + '&deg;</span>' +
+            '<span class="act">' +
+              (whl.range_applied ? "" : "not applied by the driver — ") +
+              (whlSel === WHL_RANGE_ROW ? "Enter to switch 900 / 270" : "") +
+            '</span></div>';
+
+    // Centre. A wheel whose rest position is not the axis midpoint would pull to
+    // one side in the sim forever; this pins dead-ahead to wherever it actually
+    // rests. Shows the live offset so it is obvious whether it is needed.
+    var offTxt = "";
+    if (whl.steer_raw !== null && whl.steer_raw !== undefined) {
+      var mid = (whl.centre === null || whl.centre === undefined) ? 32768 : whl.centre;
+      var offPct = (whl.steer_raw - mid) / 32768 * 100;
+      offTxt = "now " + (offPct >= 0 ? "+" : "") + offPct.toFixed(1) + "% off centre";
+    }
+    rows += '<div class="whl-row' + (whlSel === WHL_CENTRE_ROW ? " sel" : "") + '">' +
+            '<span class="role">Centre</span>' +
+            '<span class="code">' +
+              ((whl.centre === null || whl.centre === undefined) ? "auto" : esc(String(whl.centre))) +
+            '</span>' +
+            '<span class="act">' + offTxt +
+              (whlSel === WHL_CENTRE_ROW ? " — hands OFF, Enter to set (R resets)" : "") +
+            '</span></div>';
+
+    // Spring-to-centre strength. The G920 has no centring of its own, so at 0%
+    // the wheel stays wherever it is left and the car holds the turn.
+    var acTxt = whl.ff_available === false
+      ? "force feedback unavailable on this device"
+      : (whlSel === WHL_AC_ROW ? "← → adjust in steps of 10%" : "");
+    rows += '<div class="whl-row' + (whlSel === WHL_AC_ROW ? " sel" : "") + '">' +
+            '<span class="role">Centring</span>' +
+            '<span class="code">' +
+              ((whl.autocenter === undefined || whl.autocenter === null) ? "?" : whl.autocenter + "%") +
+            '</span>' +
+            bar((whl.autocenter || 0) / 100, false) +
+            '<span class="act">' + acTxt + '</span></div>';
+    whlRowsEl.innerHTML = rows;
+
+    // Every axis, always. If the wrong one gets assigned, this is where it shows.
+    var axes = Object.keys(whl.axes).sort();
+    whlAxesEl.innerHTML = axes.map(function (code) {
+      var a = whl.axes[code];
+      return '<div class="whl-axis' + (code === hot ? " hot" : "") + '">' +
+             '<span class="an">' + esc(code) + '</span>' + bar(a.value, true) +
+             '<span class="ex">' + a.excursion.toFixed(2) + '</span></div>';
+    }).join("");
+  }
+
+  function loadWheel() {
+    return fetch("/wheel", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (w) { whl = w; renderWheel(); })
+      .catch(function () {});
+  }
+
+  function wheelShow(open) {
+    wheelOpen = open;
+    wheelEl.classList.toggle("wheel-hidden", !open);
+    if (whlTimer) { clearInterval(whlTimer); whlTimer = 0; }
+    // 10 Hz only while the overlay is up. Off the rest of the time — this page
+    // sits on a waiting screen for hours and has no business polling then.
+    if (open) whlTimer = setInterval(loadWheel, 100);
+  }
+  function openWheel() {
+    wheelShow(true);
+    whlSel = 0; whlArmed = false;
+    whlMsg("Select a control with ↑ ↓, press Enter, then move it.");
+    loadWheel();
+    setTimeout(function () { whlRowsEl.focus(); }, 50);
+  }
+
+  function whlEnter() {
+    if (!whl.present) return;
+    if (whlSel === WHL_CENTRE_ROW) {
+      whlPost({ action: "centre" }).then(function (res) {
+        whlMsg(res.ok ? "Centre set to the wheel's current position. Press S to save."
+                      : ("Failed: " + (res.message || "")),
+               res.ok ? "#1a7f37" : "#c1121f");
+        loadWheel();
+      });
+      return;
+    }
+    if (whlSel === WHL_RANGE_ROW) {
+      var next = (whl.range_deg === 270) ? 900 : 270;
+      whlPost({ action: "range", deg: next }).then(function (res) {
+        whlMsg(res.ok ? ("Range set to " + next + "°") : ("Failed: " + (res.message || "")),
+               res.ok ? "#1a7f37" : "#c1121f");
+        loadWheel();
+      });
+      return;
+    }
+    var role = WHL_ROLES[whlSel];
+    if (!whlArmed) {
+      whlArmed = true;
+      whlMsg("Move the " + role.label.toLowerCase() + " control through its full travel.");
+      whlPost({ action: "arm" }).then(loadWheel);
+      return;
+    }
+    var code = hottestAxis();
+    if (!code) { whlMsg("Nothing moved yet — move the control.", "#c1121f"); return; }
+    whlArmed = false;
+    whlPost({ action: "assign", role: role.key, code: code }).then(function (res) {
+      whlMsg(res.ok ? (role.label + " → " + code + ". Press S to save.")
+                    : ("Failed: " + (res.message || "")),
+             res.ok ? "#1a7f37" : "#c1121f");
+      loadWheel();
+    });
+  }
+
+  function whlSave() {
+    whlPost({ action: "save" }).then(function (res) {
+      whlMsg(res.ok ? "Saved. This wheel is now recognised automatically."
+                    : ("Failed: " + (res.message || "")),
+             res.ok ? "#1a7f37" : "#c1121f");
+    });
+  }
+
+  whlRowsEl.addEventListener("keydown", function (e) {
+    if (e.key === "ArrowDown") { whlSel = Math.min(WHL_LAST_ROW, whlSel + 1); whlArmed = false; renderWheel(); e.preventDefault(); }
+    else if (e.key === "ArrowUp") { whlSel = Math.max(0, whlSel - 1); whlArmed = false; renderWheel(); e.preventDefault(); }
+    else if (e.key === "Enter") { whlEnter(); e.preventDefault(); }
+    else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") && whlSel === WHL_AC_ROW) {
+      var step = (e.key === "ArrowRight") ? 10 : -10;
+      var next = Math.max(0, Math.min(100, (whl.autocenter || 0) + step));
+      whlPost({ action: "autocenter", pct: next }).then(function (res) {
+        whlMsg(res.ok ? ("Centring " + next + "% — turn the wheel and let go to feel it. S to save.")
+                      : ("Failed: " + (res.message || "")),
+               res.ok ? "#1a7f37" : "#c1121f");
+        loadWheel();
+      });
+      e.preventDefault();
+    }
+    else if ((e.key === "r" || e.key === "R") && whlSel === WHL_CENTRE_ROW) {
+      whlPost({ action: "centre_reset" }).then(function () {
+        whlMsg("Centre reset to the axis midpoint."); loadWheel();
+      });
+      e.preventDefault();
+    }
+  });
+  document.getElementById("whlSave").addEventListener("click", whlSave);
+  document.getElementById("whlClose").addEventListener("click", function () { wheelShow(false); });
+
   document.addEventListener("keydown", function (e) {
     // Someone is at the keyboard: dismiss the screensaver and restart the
     // countdown before anything else looks at the key.
     noteActivity();
     if (wifiOpen) { if (e.key === "Escape") { wifiShow(false); e.preventDefault(); } return; }
+    if (wheelOpen) {
+      if (e.key === "Escape") { wheelShow(false); e.preventDefault(); }
+      else if (e.key === "s" || e.key === "S") { whlSave(); e.preventDefault(); }
+      return;
+    }
     if (e.key === "w" || e.key === "W") { openWifi(); }
+    else if (e.key === "c" || e.key === "C") { openWheel(); }
   });
 
   poll();

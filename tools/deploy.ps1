@@ -55,10 +55,11 @@
     box.conf. SSID and hostname are MAC-derived, so they do not change.
 
 .PARAMETER Restart
-    Which services to restart afterwards: both (default), controller, kiosk, none.
+    Which services to restart afterwards: both (default: controller + kiosk +
+    wheel), controller, kiosk, wheel, none.
 
 .PARAMETER Logs
-    After deploying, tail this many journal lines from both units. E.g. -Logs 60.
+    After deploying, tail this many journal lines from all units. E.g. -Logs 60.
 
 .PARAMETER Follow
     After deploying, follow the journal until Ctrl-C.
@@ -130,7 +131,7 @@ param(
     [switch] $NoConf,
     [switch] $Packages,
     [switch] $FirstBoot,
-    [ValidateSet('both', 'controller', 'kiosk', 'none')]
+    [ValidateSet('both', 'controller', 'kiosk', 'wheel', 'none')]
     [string] $Restart = 'both',
     [int]    $Logs = 0,
     [switch] $Follow,
@@ -371,7 +372,7 @@ sudo -n cat /var/lib/NetworkManager/dnsmasq-wlan0.leases 2>/dev/null \
 # SYSLOG_IDENTIFIER of the ExecStart script (cage-session.sh) instead of the unit.
 # `-u adiona-kiosk` returns zero player lines - verified on the box. The `+` is
 # journalctl's disjunction: match the controller unit OR that identifier.
-$JournalMatch = '_SYSTEMD_UNIT=adiona-controller.service + SYSLOG_IDENTIFIER=cage-session.sh'
+$JournalMatch = '_SYSTEMD_UNIT=adiona-controller.service + _SYSTEMD_UNIT=adiona-wheel.service + SYSLOG_IDENTIFIER=cage-session.sh'
 $JournalFollowCmd = "journalctl -f --no-pager -n 20 $JournalMatch"
 $JournalTailCmd   = "journalctl -n __N__ --no-pager $JournalMatch"
 
@@ -560,15 +561,16 @@ fi
 # Payload. The directories are removed rather than overlaid so files DELETED in
 # the repo actually disappear from the box (web/jmuxer.js is the cautionary tale:
 # left behind, it is a stale copy that nothing loads and everyone greps).
-sudo rm -rf /opt/adiona/web /opt/adiona/controller /opt/adiona/first-boot /opt/adiona/kiosk
+sudo rm -rf /opt/adiona/web /opt/adiona/controller /opt/adiona/first-boot /opt/adiona/kiosk /opt/adiona/wheel
 sudo install -d /opt/adiona /etc/adiona
 sudo cp -r "$SRC/web"                "/opt/adiona/web"
 sudo cp -r "$SRC/controller"         "/opt/adiona/controller"
 sudo cp -r "$SRC/system/first-boot"  "/opt/adiona/first-boot"
 sudo cp -r "$SRC/system/kiosk"       "/opt/adiona/kiosk"
-sudo chmod +x /opt/adiona/kiosk/*.sh /opt/adiona/kiosk/*.py /opt/adiona/first-boot/*.sh
+sudo cp -r "$SRC/system/wheel"       "/opt/adiona/wheel"
+sudo chmod +x /opt/adiona/kiosk/*.sh /opt/adiona/kiosk/*.py /opt/adiona/first-boot/*.sh /opt/adiona/wheel/*.py
 sudo install -m 0644 "$SRC/VERSION" /opt/adiona/VERSION
-echo "  payload: /opt/adiona/{web,controller,first-boot,kiosk}"
+echo "  payload: /opt/adiona/{web,controller,first-boot,kiosk,wheel}"
 
 if [ "$PUSH_CONF" = 1 ]; then
 	if ! sudo diff -q /etc/adiona/box.conf "$SRC/config/box.conf" >/dev/null 2>&1; then
@@ -584,7 +586,12 @@ fi
 # Units and system drop-ins.
 sudo install -m 0644 "$SRC/system/controller/adiona-controller.service" \
                      "$SRC/system/kiosk/adiona-kiosk.service" \
+                     "$SRC/system/wheel/adiona-wheel.service" \
                      "$SRC/system/first-boot/adiona-firstboot.service" /etc/systemd/system/
+# Enable here as well as in the image stage: boxes flashed before the LAN wheel
+# existed have no enablement for it, and a live deploy is the only way they will
+# ever get one short of a reflash.
+sudo systemctl enable adiona-wheel.service >/dev/null 2>&1 || true
 sudo install -m 0644 "$SRC/system/network/99-adiona-forward.conf" /etc/sysctl.d/
 sudo install -m 0644 "$SRC/system/udev/99-adiona-no-pointer.rules" /etc/udev/rules.d/
 sudo install -d /etc/NetworkManager/conf.d
@@ -617,9 +624,10 @@ fi
 
 sudo systemctl daemon-reload
 case "$RESTART" in
-	both)       UNITS="adiona-controller adiona-kiosk" ;;
+	both)       UNITS="adiona-controller adiona-kiosk adiona-wheel" ;;
 	controller) UNITS="adiona-controller" ;;
 	kiosk)      UNITS="adiona-kiosk" ;;
+	wheel)      UNITS="adiona-wheel" ;;
 	none)       UNITS="" ;;
 esac
 if [ -n "$UNITS" ]; then

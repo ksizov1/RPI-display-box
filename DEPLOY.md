@@ -37,7 +37,15 @@ onto a running box. Read its comment header before first use; the essentials:
 
 # Is RTP arriving at all? (stops the kiosk for the duration)
 .\tools\deploy.ps1 -Probe
+
+# Iterating on the LAN wheel service only (leaves the stream untouched)
+.\tools\deploy.ps1 -Restart wheel
 ```
+
+> The LAN wheel service (`system/wheel/`) needs **no** new packages — it reads
+> evdev with stdlib `struct`/`ioctl` — but a box flashed before it existed has no
+> unit enabled for it. `install.sh` runs `systemctl enable adiona-wheel` on every
+> deploy, so one live deploy is enough; no reflash.
 
 **`-Packages` is not optional for this change set.** The receiver needs
 `gstreamer1.0-{tools,plugins-base,plugins-good,plugins-bad,libav}`, which a
@@ -190,6 +198,13 @@ edited — and if it also has to reach a live box, `tools/deploy.ps1`'s
 `$PayloadItems` and its `install.sh` need the same addition. Keep the three in
 step.
 
+Note that "picked up by `assemble-stage.sh`" only means *copied into the payload*.
+A new **service** additionally needs its `cp`/`install`/`systemctl enable` lines in
+BOTH `image/pi-gen/stage-adiona/00-install/01-run.sh` and the `install.sh`
+here-string inside `tools/deploy.ps1` — the latter so that boxes flashed before the
+service existed pick up its enablement on a live deploy instead of needing a
+reflash. `system/wheel/` is the worked example.
+
 ### B2 — Flash
 
 Raspberry Pi Imager (reads `.img.xz` directly) or balenaEtcher → **Use custom
@@ -241,6 +256,48 @@ Expect **~250–400 ms, stable**. The remaining delay is capture and encoder
 look-ahead on the headset, not transport. The property that matters is that it
 must **not grow** over a session: the old TCP/MSE path ratcheted upward and never
 recovered. If you see it climbing, something is buffering that shouldn't be.
+
+---
+
+## Verifying the LAN wheel
+
+1. Plug the wheel into any USB port on the box.
+2. The waiting screen should show a wheel line with the device name and range.
+3. On the Quest, in Adiona-G: **Settings → Controller Type → Wheel over LAN**.
+4. **Settings → Steering Wheel (LAN) Setup** should read green with the device
+   name and range. Then drive.
+
+Working outward from the box when it doesn't:
+
+```bash
+curl -s localhost:8090/wheel | python3 -m json.tool   # present? mapped? subscriber?
+sudo systemctl stop adiona-wheel
+sudo python3 /opt/adiona/wheel/adiona-wheel.py --dump # every device and axis
+sudo systemctl start adiona-wheel
+```
+
+- **`"present": false`** → the kernel never enumerated it. `dmesg | tail`, try
+  another port/cable. A G920 must finish its power-up calibration sweep first.
+- **`"present": true, "mapped": false`** → unrecognised device. Press **C** on the
+  box's keyboard and map the three axes (see README).
+- **`"subscriber": null`** → the headset isn't asking. Confirm it joined *this*
+  box's SSID and that Controller Type is "Wheel over LAN". The headset derives the
+  box address as `<its own /24>.1`, exactly like the video path.
+- **Gas and brake move together** → `hid-logitech-hidpp` combined the pedals.
+  Confirm with `--dump` (one axis moving for both), then check the driver's
+  `combine_pedals` parameter is `0`.
+- **Steering is backwards or over/under-sensitive** → range and axis assignment are
+  box-side (press **C**); the sensitivity and curve sliders are headset-side.
+
+The headset holds no device knowledge at all, so a wheel problem is almost always
+on the box. `tools/wheel-sim.py` settles it: if the game drives correctly against
+the simulator, the fault is in the wheel service or the device, not the game.
+
+### Latency
+
+Expect **~10–25 ms**, wheel to game physics. Unlike the video path there is no
+encoder in the way, and every packet is a full snapshot at 120 Hz, so loss shows up
+as a few ms of staleness rather than a stuck control.
 
 ---
 

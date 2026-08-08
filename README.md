@@ -131,6 +131,82 @@ the Quest at the right network.
 
 ---
 
+## LAN wheel (USB racing wheel → headset)
+
+Good steering wheels — Logitech G920, Fanatec, Thrustmaster — are **USB only**, and
+the Quest cannot take USB peripherals in the field. So the wheel plugs into *this
+box*, which is already the access point at every event, and its readings are
+streamed back to the headset over the same Wi-Fi that carries the video. That
+replaces the Bluetooth Doyo wheel, at roughly an order of magnitude less latency.
+
+**Plug the wheel into any USB port.** `adiona-wheel.service` finds it, applies the
+rotation range, and streams. A G920 or G29 works with no setup at all.
+
+### How it works
+
+`adiona-wheel.py` reads the wheel from `/dev/input/event*` (raw evdev via `ioctl`,
+stdlib only), maps its axes to steering/gas/brake, and sends the headset a fixed
+**28-byte packet at 120 Hz on UDP 5010**:
+
+- **The headset subscribes, the box streams.** The headset sends an 8-byte `ASUB`
+  keepalive to `<gateway>:5010` every 500 ms; the box streams back to whatever
+  source address that came from, and stops after 3 s of silence. No discovery, no
+  handshake, no session state a dropped packet could corrupt — the same premise as
+  the video path, where the box is always the AP's gateway.
+- **Every packet is a complete snapshot, sent at a fixed rate** whether or not the
+  wheel moved. A lost packet therefore costs 8 ms of staleness instead of sticking
+  a stale value until the next physical movement. There is no retransmission and
+  no benefit to adding one.
+- **The box owns all device knowledge.** The headset carries no per-device table:
+  it is told the configured rotation range in a 2 Hz `INFO` packet and derives its
+  own full-lock angle as half of it (900° → ±450°, about 2.5 turns lock to lock).
+  Supporting a new wheel is a 30-second `deploy.ps1` to one box, not an APK rebuild
+  and a sideload to every headset.
+
+Latency budget, wheel to game physics: ~10–25 ms typical (USB HID poll 1–10, send
+interval 0–8, Wi-Fi 1–3, headset frame 0–17).
+
+### Setting up an unrecognised wheel
+
+Anything not in `WHEEL_PROFILES` needs its axes identified once. Do it from the
+box's own screen — you are standing there with the wheel in your hands:
+
+1. Press **C** on a keyboard attached to the box (waiting screen, not mid-stream).
+2. Pick a control with **↑ ↓**, press **Enter**, move that control through its full
+   travel, press **Enter** again to assign the axis that moved most.
+3. Set **Range** to 900° or 270° on the last row.
+4. Press **S** to save. It goes to `/etc/adiona/wheel-map.json`, keyed by device
+   name, and is recognised automatically from then on.
+
+Every axis is shown live underneath, so a wrong assignment is obvious before you
+save it. There is no pedal calibration step: the driver already reports each
+axis's true limits, and the wheel self-centres when it powers up.
+
+### Checking it
+
+The waiting screen shows a wheel line (device, range, and whether it is mapped).
+For more detail:
+
+```bash
+curl -s localhost:8090/state | python3 -m json.tool   # summary
+curl -s localhost:8090/wheel | python3 -m json.tool   # + live axis values
+sudo python3 /opt/adiona/wheel/adiona-wheel.py --dump # every device and axis
+```
+
+`--dump` requires the service to be stopped (`sudo systemctl stop adiona-wheel`)
+and is the first thing to run when a wheel behaves oddly — it prints every input
+device, its exact name, and every axis with live values. Watch that gas and brake
+move **different** axes; if one axis moves for both, the `hid-logitech-hidpp`
+driver has combined the pedals and they cannot be separated here.
+
+### On the headset
+
+Settings → **Controller Type → Wheel over LAN**. Nothing changes for any other
+controller type until that is selected. **Settings → Steering Wheel (LAN) Setup**
+shows the link status and the sensitivity/curve sliders.
+
+---
+
 ## Repository layout
 
 ```
@@ -144,6 +220,10 @@ system/
                        kiosk-session.sh  → Chromium + player supervision
                        adiona-player.sh  → GStreamer RTP receiver (+ --probe)
   controller/          controller unit
+  wheel/               adiona-wheel.py — USB racing wheel → headset (+ unit)
+tools/
+  deploy.ps1           live deploy from a Windows checkout
+  wheel-sim.py         fake LAN wheel, for testing the game without a Pi
 image/
   pi-gen/              custom pi-gen stage + build config
   assemble-stage.sh    stage the repo files into the pi-gen payload
@@ -361,3 +441,22 @@ python3 controller/adiona_controller.py
 Off-box there are no DHCP leases, so it sits on the "waiting" screen; point
 `DHCP_LEASE_FILE` at a sample lease file (and have something serving the Adiona
 page on `:8080`) to exercise selection.
+
+### Testing the LAN wheel without a Pi or a wheel
+
+`tools/wheel-sim.py` speaks the same wire protocol from any machine, so the whole
+headset-side path can be exercised on a workstation. It is also the quickest way
+to tell a headset-side bug from a box-side one: if the game drives correctly
+against the simulator, the fault is in the wheel service or the device.
+
+```bash
+python3 tools/wheel-sim.py                # sweep lock to lock, 900°
+python3 tools/wheel-sim.py --range 270    # pretend it is a 270° wheel
+python3 tools/wheel-sim.py --static 90    # hold 90° right
+python3 tools/wheel-sim.py --no-wheel     # box alive, nothing plugged in
+```
+
+Then in Godot set `Global.lan_wheel.box_ip_override` to that machine's IP
+(`"127.0.0.1"` when the game runs on the same one). Run it on whatever machine the
+game will treat as the display box — it binds the real port, so the actual wheel
+service must not be running at the same time.

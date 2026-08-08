@@ -1,0 +1,19 @@
+[Unit]
+Description=Adiona-TV LAN wheel (USB racing wheel -> headset over Wi-Fi)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=simple
+# Runs as root: reads /dev/input/event* and writes the wheel's rotation range to
+# a sysfs HID attribute, neither of which is reachable as adionauser. Binds only
+# UDP 5010 on the AP. Restarts forever — an unplugged wheel is normal, a dead
+# service is not.
+ExecStart=/usr/bin/python3 /opt/adiona/wheel/adiona-wheel.py
+Environment=ADIONA_CONF=/etc/adiona/box.conf
+Environment=ADIONA_WHEEL_MAP=/etc/adiona/wheel-map.json
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

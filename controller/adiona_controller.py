@@ -92,6 +92,16 @@ PROBE_TIMEOUT = 0.6
 UPLINK_IFACE = "eth0"
 INTERNET_CHECK_INTERVAL = 15.0
 
+# ── LAN wheel bridge ─────────────────────────────────────────────────────────
+# adiona-wheel.py owns the USB racing wheel. We never touch the device — we only
+# relay its status file to the kiosk page and drop setup commands into its
+# command file. Two plain files on tmpfs instead of an IPC socket, so neither
+# service can take the other down and either can restart independently.
+RUN_DIR = os.environ.get("ADIONA_RUN_DIR", "/run/adiona")
+WHEEL_STATUS_PATH = os.path.join(RUN_DIR, "wheel.json")
+WHEEL_CMD_PATH = os.path.join(RUN_DIR, "wheel-cmd.json")
+WHEEL_CMD_SEQ = [0]
+
 # ── Shared state (guarded by LOCK) ───────────────────────────────────────────
 LOCK = threading.Lock()
 STATE = {
@@ -109,8 +119,82 @@ STATE = {
     "ssid": "",
     "passphrase": PASSPHRASE,
     "uplink": {"ethernet": None, "internet": None},
+    # Summary of the USB wheel, if adiona-wheel.py is running and has one. Kept
+    # to a summary here; the full axis dump lives behind /wheel so the /state
+    # poll every kiosk page runs stays small.
+    "wheel": {"present": False},
     "version": read_version(),
 }
+
+
+def wheel_status():
+    """Read adiona-wheel.py's status file. Absent service == no wheel."""
+    try:
+        with open(WHEEL_STATUS_PATH) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {"present": False}
+
+
+def wheel_summary(status):
+    """The few fields the waiting screen needs, without the axis dump."""
+    return {
+        "present": bool(status.get("present")),
+        "name": status.get("name", ""),
+        "range_deg": status.get("range_deg"),
+        "mapped": bool(status.get("mapped")),
+        "subscriber": status.get("subscriber"),
+    }
+
+
+def wheel_command(data):
+    """
+    Hand one setup command to adiona-wheel.py.
+
+    Commands are whitelisted here rather than passed through, so a malformed
+    kiosk-page request can never reach the device layer as something unexpected.
+    """
+    action = str(data.get("action", ""))
+    if action not in ("arm", "assign", "range", "centre", "centre_reset",
+                      "autocenter", "save"):
+        return {"ok": False, "message": "unknown action"}
+
+    cmd = {"action": action}
+    if action == "assign":
+        role = str(data.get("role", ""))
+        if role not in ("steer", "gas", "brake"):
+            return {"ok": False, "message": "bad role"}
+        cmd["role"] = role
+        cmd["code"] = str(data.get("code", ""))
+        cmd["invert"] = bool(data.get("invert", False))
+    elif action == "range":
+        try:
+            deg = int(data.get("deg", 0))
+        except (TypeError, ValueError):
+            deg = 0
+        if deg not in (270, 900):
+            return {"ok": False, "message": "range must be 270 or 900"}
+        cmd["deg"] = deg
+    elif action == "autocenter":
+        try:
+            pct = int(data.get("pct", -1))
+        except (TypeError, ValueError):
+            pct = -1
+        if not 0 <= pct <= 100:
+            return {"ok": False, "message": "autocenter must be 0-100"}
+        cmd["pct"] = pct
+
+    WHEEL_CMD_SEQ[0] += 1
+    cmd["seq"] = WHEEL_CMD_SEQ[0]
+    tmp = WHEEL_CMD_PATH + ".tmp"
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        with open(tmp, "w") as fh:
+            json.dump(cmd, fh)
+        os.replace(tmp, WHEEL_CMD_PATH)
+    except OSError as e:
+        return {"ok": False, "message": "wheel service unreachable: %s" % e}
+    return {"ok": True, "message": action}
 
 
 def read_ssid():
@@ -665,6 +749,7 @@ def selection_loop():
             STATE["target_name"] = mac_to_host.get(current_mac) if current_mac else None
             STATE["ssid"] = read_ssid()
             STATE["uplink"] = uplink_status()
+            STATE["wheel"] = wheel_summary(wheel_status())
 
         time.sleep(SCAN_INTERVAL)
 
@@ -694,6 +779,12 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/wifi":
             self._send(200, json.dumps(wifi_info()).encode("utf-8"), "application/json")
             return
+        if path == "/wheel":
+            # Full status including the live axis dump — this is what the setup
+            # overlay polls at 10 Hz while the operator is mapping the wheel.
+            self._send(200, json.dumps(wheel_status()).encode("utf-8"),
+                       "application/json")
+            return
         # Serve any asset in WEB_DIR (index.html, splash.png, …).
         # basename() strips directories, so there's no path traversal.
         name = "index.html" if path == "/" else os.path.basename(path)
@@ -710,7 +801,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path != "/wifi":
+        if path not in ("/wifi", "/wheel"):
             self._send(404, b"not found", "text/plain")
             return
         try:
@@ -718,6 +809,10 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(self.rfile.read(n) or b"{}")
         except (ValueError, json.JSONDecodeError):
             self._send(400, b'{"ok":false,"message":"bad request"}', "application/json")
+            return
+        if path == "/wheel":
+            self._send(200, json.dumps(wheel_command(data)).encode("utf-8"),
+                       "application/json")
             return
         action = data.get("action")
         if action == "connect":
