@@ -197,6 +197,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # The same guard release-tarball applies, because this job does not depend
+      # on it (it also serves workflow_dispatch, where there is no tag) and so
+      # runs in parallel regardless of whether that one failed.
+      #
+      # It matters more here than there: 01-run.sh copies VERSION to
+      # /etc/adiona/image-version, which is what `min_image` compares against. A
+      # card built from a v1.6.1 tag but stamped 1.6.0 would quietly fail exactly
+      # the gate that exists to stop reflash-class releases half-applying.
+      # Skipped on manual runs, which have no tag to check.
+      - name: Tag must match VERSION
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="v$(head -1 VERSION | tr -d '[:space:]')"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag $tag does not match VERSION ($ver). Bump VERSION and re-tag."
+            exit 1
+          fi
+          echo "$tag matches VERSION."
+
       # pi-gen cross-builds arm64 on this x86 runner. build-docker.sh does a
       # host-side `which qemu-aarch64` check and registers the binfmt handler
       # itself (with the fix_binary/F flag), so the host just needs the actual
