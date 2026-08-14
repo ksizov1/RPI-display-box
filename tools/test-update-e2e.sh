@@ -34,6 +34,12 @@ ln -s /tmp "$probe" 2>/dev/null || {
 	echo "this filesystem cannot create symlinks — run under Linux or WSL" >&2; exit 1; }
 rm -f "$probe"
 
+# Fixed sandbox versions, deliberately unrelated to the repo's VERSION: this
+# test is about the mechanism, and inheriting the real version would make it a
+# no-op ("already current") the moment a release bumps past the hardcoded one.
+FROM_VER="1.0.0"
+TO_VER="1.0.1"
+
 pass=0; fail=0
 ok()  { printf '  ok   %s\n' "$1"; pass=$((pass + 1)); }
 bad() { printf '  FAIL %s\n' "$1"; fail=$((fail + 1)); }
@@ -47,15 +53,15 @@ openssl rsa -in "$SB/priv.pem" -pubout -out "$SB/pub.pem" 2>/dev/null
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$SB/evil.pem" 2>/dev/null
 mkdir -p "$SB/dist" "$SB/src16"
 cp -r web controller system config VERSION "$SB/src16/"
-echo "1.6.0" > "$SB/src16/VERSION"
+echo "$TO_VER" > "$SB/src16/VERSION"
 # A visible change OUTSIDE kiosk/, so the applier's "kiosk unchanged, just reload
 # the page" fast path is the one under test — that is the common case in practice.
-sed -i 's/Waiting for a headset/Waiting for a headset (v1.6.0)/' "$SB/src16/web/index.html"
+sed -i "s/Waiting for a headset/Waiting for a headset (v$TO_VER)/" "$SB/src16/web/index.html"
 ( cd "$SB/src16" && tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner \
     --exclude=__pycache__ -cf - web controller system config VERSION \
-    | gzip -n -9 > "$SB/dist/adiona-tv-1.6.0.tar.gz" )
-SHA="$(sha256sum "$SB/dist/adiona-tv-1.6.0.tar.gz" | cut -d' ' -f1)"
-SIZE="$(wc -c < "$SB/dist/adiona-tv-1.6.0.tar.gz" | tr -d ' ')"
+    | gzip -n -9 > "$SB/dist/adiona-tv-$TO_VER.tar.gz" )
+SHA="$(sha256sum "$SB/dist/adiona-tv-$TO_VER.tar.gz" | cut -d' ' -f1)"
+SIZE="$(wc -c < "$SB/dist/adiona-tv-$TO_VER.tar.gz" | tr -d ' ')"
 echo "  tarball: $SIZE bytes, sha256 ${SHA:0:16}…"
 
 echo "=== 1. a manifest server, signing the way routes/boxUpdates.js does ==="
@@ -63,8 +69,8 @@ cat > "$SB/server.py" <<PYEOF
 import base64, http.server, json, os, subprocess, sys
 KEY = sys.argv[1]
 MANIFEST = {"schema": 1, "channel": "stable", "min_client_protocol": 1, "pins": {},
-  "releases": [{"version": "1.6.0",
-    "url": "http://127.0.0.1:$PORT/adiona-tv-1.6.0.tar.gz",
+  "releases": [{"version": "$TO_VER",
+    "url": "http://127.0.0.1:$PORT/adiona-tv-$TO_VER.tar.gz",
     "size": $SIZE, "sha256": "$SHA", "notes": "End-to-end test release.",
     "min_from": "1.0.0", "min_image": "1.0.0", "packages": [], "rollout": 100}]}
 
@@ -104,13 +110,13 @@ cp -r system/kiosk/.      "$BOX/opt/adiona/kiosk/"
 cp -r system/wheel/.      "$BOX/opt/adiona/wheel/"
 cp -r system/first-boot/. "$BOX/opt/adiona/first-boot/"
 cp -r system/updater/.    "$BOX/opt/adiona/updater/"
-cp VERSION "$BOX/opt/adiona/VERSION"
+echo "$FROM_VER" > "$BOX/opt/adiona/VERSION"
 cp config/box.conf "$BOX/etc/adiona/box.conf"
 cp "$SB/pub.pem" "$BOX/etc/adiona/update-key.pub"
-echo "1.5.0" > "$BOX/etc/adiona/image-version"
+echo "$FROM_VER" > "$BOX/etc/adiona/image-version"
 echo "Adiona-TV-A3F1" > "$BOX/etc/adiona/ssid"
 for u in controller kiosk wheel updater; do
-	printf '[Unit]\nDescription=adiona-%s v1.5.0\n' "$u" > "$BOX/etc/systemd/system/adiona-$u.service"
+	printf '[Unit]\nDescription=adiona-%s v%s\n' "$u" "$FROM_VER" > "$BOX/etc/systemd/system/adiona-$u.service"
 done
 sed -i "s#^UPDATE_MANIFEST_URL=.*#UPDATE_MANIFEST_URL=\"http://127.0.0.1:$PORT/\"#" \
 	"$BOX/etc/adiona/box.conf"
@@ -137,10 +143,13 @@ export ADIONA_ROOT="$BOX/opt/adiona" ADIONA_ETC="$BOX/etc/adiona" \
        RESTARTS="$SB/restarts.log"
 : > "$RESTARTS"
 bash "$BOX/opt/adiona/updater/apply-update.sh" --migrate >/dev/null 2>&1
-chk "migrated to the release layout" '[ "$(readlink "$BOX/opt/adiona/current")" = "releases/1.5.0" ]'
+chk "migrated to the release layout" '[ "$(readlink "$BOX/opt/adiona/current")" = "releases/$FROM_VER" ]'
 
 echo "=== 3. the updater: check, verify, download, stage ==="
-PATH="$SB/bin:$PATH" python3 - <<'PY'
+# TO_VER goes in through the environment, not by interpolation: the heredoc is
+# quoted ('PY') so the shell leaves its body alone, which is what keeps the Python
+# readable — but it also means $TO_VER would arrive at Python as a literal.
+PATH="$SB/bin:$PATH" TO_VER="$TO_VER" python3 - <<'PY'
 import importlib.util, os, time
 spec = importlib.util.spec_from_file_location("au", os.environ["ADIONA_ROOT"] + "/updater/adiona-updater.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -149,33 +158,33 @@ m.controller_state = lambda: {"target": None, "casting": False, "uplink": {"inte
 up = m.Updater()
 up.check(force=True)
 print("  after check :", m.STATE["state"], "->", m.STATE["available"])
-up.accept("1.6.0")                       # this starts the download thread itself
+up.accept(os.environ["TO_VER"])          # this starts the download thread itself
 for _ in range(600):
     if m.STATE["state"] in ("staged", "failed"):
         break
     time.sleep(0.1)
 print("  after stage :", m.STATE["state"], "|", m.STATE["message"])
 PY
-chk "release 1.6.0 staged"        '[ -d "$BOX/opt/adiona/releases/1.6.0" ]'
-chk "staged VERSION is 1.6.0"     '[ "$(cat "$BOX/opt/adiona/releases/1.6.0/VERSION")" = "1.6.0" ]'
-chk "no .partial left behind"     '[ ! -d "$BOX/opt/adiona/releases/1.6.0.partial" ]'
+chk "release $TO_VER staged"      '[ -d "$BOX/opt/adiona/releases/$TO_VER" ]'
+chk "staged VERSION is $TO_VER"   '[ "$(cat "$BOX/opt/adiona/releases/$TO_VER/VERSION")" = "$TO_VER" ]'
+chk "no .partial left behind"     '[ ! -d "$BOX/opt/adiona/releases/$TO_VER.partial" ]'
 chk "tarball cleaned up"          '[ -z "$(ls "$BOX/var/downloads" 2>/dev/null)" ]'
-chk "units extracted"             '[ -f "$BOX/opt/adiona/releases/1.6.0/units/adiona-updater.service" ]'
-chk "nothing swapped yet"         '[ "$(cat "$BOX/opt/adiona/VERSION")" = "1.5.0" ]'
+chk "units extracted"             '[ -f "$BOX/opt/adiona/releases/$TO_VER/units/adiona-updater.service" ]'
+chk "nothing swapped yet"         '[ "$(cat "$BOX/opt/adiona/VERSION")" = "$FROM_VER" ]'
 
 echo "=== 4. apply ==="
 PATH="$SB/bin:$PATH" ADIONA_SOAK_SECONDS=4 ADIONA_SOAK_POLL=1 ADIONA_CONTROLLER_WAIT=3 \
-	bash "$BOX/opt/adiona/updater/apply-update.sh" --protocol 1 --from 1.5.0 --to 1.6.0 \
-	     --release-dir "$BOX/opt/adiona/releases/1.6.0" > "$SB/apply.log" 2>&1
+	bash "$BOX/opt/adiona/updater/apply-update.sh" --protocol 1 --from $FROM_VER --to $TO_VER \
+	     --release-dir "$BOX/opt/adiona/releases/$TO_VER" > "$SB/apply.log" 2>&1
 grep -E "kiosk subtree|updated " "$SB/apply.log" | sed 's/^/     /'
-chk "current -> 1.6.0"             '[ "$(readlink "$BOX/opt/adiona/current")" = "releases/1.6.0" ]'
-chk "VERSION now 1.6.0"            '[ "$(cat "$BOX/opt/adiona/VERSION")" = "1.6.0" ]'
-chk "new page content is live"     'grep -q "Waiting for a headset (v1.6.0)" "$BOX/opt/adiona/web/index.html"'
+chk "current -> $TO_VER"             '[ "$(readlink "$BOX/opt/adiona/current")" = "releases/$TO_VER" ]'
+chk "VERSION now $TO_VER"          '[ "$(cat "$BOX/opt/adiona/VERSION")" = "$TO_VER" ]'
+chk "new page content is live"     'grep -q "Waiting for a headset (v$TO_VER)" "$BOX/opt/adiona/web/index.html"'
 chk "kiosk unchanged, not restarted" '! grep -q "restart adiona-kiosk" "$RESTARTS"'
 chk "controller restarted"         'grep -q "restart adiona-controller" "$RESTARTS"'
 chk "marker cleared"               '[ ! -f "$BOX/etc/adiona/update-pending" ]'
 chk "result recorded ok"           'grep -q "\"ok\":true" "$BOX/var/last-apply.json"'
-chk ".updated stamp written"       'grep -q "v1.6.0 applied over v1.5.0" "$BOX/etc/adiona/.updated"'
+chk ".updated stamp written"       'grep -q "v$TO_VER applied over v$FROM_VER" "$BOX/etc/adiona/.updated"'
 chk "operator box.conf preserved"  "grep -q 'UPDATE_MANIFEST_URL=\"http://127.0.0.1:$PORT/\"' \"\$BOX/etc/adiona/box.conf\""
 
 echo "=== 5. a manifest signed with the WRONG key must be refused ==="
@@ -192,15 +201,15 @@ open(os.environ["ADIONA_STATE_DIR"] + "/tamper.txt", "w").write(
     m.STATE["state"] + "|" + m.STATE["blocked_reason"])
 PY
 chk "foreign key -> blocked"  'grep -q "^blocked|signature does not verify" "$BOX/var/tamper.txt"'
-chk "still on 1.6.0, nothing installed" '[ "$(cat "$BOX/opt/adiona/VERSION")" = "1.6.0" ]'
+chk "still on $TO_VER, nothing installed" '[ "$(cat "$BOX/opt/adiona/VERSION")" = "$TO_VER" ]'
 
 echo "=== 6. manual rollback ==="
 : > "$RESTARTS"
 PATH="$SB/bin:$PATH" bash "$BOX/opt/adiona/updater/apply-update.sh" --rollback \
 	> "$SB/rollback.log" 2>&1
-chk "current -> 1.5.0"        '[ "$(readlink "$BOX/opt/adiona/current")" = "releases/1.5.0" ]'
-chk "VERSION back to 1.5.0"   '[ "$(cat "$BOX/opt/adiona/VERSION")" = "1.5.0" ]'
-chk "old page content back"   '! grep -q "Waiting for a headset (v1.6.0)" "$BOX/opt/adiona/web/index.html"'
+chk "current -> $FROM_VER"        '[ "$(readlink "$BOX/opt/adiona/current")" = "releases/$FROM_VER" ]'
+chk "VERSION back to $FROM_VER" '[ "$(cat "$BOX/opt/adiona/VERSION")" = "$FROM_VER" ]'
+chk "old page content back"   '! grep -q "Waiting for a headset (v$TO_VER)" "$BOX/opt/adiona/web/index.html"'
 
 echo
 echo "passed $pass, failed $fail"

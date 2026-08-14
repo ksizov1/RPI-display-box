@@ -76,6 +76,16 @@ for want in web/index.html controller/adiona_controller.py system/kiosk/ \
 	esac
 done
 
+# min_from and min_image default to EMPTY, i.e. no constraint, because both are
+# exceptions and both fail closed when set.
+#
+# min_image especially: a box upgraded by a live deploy reports image-version
+# 0.0.0 (a deploy changes /opt/adiona, never the boot configuration, so it cannot
+# honestly claim to know what the card was flashed with), and an unknown image is
+# treated as too old on purpose. So a min_image copied in without thinking would
+# refuse the release on every box in the existing fleet — which is exactly the
+# fleet a first OTA release is aimed at. Set it ONLY when a release genuinely
+# depends on something a reflash provides.
 BASE_URL="${ADIONA_RELEASE_BASE_URL:-https://license.drivingsimulator.com/5}"
 cat > "$OUT/manifest-fragment.json" <<JSON
 {
@@ -84,8 +94,8 @@ cat > "$OUT/manifest-fragment.json" <<JSON
   "size": $SIZE,
   "sha256": "$SHA",
   "notes": "TODO: one line, shown on the TV in the update prompt",
-  "min_from": "1.5.0",
-  "min_image": "1.5.0",
+  "min_from": "",
+  "min_image": "",
   "packages": [],
   "rollout": 100
 }
@@ -96,4 +106,10 @@ echo "  size   $SIZE bytes"
 echo "  sha256 $SHA"
 echo "  manifest fragment: $OUT/manifest-fragment.json"
 echo
-echo "Edit the 'notes' line, then follow Adiona-license-server/docs/BOX_UPDATES.md."
+echo "Before pasting it into data/box_versions.json:"
+echo "  * write a real 'notes' line — it is what the operator reads on the TV;"
+echo "  * leave min_image empty unless this release needs a REFLASHED card. Setting"
+echo "    it blocks every box upgraded by deploy.ps1, which report image 0.0.0;"
+echo "  * set 'rollout' below 100 to try it on a few boxes first."
+echo
+echo "Then follow Adiona-license-server/docs/BOX_UPDATES.md."

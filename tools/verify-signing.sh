@@ -11,7 +11,8 @@
 # refusing it. Run this after setting up or rotating the key, and before
 # publishing a release anyone is waiting for.
 #
-# Needs: curl, openssl, python3. Run it from a workstation or from a box.
+# Needs: curl, openssl, and a Python 3 (found as python3, python or py). Runs from
+# a box, from WSL, or from Git Bash on Windows.
 #
 #     bash tools/verify-signing.sh
 #     bash tools/verify-signing.sh https://staging.example/api/box/updates
@@ -24,6 +25,28 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 URL="${1:-}"
 KEY="${ADIONA_UPDATE_KEY:-}"
+
+# Find a Python 3 that actually runs.
+#
+# On Windows, `python3` is usually a Microsoft Store stub that prints an advert to
+# stderr and exits 49 WITHOUT running anything — so "is it on PATH" and "did it
+# exit non-zero" are both useless as tests (the first says yes, and callers that
+# only check `command -v` end up piping their script into a shim). The only
+# reliable question is whether it answers something a working Python 3 would.
+PY=""
+for cand in python3 python py; do
+	command -v "$cand" >/dev/null 2>&1 || continue
+	if [ "$("$cand" -c 'import sys; print(sys.version_info[0])' 2>/dev/null | tr -d '\r\n')" = "3" ]; then
+		PY="$cand"
+		break
+	fi
+done
+if [ -z "$PY" ]; then
+	echo "no working Python 3 found (tried python3, python, py)" >&2
+	echo "on Windows, install Python or run this under WSL:" >&2
+	echo "    wsl bash tools/verify-signing.sh" >&2
+	exit 1
+fi
 
 # Default the URL to whatever box.conf says, so this checks the endpoint the
 # fleet actually talks to rather than one hardcoded here and forgotten.
@@ -73,7 +96,7 @@ if ! curl -sS --max-time 15 -X POST "$URL" \
 	exit 1
 fi
 
-python3 - "$TMP" "$KEY" <<'PY'
+"$PY" - "$TMP" "$KEY" <<'PY'
 import base64, json, os, subprocess, sys
 
 tmp, key = sys.argv[1], sys.argv[2]
