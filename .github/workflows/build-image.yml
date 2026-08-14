@@ -152,29 +152,22 @@ jobs:
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" bash tools/make-release.sh
           cat dist/manifest-fragment.json
 
-      # Signs the FRAGMENT so whoever edits data/box_versions.json on the licence
-      # server has a signed artifact to compare against. The manifest the boxes
-      # actually verify is signed by the server at request time (it varies with
-      # pins and rollout, so it cannot be signed here).
-      # The emptiness test is inside the script, not in a step-level `if`: a step's
-      # own `env:` is not in scope for its `if`, and the secrets context is not
-      # available there either, so either form would silently evaluate false and
-      # skip signing on every run.
-      - name: Sign the manifest fragment
-        env:
-          SIGNING_KEY: ${{ secrets.ADIONA_UPDATE_SIGNING_KEY }}
-        run: |
-          if [ -z "$SIGNING_KEY" ]; then
-            echo "::warning::ADIONA_UPDATE_SIGNING_KEY is not set - fragment left unsigned"
-            exit 0
-          fi
-          printf '%s' "$SIGNING_KEY" > /tmp/sign.key
-          openssl dgst -sha256 -sign /tmp/sign.key \
-                  -out /tmp/fragment.sig dist/manifest-fragment.json
-          base64 -w0 /tmp/fragment.sig > dist/manifest-fragment.json.sig
-          shred -u /tmp/sign.key /tmp/fragment.sig
-          echo "Signed."
-
+      # There is deliberately NO fragment-signing step here, and no
+      # ADIONA_UPDATE_SIGNING_KEY secret on this repository.
+      #
+      # The signature a box verifies is produced by the licence server at request
+      # time from Key Vault — it has to be, because the manifest varies per box
+      # with `pins` and `rollout` and so cannot be signed in advance. A signature
+      # over this fragment would be checked by nothing, while requiring the key
+      # that authorises running code as root across the whole fleet to sit in CI,
+      # where any workflow with write access could exfiltrate it.
+      #
+      # The fragment already arrives over an authenticated channel (a GitHub
+      # release), and what protects data/box_versions.json from a bad edit is
+      # review of that commit — not a detached signature nobody verifies.
+      #
+      # An earlier version of this file did sign it, warned on every release that
+      # the secret was unset, and then never uploaded the .sig anyway.
       - name: Attach to the release
         uses: softprops/action-gh-release@v2
         with:
