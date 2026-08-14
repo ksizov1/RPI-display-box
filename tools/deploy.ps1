@@ -481,7 +481,18 @@ function Invoke-SetupSudo {
     # The one mode that must stay interactive: sudo has to prompt for the box
     # password, so it needs a tty and cannot have stdin taken by a script.
     Say "granting passwordless sudo to $User on $Box (expect one password prompt)"
-    & $ssh '-t' @SshOpts $Target ($SudoSetupCmd -replace '__USER__', $User)
+    # Out-Host is load-bearing. A native command's stdout goes to PowerShell's
+    # SUCCESS stream, so in a function whose value is assigned - which both callers
+    # do - a bare `& ssh ...` makes the remote's output part of the return value.
+    # This function then returns @('...parsed OK', 'OK: ...', 0) instead of 0, and
+    # `if ($rc -ne 0)` on an array is true whenever ANY element is non-zero, so a
+    # completely successful setup reported:
+    #     deploy: sudo setup failed (exit /tmp/x: parsed OK OK: ... 0)
+    # Routing the output to the host keeps it visible and leaves only the exit code
+    # as the return value. Invoke-SetupKey is unaffected because it goes through
+    # Invoke-RemoteScript, whose Start-Process -NoNewWindow writes straight to the
+    # console and returns a bare ExitCode.
+    & $ssh '-t' @SshOpts $Target ($SudoSetupCmd -replace '__USER__', $User) | Out-Host
     return $LASTEXITCODE
 }
 
@@ -552,8 +563,16 @@ sudo -n true 2>/dev/null || {
 # Same lock apply-update.sh takes. Two writers to /opt/adiona at once produce an
 # undefined tree, and "I deployed while the box happened to be installing an OTA
 # update" is not a state anyone should have to reason about afterwards.
+#
+# The file is created BY ROOT and opened for READING. A redirection is performed
+# by the shell itself, which here is the unprivileged deploy user, so `exec 9>` on
+# a root-owned /opt/adiona fails with EACCES before sudo ever enters the picture.
+# flock does not need write access — the lock is advisory and lives on the inode —
+# so a read-only fd takes the same exclusive lock and still mutually excludes the
+# root-owned applier, which opens the identical file for writing.
 sudo install -d /opt/adiona
-exec 9>/opt/adiona/.update.lock
+sudo touch /opt/adiona/.update.lock
+exec 9</opt/adiona/.update.lock
 if ! flock -n 9; then
 	echo "deploy: an OTA update is applying on the box; retry in a minute." >&2
 	exit 1

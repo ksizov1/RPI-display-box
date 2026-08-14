@@ -5,6 +5,8 @@ chromium
 cage
 python3
 curl
+openssl
+ca-certificates
 fonts-dejavu-core
 plymouth
 plymouth-label

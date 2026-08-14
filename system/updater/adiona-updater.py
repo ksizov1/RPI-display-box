@@ -137,6 +137,8 @@ SPACE_HEADROOM = 200 * 1024 * 1024
 TICK = 1.0
 
 RUNNING = True
+# False for every CLI subcommand, True only for the daemon — see write_status().
+PUBLISH = [False]
 
 
 def log(msg):
@@ -176,6 +178,14 @@ def set_state(**kw):
 
 
 def write_status():
+    # Only the long-running service owns /run/adiona/update.json. The wheel
+    # service reads it once a second for the AB01 flags and the controller relays
+    # it into /state, so a one-shot CLI run publishing its own view over it would
+    # briefly blank whatever the operator is reading on the TV — including a live
+    # update prompt. Every CLI subcommand clears this; main() sets it back before
+    # entering the daemon loop.
+    if not PUBLISH[0]:
+        return
     try:
         os.makedirs(RUN_DIR, exist_ok=True)
     except OSError:
@@ -812,6 +822,12 @@ class Updater(object):
 
     # ── the check ──
     def check(self, force=False):
+        # Refresh the box's own identity first. run() does this every tick, but
+        # check() is also reachable from `--check` in a one-shot process where
+        # nothing else ever has — and a diagnostic that reports the STATE defaults
+        # (current "", layout "flat") as if they were findings is worse than one
+        # that reports nothing, because "flat" is a plausible answer.
+        set_state(current=current_version(), layout=layout(), releases=list_releases())
         if not ENABLED:
             set_state(state="blocked", blocked_reason="updates disabled in box.conf")
             self.schedule_next()
@@ -1105,12 +1121,13 @@ class Updater(object):
 
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
-def cli_status():
-    try:
-        with open(STATUS_PATH) as fh:
-            print(fh.read())
-    except OSError:
-        print("no status file at %s (is adiona-updater running?)" % STATUS_PATH)
+def cli_status(show_published=True):
+    if show_published:
+        try:
+            with open(STATUS_PATH) as fh:
+                print(fh.read())
+        except OSError:
+            print("no status file at %s (is adiona-updater running?)" % STATUS_PATH)
     print("installed : v%s" % current_version())
     print("image     : v%s" % (image_version() or "unknown"))
     print("layout    : %s" % layout())
@@ -1179,8 +1196,14 @@ def main():
     if args.check:
         up = Updater()
         up.check(force=True)
-        write_status()
-        cli_status()
+        # Deliberately NOT write_status(). /run/adiona/update.json belongs to the
+        # running service: the wheel service reads it for the AB01 flags and the
+        # controller relays it into /state, so publishing this one-shot process's
+        # view over it would briefly blank a prompt the operator is reading. Print
+        # what this run found instead.
+        with LOCK:
+            print(json.dumps(STATE, indent=2))
+        cli_status(show_published=False)
         return 0
 
     os.makedirs(RUN_DIR, exist_ok=True)
@@ -1193,6 +1216,9 @@ def main():
     except OSError:
         log("another updater is already running")
         return 1
+
+    # Past every CLI subcommand, so this process is the service: it may publish.
+    PUBLISH[0] = True
 
     log("started — %s every %.1f h, prompt %d s, channel %s"
         % ("enabled" if ENABLED else "DISABLED", CHECK_INTERVAL / 3600.0,

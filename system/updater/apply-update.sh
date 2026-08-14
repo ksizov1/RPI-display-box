@@ -705,6 +705,20 @@ main() {
 	do_apply "$from" "$to" "$reldir"
 }
 
+# --help costs nothing and must not require root.
+case " $* " in
+	*" --help "*|*" -h "*) sed -n '2,60p' "$0"; exit 0 ;;
+esac
+
+# Root is checked HERE rather than only inside main(), because the lock below is
+# taken by a shell redirection into a root-owned directory: an unprivileged run
+# would die with a bare "Permission denied" pointing at a line number, instead of
+# saying the one thing that would fix it.
+if [ "$(id -u)" != 0 ] && [ -z "${ADIONA_ROOT:-}" ]; then
+	log "FATAL: must run as root — try: sudo $0 $*"
+	exit 1
+fi
+
 # One applier at a time, and deploy.ps1's install.sh takes the same lock — two
 # concurrent writers to /opt/adiona produce an undefined tree.
 exec 9>"$LOCK"
