@@ -12,16 +12,34 @@ cp -r files/payload/controller         "${ROOTFS_DIR}/opt/adiona/controller"
 cp -r files/payload/system/first-boot  "${ROOTFS_DIR}/opt/adiona/first-boot"
 cp -r files/payload/system/kiosk       "${ROOTFS_DIR}/opt/adiona/kiosk"
 cp -r files/payload/system/wheel       "${ROOTFS_DIR}/opt/adiona/wheel"
+cp -r files/payload/system/updater     "${ROOTFS_DIR}/opt/adiona/updater"
 
 install -m 0644 files/payload/config/box.conf "${ROOTFS_DIR}/etc/adiona/box.conf"
 install -m 0644 files/payload/VERSION "${ROOTFS_DIR}/opt/adiona/VERSION"
+
+# The version this CARD WAS FLASHED WITH, as opposed to the version it is running
+# (which an OTA update changes). A release declares `min_image` when it depends on
+# something only this script can do — the kernel cmdline and config.txt edits
+# below, the Plymouth theme registration, the getty@tty1 mask, the usermod groups.
+# The box then reports "needs re-imaging", which a field tech can act on, instead
+# of installing new code against old boot configuration and failing in a way that
+# looks nothing like its cause.
+install -m 0644 files/payload/VERSION "${ROOTFS_DIR}/etc/adiona/image-version"
+
+# Public key the updater verifies the release manifest against. Baked into the
+# image and never fetched: it is the whole reason a box can safely ask a server
+# for software while sitting on a stranger's Wi-Fi.
+install -m 0644 files/payload/system/updater/update-key.pub \
+        "${ROOTFS_DIR}/etc/adiona/update-key.pub"
 
 chmod +x "${ROOTFS_DIR}/opt/adiona/first-boot/adiona-firstboot.sh" \
          "${ROOTFS_DIR}/opt/adiona/kiosk/cage-session.sh" \
          "${ROOTFS_DIR}/opt/adiona/kiosk/kiosk-session.sh" \
          "${ROOTFS_DIR}/opt/adiona/kiosk/adiona-player.sh" \
          "${ROOTFS_DIR}/opt/adiona/kiosk/blank-cursor.py" \
-         "${ROOTFS_DIR}/opt/adiona/wheel/adiona-wheel.py"
+         "${ROOTFS_DIR}/opt/adiona/wheel/adiona-wheel.py" \
+         "${ROOTFS_DIR}/opt/adiona/updater/adiona-updater.py" \
+         "${ROOTFS_DIR}/opt/adiona/updater/apply-update.sh"
 
 # systemd units
 install -m 0644 files/payload/system/controller/adiona-controller.service \
@@ -32,6 +50,10 @@ install -m 0644 files/payload/system/first-boot/adiona-firstboot.service \
         "${ROOTFS_DIR}/etc/systemd/system/adiona-firstboot.service"
 install -m 0644 files/payload/system/wheel/adiona-wheel.service \
         "${ROOTFS_DIR}/etc/systemd/system/adiona-wheel.service"
+install -m 0644 files/payload/system/updater/adiona-updater.service \
+        "${ROOTFS_DIR}/etc/systemd/system/adiona-updater.service"
+install -m 0644 files/payload/system/updater/adiona-rollback.service \
+        "${ROOTFS_DIR}/etc/systemd/system/adiona-rollback.service"
 
 # sysctl: IPv4 forwarding for the router role
 install -m 0644 files/payload/system/network/99-adiona-forward.conf \
@@ -89,6 +111,10 @@ systemctl enable adiona-firstboot.service
 systemctl enable adiona-controller.service
 systemctl enable adiona-kiosk.service
 systemctl enable adiona-wheel.service
+systemctl enable adiona-updater.service
+# Guarded by ConditionPathExists on the update marker, so on a normal boot it is
+# skipped before it costs anything.
+systemctl enable adiona-rollback.service
 
 # Headless appliance: boot to the console (multi-user), no display manager.
 systemctl set-default multi-user.target

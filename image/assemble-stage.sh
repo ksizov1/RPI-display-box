@@ -17,4 +17,10 @@ cp -r "${ROOT}/system"     "${PAYLOAD}/system"
 cp -r "${ROOT}/config"     "${PAYLOAD}/config"
 cp    "${ROOT}/VERSION"    "${PAYLOAD}/VERSION"
 
+# Bytecode a developer's local run left behind is not part of the release. It is
+# gitignored, so it never reaches CI — which is precisely why it would otherwise
+# only ever appear in images built on a workstation, and only sometimes.
+find "${PAYLOAD}" -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+find "${PAYLOAD}" -name '*.pyc' -delete 2>/dev/null || true
+
 echo "Assembled payload at: ${PAYLOAD}"

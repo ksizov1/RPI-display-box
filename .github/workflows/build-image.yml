@@ -118,6 +118,76 @@ jobs:
           fi
           echo "All package names resolve."
 
+  # The OTA payload boxes in the field download, as opposed to the image a fresh
+  # card is flashed with. Minutes, not an hour — an image build is for new
+  # hardware, this is for the fleet that already exists.
+  release-tarball:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Nothing enforced this before, and it did not matter while VERSION only
+      # reached a box by reflash or by a developer running deploy.ps1. With OTA it
+      # does: the tag names the release the server offers, VERSION is what the box
+      # reports afterwards, and a mismatch means the whole fleet reports a version
+      # nobody can correlate with a commit.
+      - name: Tag must match VERSION
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="v$(head -1 VERSION | tr -d '[:space:]')"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag $tag does not match VERSION ($ver). Bump VERSION and re-tag."
+            exit 1
+          fi
+          echo "$tag matches VERSION."
+
+      - name: Build OTA tarball
+        run: |
+          # Fixed timestamps from the tagged commit, so the archive — and
+          # therefore its sha256 — is reproducible from the tag alone.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" bash tools/make-release.sh
+          cat dist/manifest-fragment.json
+
+      # Signs the FRAGMENT so whoever edits data/box_versions.json on the licence
+      # server has a signed artifact to compare against. The manifest the boxes
+      # actually verify is signed by the server at request time (it varies with
+      # pins and rollout, so it cannot be signed here).
+      # The emptiness test is inside the script, not in a step-level `if`: a step's
+      # own `env:` is not in scope for its `if`, and the secrets context is not
+      # available there either, so either form would silently evaluate false and
+      # skip signing on every run.
+      - name: Sign the manifest fragment
+        env:
+          SIGNING_KEY: ${{ secrets.ADIONA_UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$SIGNING_KEY" ]; then
+            echo "::warning::ADIONA_UPDATE_SIGNING_KEY is not set - fragment left unsigned"
+            exit 0
+          fi
+          printf '%s' "$SIGNING_KEY" > /tmp/sign.key
+          openssl dgst -sha256 -sign /tmp/sign.key \
+                  -out /tmp/fragment.sig dist/manifest-fragment.json
+          base64 -w0 /tmp/fragment.sig > dist/manifest-fragment.json.sig
+          shred -u /tmp/sign.key /tmp/fragment.sig
+          echo "Signed."
+
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/adiona-tv-*.tar.gz
+            dist/adiona-tv-*.tar.gz.sha256
+            dist/manifest-fragment.json
+          body: |
+            Paste `manifest-fragment.json` into `data/box_versions.json` in
+            Adiona-license-server, and upload the tarball to
+            `/var/www/license-api-binaries/5/`.
+            See `Adiona-license-server/docs/BOX_UPDATES.md`.
+
   build:
     runs-on: ubuntu-latest
     # An image build costs 45-75 minutes, so only produce one for a release tag

@@ -131,7 +131,7 @@ param(
     [switch] $NoConf,
     [switch] $Packages,
     [switch] $FirstBoot,
-    [ValidateSet('both', 'controller', 'kiosk', 'wheel', 'none')]
+    [ValidateSet('both', 'controller', 'kiosk', 'wheel', 'updater', 'none')]
     [string] $Restart = 'both',
     [int]    $Logs = 0,
     [switch] $Follow,
@@ -351,10 +351,18 @@ echo "--- identity ---"
 echo "hostname:         $(hostname)"
 echo "ssid:             $(cat /etc/adiona/ssid 2>/dev/null || echo '?')"
 echo "VERSION:          $(cat /opt/adiona/VERSION 2>/dev/null || echo '?')"
+echo "image version:    $(cat /etc/adiona/image-version 2>/dev/null || echo 'pre-OTA image')"
+echo "layout:           $(if [ -L /opt/adiona/current ]; then echo "release ($(readlink /opt/adiona/current))"; else echo 'flat (never OTA-updated)'; fi)"
+echo "releases on card: $(ls /opt/adiona/releases 2>/dev/null | tr '\n' ' ' || echo '-')"
 echo "last live deploy: $(cat /etc/adiona/.deployed 2>/dev/null || echo 'none - running the flashed image')"
+echo "last OTA update:  $(cat /etc/adiona/.updated 2>/dev/null || echo 'none')"
+if [ -f /etc/adiona/update-pending ]; then
+    echo "!! UPDATE IN FLIGHT OR INTERRUPTED:"
+    sed 's/^/     /' /etc/adiona/update-pending
+fi
 echo "uptime:          $(uptime -p | sed 's/^up//')"
 echo "--- services ---"
-for u in adiona-controller adiona-kiosk; do
+for u in adiona-controller adiona-kiosk adiona-wheel adiona-updater; do
     printf "%-20s %s\n" "$u" "$(systemctl is-active "$u")"
 done
 echo "--- controller /state ---"
@@ -372,7 +380,9 @@ sudo -n cat /var/lib/NetworkManager/dnsmasq-wlan0.leases 2>/dev/null \
 # SYSLOG_IDENTIFIER of the ExecStart script (cage-session.sh) instead of the unit.
 # `-u adiona-kiosk` returns zero player lines - verified on the box. The `+` is
 # journalctl's disjunction: match the controller unit OR that identifier.
-$JournalMatch = '_SYSTEMD_UNIT=adiona-controller.service + _SYSTEMD_UNIT=adiona-wheel.service + SYSLOG_IDENTIFIER=cage-session.sh'
+# adiona-apply is the transient unit systemd-run creates for an update; its output
+# is the only record of what an update did, so it belongs in the same view.
+$JournalMatch = '_SYSTEMD_UNIT=adiona-controller.service + _SYSTEMD_UNIT=adiona-wheel.service + _SYSTEMD_UNIT=adiona-updater.service + SYSLOG_IDENTIFIER=cage-session.sh + SYSLOG_IDENTIFIER=adiona-apply'
 $JournalFollowCmd = "journalctl -f --no-pager -n 20 $JournalMatch"
 $JournalTailCmd   = "journalctl -n __N__ --no-pager $JournalMatch"
 
@@ -539,6 +549,16 @@ sudo -n true 2>/dev/null || {
 	exit 1
 }
 
+# Same lock apply-update.sh takes. Two writers to /opt/adiona at once produce an
+# undefined tree, and "I deployed while the box happened to be installing an OTA
+# update" is not a state anyone should have to reason about afterwards.
+sudo install -d /opt/adiona
+exec 9>/opt/adiona/.update.lock
+if ! flock -n 9; then
+	echo "deploy: an OTA update is applying on the box; retry in a minute." >&2
+	exit 1
+fi
+
 # Packages first: new code with an unmet dependency fails at runtime, not at copy
 # time, and the failure (a black screen) looks nothing like its cause.
 if [ "$DO_PACKAGES" = 1 ]; then
@@ -558,19 +578,82 @@ if [ "$DO_PACKAGES" = 1 ]; then
 	fi
 fi
 
-# Payload. The directories are removed rather than overlaid so files DELETED in
-# the repo actually disappear from the box (web/jmuxer.js is the cautionary tale:
-# left behind, it is a stale copy that nothing loads and everyone greps).
-sudo rm -rf /opt/adiona/web /opt/adiona/controller /opt/adiona/first-boot /opt/adiona/kiosk /opt/adiona/wheel
+# Payload. Two layouts exist and this has to handle both:
+#
+#   flat    — /opt/adiona/{web,controller,...} are real directories, as the image
+#             build creates them. A box that has never taken an OTA update.
+#   release — those names are symlinks into /opt/adiona/current, which points at
+#             one of /opt/adiona/releases/<version>. Created by the first update.
+#
+# On a release-layout box we must NOT write through the symlinks: `rm -rf
+# /opt/adiona/web` would delete the contents of the CURRENT RELEASE directory and
+# `cp -r` would then fill it with a working tree, so a release named 1.6.0 would
+# quietly contain somebody's uncommitted edits — and a later rollback would
+# restore them. Build a new release directory instead and repoint `current`,
+# which also makes a live deploy rollback-able like any other release.
+#
+# Either way the directories are replaced rather than overlaid, so files DELETED
+# in the repo actually disappear from the box (web/jmuxer.js is the cautionary
+# tale: left behind, it is a stale copy that nothing loads and everyone greps).
+VER="$(head -1 "$SRC/VERSION" | tr -d '[:space:]')"
 sudo install -d /opt/adiona /etc/adiona
-sudo cp -r "$SRC/web"                "/opt/adiona/web"
-sudo cp -r "$SRC/controller"         "/opt/adiona/controller"
-sudo cp -r "$SRC/system/first-boot"  "/opt/adiona/first-boot"
-sudo cp -r "$SRC/system/kiosk"       "/opt/adiona/kiosk"
-sudo cp -r "$SRC/system/wheel"       "/opt/adiona/wheel"
-sudo chmod +x /opt/adiona/kiosk/*.sh /opt/adiona/kiosk/*.py /opt/adiona/first-boot/*.sh /opt/adiona/wheel/*.py
-sudo install -m 0644 "$SRC/VERSION" /opt/adiona/VERSION
-echo "  payload: /opt/adiona/{web,controller,first-boot,kiosk,wheel}"
+
+if [ -L /opt/adiona/current ]; then
+	# The +deploy suffix marks this as a working-tree build rather than a signed
+	# release, so it is obvious in -Status and in the update UI what is running.
+	REL="/opt/adiona/releases/${VER}+deploy"
+	PREV="$(readlink /opt/adiona/current)"
+	sudo rm -rf "$REL"
+	sudo install -d "$REL/config" "$REL/units" "$REL/units-installed"
+	sudo cp -r "$SRC/web"                "$REL/web"
+	sudo cp -r "$SRC/controller"         "$REL/controller"
+	sudo cp -r "$SRC/system/first-boot"  "$REL/first-boot"
+	sudo cp -r "$SRC/system/kiosk"       "$REL/kiosk"
+	sudo cp -r "$SRC/system/wheel"       "$REL/wheel"
+	sudo cp -r "$SRC/system/updater"     "$REL/updater"
+	sudo install -m 0644 "$SRC/VERSION" "$REL/VERSION"
+	sudo install -m 0644 "$SRC/config/box.conf" "$REL/config/box.conf"
+	sudo find "$SRC/system" -name '*.service' -exec sudo install -m 0644 {} "$REL/units/" \;
+	# What is live right now, so a rollback to this deploy restores its units too.
+	for u in /etc/systemd/system/adiona-*.service; do
+		[ -f "$u" ] && sudo cp -a "$u" "$REL/units-installed/"
+	done
+	sudo chmod +x "$REL"/kiosk/*.sh "$REL"/kiosk/*.py "$REL"/first-boot/*.sh \
+	              "$REL"/wheel/*.py "$REL"/updater/*.py "$REL"/updater/*.sh
+	sync
+	sudo ln -sfn "releases/${VER}+deploy" /opt/adiona/.current.tmp
+	sudo mv -T /opt/adiona/.current.tmp /opt/adiona/current
+	echo "  payload: $REL (release layout; current was $PREV)"
+else
+	sudo rm -rf /opt/adiona/web /opt/adiona/controller /opt/adiona/first-boot \
+	            /opt/adiona/kiosk /opt/adiona/wheel /opt/adiona/updater
+	sudo cp -r "$SRC/web"                "/opt/adiona/web"
+	sudo cp -r "$SRC/controller"         "/opt/adiona/controller"
+	sudo cp -r "$SRC/system/first-boot"  "/opt/adiona/first-boot"
+	sudo cp -r "$SRC/system/kiosk"       "/opt/adiona/kiosk"
+	sudo cp -r "$SRC/system/wheel"       "/opt/adiona/wheel"
+	sudo cp -r "$SRC/system/updater"     "/opt/adiona/updater"
+	sudo chmod +x /opt/adiona/kiosk/*.sh /opt/adiona/kiosk/*.py \
+	              /opt/adiona/first-boot/*.sh /opt/adiona/wheel/*.py \
+	              /opt/adiona/updater/*.py /opt/adiona/updater/*.sh
+	sudo install -m 0644 "$SRC/VERSION" /opt/adiona/VERSION
+	echo "  payload: /opt/adiona/{web,controller,first-boot,kiosk,wheel,updater}"
+fi
+
+# Boxes flashed before OTA existed have neither file, and an updater with no key
+# rejects every manifest — so this is what turns updates on for the existing fleet.
+#
+# image-version records what the CARD WAS FLASHED WITH, and a live deploy cannot
+# know that: it changes /opt/adiona, never the boot configuration. Writing the
+# version being deployed would be a lie that lets a `min_image` gate pass on a box
+# whose kernel cmdline, config.txt and Plymouth registration are years older —
+# exactly the half-applied state min_image exists to prevent. So record 0.0.0,
+# meaning "predates image-version, unknown". Releases that set min_image will
+# refuse to install and say the card needs re-imaging, which is true; releases
+# that do not set it are unaffected. A reflash writes the real value.
+[ -f /etc/adiona/image-version ] || \
+	echo "0.0.0" | sudo tee /etc/adiona/image-version >/dev/null
+sudo install -m 0644 "$SRC/system/updater/update-key.pub" /etc/adiona/update-key.pub
 
 if [ "$PUSH_CONF" = 1 ]; then
 	if ! sudo diff -q /etc/adiona/box.conf "$SRC/config/box.conf" >/dev/null 2>&1; then
@@ -587,11 +670,15 @@ fi
 sudo install -m 0644 "$SRC/system/controller/adiona-controller.service" \
                      "$SRC/system/kiosk/adiona-kiosk.service" \
                      "$SRC/system/wheel/adiona-wheel.service" \
+                     "$SRC/system/updater/adiona-updater.service" \
+                     "$SRC/system/updater/adiona-rollback.service" \
                      "$SRC/system/first-boot/adiona-firstboot.service" /etc/systemd/system/
 # Enable here as well as in the image stage: boxes flashed before the LAN wheel
 # existed have no enablement for it, and a live deploy is the only way they will
 # ever get one short of a reflash.
 sudo systemctl enable adiona-wheel.service >/dev/null 2>&1 || true
+sudo systemctl enable adiona-updater.service >/dev/null 2>&1 || true
+sudo systemctl enable adiona-rollback.service >/dev/null 2>&1 || true
 sudo install -m 0644 "$SRC/system/network/99-adiona-forward.conf" /etc/sysctl.d/
 sudo install -m 0644 "$SRC/system/udev/99-adiona-no-pointer.rules" /etc/udev/rules.d/
 sudo install -d /etc/NetworkManager/conf.d
@@ -624,10 +711,11 @@ fi
 
 sudo systemctl daemon-reload
 case "$RESTART" in
-	both)       UNITS="adiona-controller adiona-kiosk adiona-wheel" ;;
+	both)       UNITS="adiona-controller adiona-kiosk adiona-wheel adiona-updater" ;;
 	controller) UNITS="adiona-controller" ;;
 	kiosk)      UNITS="adiona-kiosk" ;;
 	wheel)      UNITS="adiona-wheel" ;;
+	updater)    UNITS="adiona-updater" ;;
 	none)       UNITS="" ;;
 esac
 if [ -n "$UNITS" ]; then

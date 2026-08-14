@@ -1,0 +1,31 @@
+[Unit]
+Description=Adiona-TV update rollback (undo an interrupted software update)
+# Costs nothing on a normal boot: apply-update.sh writes this marker immediately
+# before the release swap and clears it only after the new release has passed its
+# health check, so its presence at boot means the box was power-cycled mid-update
+# — either because the operator pulled the plug on a black screen, or because the
+# power actually failed. Same idiom as adiona-firstboot.service's .firstboot-done.
+ConditionPathExists=/etc/adiona/update-pending
+After=local-fs.target
+# Decide which release is current BEFORE anything runs out of it. All four
+# services ExecStart from under /opt/adiona, so letting them boot from a bad
+# release and restarting them afterwards would mean a visibly broken screen and
+# a second restart; flipping the symlink first means they only ever start once.
+# adiona-firstboot is included because it too execs from the release tree.
+Before=adiona-controller.service adiona-wheel.service adiona-kiosk.service adiona-firstboot.service adiona-updater.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/adiona/updater/apply-update.sh --boot-check
+# Generous: a power cut mid-dpkg leaves packages half-configured, and
+# `dpkg --configure -a` on an SD card is not fast. Holding the boot is the right
+# trade — the alternative is a box that comes up with a broken package database.
+TimeoutStartSec=600
+# Never block the boot on our own failure. A box that cannot roll back must still
+# come up on whatever it has; the failure is recorded in last-apply.json and shows
+# on the waiting screen.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target

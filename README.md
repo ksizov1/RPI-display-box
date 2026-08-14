@@ -207,6 +207,99 @@ shows the link status and the sensitivity/curve sliders.
 
 ---
 
+## Software updates
+
+### What the headset is told
+
+Once a second, on the same UDP socket the wheel already uses, the box sends a
+64-byte `AB01` packet carrying its software version, its OS version, a
+fleet-unique box id and a few status flags. The headset uses it to decide whether
+the wheel stream is one it can interpret, and shows it on the LAN wheel settings
+screen — so "which version is that box on?" is answerable from inside the headset
+rather than over SSH.
+
+It rides on the wheel socket because the headset's socket is *connected* to
+`box:5010` and drops datagrams from anywhere else. Packet **sizes** 28 (state), 56
+(info) and 64 (box) are the dispatch key on the headset; any future message must
+avoid all three.
+
+### How an update happens
+
+1. **Check.** Every `UPDATE_CHECK_INTERVAL_HOURS`, and only when the box actually
+   has an uplink, `adiona-updater.py` asks the licence server what the current
+   release is. The reply is signed; a manifest that does not verify against
+   `/etc/adiona/update-key.pub` is discarded and nothing is installed. The check
+   is a few hundred bytes — it is the *download* that is expensive, and that never
+   starts on its own.
+2. **Ask.** A prompt appears on the TV: *v1.5.0 → v1.6.0, Y to update, N for not
+   now.* **No answer within 60 seconds means no update**, and that version is not
+   offered again for 24 hours. The prompt only appears when no headset is
+   connected — during a session the video surface covers the page completely, and
+   interrupting a demo to ask about an update is the wrong thing to do anyway.
+3. **Download and stage.** The tarball is verified against the sha256 in the
+   signed manifest and unpacked into `/opt/adiona/releases/<version>/`. Nothing
+   the box is running has changed yet.
+4. **Apply.** `apply-update.sh` installs any missing apt packages *first* (so a
+   failure leaves the box untouched), merges new `box.conf` keys without
+   overwriting anything the operator set, then swaps `/opt/adiona/current` — one
+   atomic `rename(2)` of a symlink — and restarts the services. The display is
+   only restarted if the kiosk files actually changed; otherwise the page just
+   reloads itself.
+5. **Prove it worked.** For 90 seconds afterwards it checks that every unit is
+   active, is not crash-looping, and that the kiosk page is still polling
+   `/state`. That last one is the only signal that separates a working box from
+   Chromium sitting on an error page — `systemctl` cannot tell the difference.
+   **Any failure rolls the symlink and the unit files straight back.**
+
+### If the power is pulled mid-update
+
+A marker is written and `fsync`ed *before* the swap, and cleared only once the new
+release has passed its health check. `adiona-rollback.service` runs at boot
+whenever that marker survives, **before any Adiona service starts**, and puts the
+box back on the previous release. So a power cut during an update costs a longer
+boot, not a dead box.
+
+### Operating it
+
+```powershell
+.\tools\deploy.ps1 -Status          # version, image version, layout, releases, in-flight update
+.\tools\deploy.ps1 -Logs 100        # includes the updater and the applier
+```
+
+```bash
+sudo /opt/adiona/updater/adiona-updater.py --status     # what it thinks is going on
+sudo /opt/adiona/updater/adiona-updater.py --check      # check now, ignore the schedule
+sudo /opt/adiona/updater/adiona-updater.py --apply 1.6.0  # install now, no prompt
+sudo /opt/adiona/updater/adiona-updater.py --rollback   # back to the previous release
+```
+
+Set `UPDATE_ENABLED="0"` in `box.conf` for a box that must not change during a
+long installation.
+
+### Publishing a release
+
+`git tag v1.6.0 && git push --tags` builds the OTA tarball (and the image), then
+follow **`Adiona-license-server/docs/BOX_UPDATES.md`**. `bash tools/make-release.sh`
+does the same build locally.
+
+Before publishing anything anyone is waiting for:
+
+```bash
+bash tools/verify-signing.sh
+```
+
+A key mismatch between `system/updater/update-key.pub` and the vault secret is the
+one failure in this chain that is completely silent — the server reports
+`"signed": true`, boxes check in without errors, and nothing goes wrong until the
+first release, which every box then refuses and goes on refusing. This fetches a
+real manifest and verifies it the way a box would, with the key a box would use.
+
+`bash tools/test-apply-update.sh` (Linux or WSL — it needs real symlinks) exercises
+migration, rollback, crash-loop detection and power-cut repair in a sandbox. Run it
+after touching anything under `system/updater/`.
+
+---
+
 ## Repository layout
 
 ```
@@ -221,8 +314,14 @@ system/
                        adiona-player.sh  → GStreamer RTP receiver (+ --probe)
   controller/          controller unit
   wheel/               adiona-wheel.py — USB racing wheel → headset (+ unit)
+  updater/             adiona-updater.py — checks, offers and stages releases
+                       apply-update.sh   — the only thing that switches releases
+                       update-key.pub    — verifies the signed release manifest
 tools/
   deploy.ps1           live deploy from a Windows checkout
+  make-release.sh      build the OTA tarball + manifest fragment for a release
+  verify-signing.sh    prove the server signs with the pair of update-key.pub
+  test-apply-update.sh sandbox test for the update/rollback machinery (Linux/WSL)
   wheel-sim.py         fake LAN wheel, for testing the game without a Pi
 image/
   pi-gen/              custom pi-gen stage + build config

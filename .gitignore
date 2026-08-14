@@ -10,3 +10,16 @@ image/pi-gen/stage-adiona/00-install/files/
 # Python
 __pycache__/
 *.pyc
+
+# OTA release tarballs (tools/make-release.sh output; CI attaches them to the tag)
+dist/
+
+# Signing keys. The OTA release private key authorises running code AS ROOT on
+# every box in the fleet, and the natural place to run `openssl genpkey` is right
+# here in the checkout — so make it impossible to commit one by accident. Only the
+# PUBLIC half belongs in this repo, as system/updater/update-key.pub, which these
+# patterns do not match.
+*.key
+*.pem
+*.p12
+*.pfx

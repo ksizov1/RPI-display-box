@@ -162,6 +162,34 @@
   .whl-axis.hot { background: #fff4e5; border-radius: 0.6vmin; font-weight: 700; }
   .whl-axis .an { width: 15ch; }
   .whl-axis .ex { width: 8ch; color: #999; font-size: 1.6vmin; text-align: right; }
+
+  /* Software update prompt. Same shell as the two setup overlays, but above them
+     (z-index 20): it can appear while somebody is mid-way through Wi-Fi or wheel
+     setup, and half a dialog behind another is worse than either. */
+  #update { position: fixed; inset: 0; z-index: 20; display: flex;
+            align-items: center; justify-content: center;
+            background: rgba(255, 255, 255, 0.98);
+            font-family: system-ui, "DejaVu Sans", sans-serif; color: #1a1a1a; }
+  #update.update-hidden { display: none; }
+  .upd-vers { font-size: 4.2vmin; font-weight: 700; text-align: center; margin: 1vmin 0 2vmin; }
+  .upd-vers .from { color: #777; }
+  .upd-vers .arrow { color: #777; margin: 0 1.5vmin; }
+  .upd-vers .to { color: #1a73e8; }
+  .upd-notes { font-size: 2vmin; color: #555; text-align: center; margin-bottom: 2vmin;
+               max-height: 20vh; overflow-y: auto; }
+  .upd-notes:empty { display: none; }
+  /* Keys, not buttons, are the primary affordance: the box is driven from a
+     keyboard across a room and there is usually no mouse (see the udev rule). */
+  .upd-keys { display: flex; gap: 3vmin; justify-content: center; margin: 2vmin 0; }
+  .upd-key { font-size: 2.4vmin; padding: 1.2vmin 3vmin; border: 2px solid #c2c2c2;
+             border-radius: 1vmin; background: #f3f3f3; }
+  .upd-key b { font-size: 3vmin; color: #1a73e8; }
+  .upd-count { text-align: center; font-size: 2.2vmin; color: #555; }
+  .upd-count b { color: #111; font-variant-numeric: tabular-nums; }
+  /* Full-width progress bar; .bar itself is fixed-width for the wheel axes. */
+  .upd-bar { width: 100%; margin: 2vmin 0 1vmin; }
+  .upd-warn { text-align: center; font-size: 2.4vmin; color: #c1121f; font-weight: 700;
+              margin-top: 2vmin; }
 </style>
 </head>
 <body>
@@ -234,6 +262,20 @@
       <button id="whlClose">Close (Esc)</button>
     </div>
     <div id="whlMsg" class="wifi-msg"></div>
+  </div>
+</div>
+
+<!-- Software update prompt. Driven entirely by adiona-updater.py through
+     /state.update — this page decides nothing about updates, it only shows the
+     question and relays the answer. It cannot name a version or a URL of its own;
+     see update_command() in adiona_controller.py. -->
+<div id="update" class="update-hidden">
+  <div class="wifi-card">
+    <div id="updTitle" class="wifi-title">Software update available</div>
+    <div id="updVers" class="upd-vers"></div>
+    <div id="updNotes" class="upd-notes"></div>
+    <div id="updBody"></div>
+    <div id="updMsg" class="wifi-msg"></div>
   </div>
 </div>
 
@@ -426,32 +468,68 @@
   }                                    // next frame was already queued at the top
 
   // ── Poll the controller for what to display ───────────────────────────────
+  // The version this page was served with. An update that swaps the release
+  // under a running controller leaves Chromium showing the OLD index.html, and
+  // nothing else would ever reload it — so a version change IS the reload signal.
+  // Cheap and exact: the page is served with Cache-Control: no-store, so a reload
+  // always fetches the new one, and most updates therefore cost a sub-second
+  // refresh instead of a ten-second kiosk restart.
+  var loadedVersion = null;
+  var pollFailures = 0;
+
   function poll() {
     fetch("/state", { cache: "no-store" }).then(function (r) { return r.json(); })
       .then(function (s) {
         state = s;
+        // Two reasons to reload, both meaning "the HTML behind us may have
+        // changed": the version moved (an update swapped the release), or the
+        // controller went away and came back (a restart — which deploy.ps1 does
+        // on every deploy, usually without a version bump). Both are checked only
+        // on a SUCCESSFUL fetch, so a reload can never land on an error page.
+        var cameBack = pollFailures >= 10;
+        pollFailures = 0;
+        if (loadedVersion === null) {
+          loadedVersion = s.version || "";
+        } else if (cameBack || (s.version && s.version !== loadedVersion)) {
+          location.reload();
+          return;
+        }
         elVersion.textContent = s.version ? ("Adiona-TV v" + s.version) : "";
         renderOverlay();
+        renderUpdate(s.update);
 
         // Signature of everything the waiting screen draws. Any change to it is
         // a visible change, and restarts the idle countdown.
         var up = s.uplink || {};
         var wh = s.wheel || {};
+        var ud = s.update || {};
         var sig = [s.mode, s.target, s.target_name, s.ssid, s.passphrase, s.version,
                    s.casting, up.internet, up.via, up.wifi_ssid, up.ethernet,
                    up.wifi_present,
                    // Summary fields only. Axis values change constantly and would
                    // keep the idle countdown permanently reset — the very case
                    // the screensaver exists for.
-                   wh.present, wh.name, wh.range_deg, wh.mapped].join("|");
+                   wh.present, wh.name, wh.range_deg, wh.mapped,
+                   // Update state, but NOT progress or the countdown: those move
+                   // every poll and would defeat the idle detection entirely.
+                   ud.state, ud.available].join("|");
         if (sig !== lastSig) { lastSig = sig; noteActivity(); }
 
         // Never over a live stream: the player's surface covers this page, so it
-        // would be invisible work, and the picture is moving anyway.
-        if (!wifiOpen && !wheelOpen && !s.casting &&
+        // would be invisible work, and the picture is moving anyway. Nor over the
+        // update prompt — burning in for three minutes is a smaller problem than
+        // hiding a question that installs software.
+        if (!wifiOpen && !wheelOpen && !updateOpen && !s.casting &&
             (Date.now() - lastChangeMs) > IDLE_MS) saverStart();
       })
-      .catch(function () { /* controller momentarily down; keep last state */ });
+      .catch(function () {
+        // Controller momentarily down; keep the last state on screen. Deliberately
+        // NOT a reload: while the controller is down a reload replaces a stale but
+        // perfectly recoverable page with Chromium's connection-error page, which
+        // has no way back — kiosk-session.sh passes the URL once and never reloads
+        // it. Counting here and reloading on the way back up is the safe half.
+        pollFailures++;
+      });
   }
 
   // ── Upstream Wi-Fi setup overlay (keyboard-only: W opens, arrows/Tab/Enter/Esc) ──
@@ -879,10 +957,166 @@
   document.getElementById("whlSave").addEventListener("click", whlSave);
   document.getElementById("whlClose").addEventListener("click", function () { wheelShow(false); });
 
+  // ── Software update prompt ────────────────────────────────────────────────
+  // The updater owns every decision here: whether there is an update, whether now
+  // is a moment to ask, and when the offer lapses. This renders what it says and
+  // posts back Y or N. Keeping the deadline on the updater's side (a monotonic
+  // clock in a process that outlives this page) is what makes it survive a
+  // reload — a countdown held in the page would restart every time Chromium did.
+  var updateEl = document.getElementById("update");
+  var elUpdTitle = document.getElementById("updTitle");
+  var elUpdVers = document.getElementById("updVers");
+  var elUpdNotes = document.getElementById("updNotes");
+  var elUpdBody = document.getElementById("updBody");
+  var elUpdMsg = document.getElementById("updMsg");
+  var updateOpen = false;
+  var upd = { state: "idle" };
+  // /state arrives at 1 Hz but the countdown must not visibly stutter, so the
+  // number is interpolated locally between polls and re-synced on every one.
+  var updDeadlineMs = 0;
+
+  function updPost(p) {
+    return fetch("/update", { method: "POST", body: JSON.stringify(p) })
+      .then(function (r) { return r.json(); });
+  }
+
+  function updShow(open) {
+    updateOpen = open;
+    updateEl.classList.toggle("update-hidden", !open);
+  }
+
+  // Which states are worth covering the screen for. "available" is not among
+  // them: it means the updater has found something but has not decided this is a
+  // moment to ask (a headset is connected, say).
+  function updVisible(u) {
+    return u.state === "prompting" || u.state === "downloading" ||
+           u.state === "verifying" || u.state === "staged" ||
+           u.state === "applying"  || u.state === "health" ||
+           u.state === "ok"        || u.state === "failed";
+  }
+
+  function updCountdown() {
+    if (upd.state !== "prompting") return 0;
+    return Math.max(0, Math.round((updDeadlineMs - Date.now()) / 1000));
+  }
+
+  function renderUpdate(next) {
+    var prev = upd;
+    upd = next || { state: "idle" };
+
+    if (upd.state === "prompting") {
+      // Re-sync only when the updater's own number moves, so the local
+      // interpolation is not yanked back a fraction of a second every poll.
+      if (prev.state !== "prompting" || prev.expires_in !== upd.expires_in) {
+        updDeadlineMs = Date.now() + (upd.expires_in || 0) * 1000;
+      }
+    } else {
+      updDeadlineMs = 0;
+    }
+
+    var visible = updVisible(upd);
+    if (visible !== updateOpen) updShow(visible);
+    if (!visible) return;
+
+    var cur = esc(upd.current || state.version || "");
+    var to = esc(upd.available || "");
+    var versLine = to
+      ? '<span class="from">v' + cur + '</span><span class="arrow">&rarr;</span>' +
+        '<span class="to">v' + to + '</span>'
+      : "";
+
+    elUpdNotes.textContent = "";
+    elUpdMsg.textContent = "";
+
+    if (upd.state === "prompting") {
+      elUpdTitle.textContent = "Software update available";
+      elUpdVers.innerHTML = versLine;
+      elUpdNotes.textContent = upd.notes || "";
+      elUpdBody.innerHTML =
+        '<div class="upd-keys">' +
+          '<span class="upd-key"><b>Y</b> &nbsp;Update now</span>' +
+          '<span class="upd-key"><b>N</b> &nbsp;Not now</span>' +
+        '</div>' +
+        '<div class="upd-count">Closing in <b id="updSecs">' + updCountdown() + '</b> s' +
+        ' &nbsp;·&nbsp; no answer means no update</div>';
+      return;
+    }
+
+    if (upd.state === "downloading" || upd.state === "verifying") {
+      elUpdTitle.textContent = upd.state === "verifying"
+        ? "Checking the download" : "Downloading update";
+      elUpdVers.innerHTML = versLine;
+      var pct = Math.round((upd.progress || 0) * 100);
+      elUpdBody.innerHTML =
+        '<div class="bar upd-bar"><i style="left:0;width:' + pct + '%"></i></div>' +
+        '<div class="upd-count"><b>' + pct + '</b>%</div>';
+      return;
+    }
+
+    if (upd.state === "staged" || upd.state === "applying" || upd.state === "health") {
+      elUpdTitle.textContent = upd.state === "staged"
+        ? "Ready to install" : "Installing update";
+      elUpdVers.innerHTML = versLine;
+      elUpdBody.innerHTML = "";
+      // The single most important line on this screen. Without it the operator
+      // sees an unexplained black screen and pulls the power — which is exactly
+      // the failure the rollback machinery exists to survive, and the one case
+      // where it costs a reboot to recover from.
+      elUpdMsg.innerHTML = upd.state === "staged"
+        ? esc(upd.message || "Waiting for the session to end.")
+        : '<span class="upd-warn">The display will go black for a few seconds.' +
+          '<br>Do not remove power.</span>';
+      return;
+    }
+
+    // ok / failed — a short-lived banner the updater clears on its own.
+    elUpdTitle.textContent = upd.state === "ok" ? "Update complete" : "Update failed";
+    elUpdVers.innerHTML = upd.state === "ok" && to
+      ? '<span class="to">v' + to + '</span>'
+      : '<span class="to">v' + esc(state.version || upd.current || "") + '</span>';
+    elUpdBody.innerHTML = "";
+    elUpdMsg.textContent = upd.message ||
+      (upd.state === "ok" ? "" : "The box is still running its previous version.");
+  }
+
+  // Tick the displayed number between polls. Cheap: one text node, once a second,
+  // and only while the prompt is up.
+  setInterval(function () {
+    if (!updateOpen || upd.state !== "prompting") return;
+    var el = document.getElementById("updSecs");
+    if (el) el.textContent = updCountdown();
+  }, 250);
+
+  function updAnswer(accept) {
+    var version = upd.available || "";
+    updPost({ action: accept ? "accept" : "decline", version: version });
+    // Optimistic, so the screen reacts to the keypress immediately rather than
+    // on the next poll. The updater's own state overwrites this within a second.
+    elUpdMsg.textContent = accept ? "Starting the update…" : "Not now.";
+    if (!accept) updShow(false);
+  }
+
   document.addEventListener("keydown", function (e) {
     // Someone is at the keyboard: dismiss the screensaver and restart the
     // countdown before anything else looks at the key.
     noteActivity();
+    // The update prompt is checked FIRST and swallows everything. It is drawn
+    // over the two setup overlays, and the wifiOpen branch below returns early —
+    // so anywhere later in this chain its Y/N would be eaten by whatever dialog
+    // happens to be open underneath.
+    if (updateOpen) {
+      if (upd.state === "prompting") {
+        if (e.key === "y" || e.key === "Y") { updAnswer(true); e.preventDefault(); }
+        else if (e.key === "n" || e.key === "N" || e.key === "Escape") {
+          updAnswer(false); e.preventDefault();
+        }
+      } else if (e.key === "Escape" && (upd.state === "ok" || upd.state === "failed")) {
+        updShow(false); e.preventDefault();     // dismiss the result banner early
+      }
+      // Everything else is deliberately dropped: W and C must not open a dialog
+      // underneath a question that is about to install software.
+      return;
+    }
     if (wifiOpen) { if (e.key === "Escape") { wifiShow(false); e.preventDefault(); } return; }
     if (wheelOpen) {
       if (e.key === "Escape") { wheelShow(false); e.preventDefault(); }

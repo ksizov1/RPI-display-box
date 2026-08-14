@@ -102,6 +102,20 @@ WHEEL_STATUS_PATH = os.path.join(RUN_DIR, "wheel.json")
 WHEEL_CMD_PATH = os.path.join(RUN_DIR, "wheel-cmd.json")
 WHEEL_CMD_SEQ = [0]
 
+# ── Software update bridge ───────────────────────────────────────────────────
+# Identical arrangement to the wheel bridge above, and for the same reason: the
+# updater must be able to restart — which applying an update forces it to do —
+# without taking this service or the kiosk page with it.
+UPDATE_STATUS_PATH = os.path.join(RUN_DIR, "update.json")
+UPDATE_CMD_PATH = os.path.join(RUN_DIR, "update-cmd.json")
+UPDATE_CMD_SEQ = [0]
+
+# Monotonic time of the last /state fetch by the kiosk page. apply-update.sh
+# watches this during an update's soak: it is the only signal that separates
+# "adiona-kiosk is active" from "Chromium is parked on its connection-error page",
+# which looks identical to systemctl and identical to a black TV.
+UI_SEEN = [0.0]
+
 # ── Shared state (guarded by LOCK) ───────────────────────────────────────────
 LOCK = threading.Lock()
 STATE = {
@@ -194,6 +208,58 @@ def wheel_command(data):
         os.replace(tmp, WHEEL_CMD_PATH)
     except OSError as e:
         return {"ok": False, "message": "wheel service unreachable: %s" % e}
+    return {"ok": True, "message": action}
+
+
+def update_status():
+    """Read adiona-updater.py's status file. Absent service == nothing to say."""
+    try:
+        with open(UPDATE_STATUS_PATH) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {"state": "idle"}
+
+
+def update_summary(status):
+    """The few fields the update modal needs. /state is fetched twice a second —
+    by the page and by kiosk-session.sh — so the release list, the schedule and
+    the manifest details stay out of it."""
+    return {
+        "state": status.get("state", "idle"),
+        "current": status.get("current", ""),
+        "available": status.get("available", ""),
+        "notes": status.get("notes", ""),
+        "progress": status.get("progress", 0.0),
+        "expires_in": status.get("prompt_expires_in", 0),
+        "message": status.get("message", ""),
+    }
+
+
+def update_command(data):
+    """
+    Hand one command to adiona-updater.py.
+
+    Whitelisted rather than passed through, exactly like wheel_command(). Note
+    what is NOT accepted: no URL, no download location, no version to fetch. The
+    page may only answer the question the updater is already asking. `version` is
+    echoed back solely so an answer to a superseded offer can be ignored — the
+    page reads it from /state and cannot invent one.
+    """
+    action = str(data.get("action", ""))
+    if action not in ("check", "accept", "decline", "cancel"):
+        return {"ok": False, "message": "unknown action"}
+
+    cmd = {"action": action, "version": str(data.get("version", ""))[:32]}
+    UPDATE_CMD_SEQ[0] += 1
+    cmd["seq"] = UPDATE_CMD_SEQ[0]
+    tmp = UPDATE_CMD_PATH + ".tmp"
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        with open(tmp, "w") as fh:
+            json.dump(cmd, fh)
+        os.replace(tmp, UPDATE_CMD_PATH)
+    except OSError as e:
+        return {"ok": False, "message": "updater unreachable: %s" % e}
     return {"ok": True, "message": action}
 
 
@@ -748,6 +814,11 @@ def selection_loop():
             STATE["casting"] = bool(target) and target in casting_ips
             STATE["target_name"] = mac_to_host.get(current_mac) if current_mac else None
             STATE["ssid"] = read_ssid()
+            # Re-read rather than trusting the value captured at import: an OTA
+            # swaps the release under this process, and the page's "Updated to
+            # v1.6.0" confirmation would otherwise report the old version until
+            # something happened to restart the controller.
+            STATE["version"] = read_version()
             STATE["uplink"] = uplink_status()
             STATE["wheel"] = wheel_summary(wheel_status())
 
@@ -772,9 +843,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         if path == "/state":
+            now = time.monotonic()
+            seen_ago = (now - UI_SEEN[0]) if UI_SEEN[0] else None
+            UI_SEEN[0] = now
             with LOCK:
-                body = json.dumps(STATE).encode("utf-8")
-            self._send(200, body, "application/json")
+                snapshot = dict(STATE)
+            # Built per request, not in selection_loop: SCAN_INTERVAL is 2 s but
+            # the page polls at 1 Hz, so an update countdown assembled in the loop
+            # would tick 60, 60, 58, 58 instead of counting down smoothly.
+            snapshot["update"] = update_summary(update_status())
+            snapshot["ui_seen_ago"] = round(seen_ago, 2) if seen_ago is not None else None
+            self._send(200, json.dumps(snapshot).encode("utf-8"), "application/json")
             return
         if path == "/wifi":
             self._send(200, json.dumps(wifi_info()).encode("utf-8"), "application/json")
@@ -801,7 +880,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path not in ("/wifi", "/wheel"):
+        if path not in ("/wifi", "/wheel", "/update"):
             self._send(404, b"not found", "text/plain")
             return
         try:
@@ -812,6 +891,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/wheel":
             self._send(200, json.dumps(wheel_command(data)).encode("utf-8"),
+                       "application/json")
+            return
+        if path == "/update":
+            self._send(200, json.dumps(update_command(data)).encode("utf-8"),
                        "application/json")
             return
         action = data.get("action")

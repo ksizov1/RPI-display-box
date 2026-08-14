@@ -13,6 +13,7 @@ Usage
     python3 tools/wheel-sim.py --range 270     # pretend it is a 270 deg wheel
     python3 tools/wheel-sim.py --static 90     # hold 90 deg right, no sweep
     python3 tools/wheel-sim.py --no-wheel      # box alive, nothing plugged in
+    python3 tools/wheel-sim.py --app-version 1.6.0   # what the box claims to run
 
 Then in Godot set Global.lan_wheel.box_ip_override to this machine's IP (or
 "127.0.0.1" when the game runs on the same box).
@@ -31,14 +32,26 @@ import struct
 import sys
 import time
 
+# Mirrors the wire format in system/wheel/adiona-wheel.py. PACKET SIZES 28
+# (STATE), 56 (INFO) and 64 (BOX) ARE TAKEN — the headset dispatches on size
+# first, so any new message must avoid all three. Change this file and the
+# service together, or the sim stops being a valid stand-in.
 STATE_FMT = struct.Struct("<4sIHHfHHIi")
 INFO_FMT = struct.Struct("<4sHH48s")
+BOX_FMT = struct.Struct("<4sHHBBBBHHI20s24s")
 SUB_FMT = struct.Struct("<4sI")
-STATE_MAGIC, INFO_MAGIC, SUB_MAGIC = b"AW01", b"AI01", b"ASUB"
+STATE_MAGIC, INFO_MAGIC, BOX_MAGIC, SUB_MAGIC = b"AW01", b"AI01", b"AB01", b"ASUB"
 
 FLAG_WHEEL_PRESENT = 1 << 0
 FLAG_PEDALS_MAPPED = 1 << 1
 FLAG_RANGE_APPLIED = 1 << 2
+
+
+def parse_semver(text):
+    parts = text.strip().split(".")
+    if len(parts) != 3 or not all(p.isdigit() and int(p) < 256 for p in parts):
+        return (0, 0, 0)
+    return tuple(int(p) for p in parts)
 
 
 def main():
@@ -55,6 +68,16 @@ def main():
     ap.add_argument("--no-wheel", action="store_true",
                     help="report the box as alive but with no wheel plugged in")
     ap.add_argument("--name", default="Logitech G920 Driving Force Racing Wheel")
+    ap.add_argument("--app-version", default="1.5.0", dest="app_version",
+                    help="version the box reports in the 1 Hz AB01 packet")
+    ap.add_argument("--os-string", default="Debian 13 (trixie)",
+                    dest="os_string", help="OS string reported in AB01 (24 bytes max)")
+    ap.add_argument("--os-version", default="13", dest="os_version",
+                    help="numeric OS version reported in AB01, e.g. 13 or 12.5")
+    ap.add_argument("--box-id", default="A3F1", dest="box_id",
+                    help="4 hex chars, as adiona-firstboot.sh derives from the MAC")
+    ap.add_argument("--no-box-report", action="store_true",
+                    help="omit AB01 entirely, to test a headset against an old box")
     args = ap.parse_args()
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -69,11 +92,24 @@ def main():
     print("wheel-sim on UDP %d — %d Hz, range %d deg%s" %
           (args.port, args.hz, args.range_deg,
            ", NO WHEEL" if args.no_wheel else ""))
+    print("box report: v%s on %s%s" %
+          (args.app_version, args.os_string,
+           " (SUPPRESSED)" if args.no_box_report else ""))
     print("waiting for a subscriber (the headset sends ASUB every 500 ms)...")
 
     half = args.range_deg / 2.0
     interval = 1.0 / args.hz
     info_every = max(1, args.hz // 2)
+
+    app_num = parse_semver(args.app_version)
+    os_bits = args.os_version.split(".")
+    os_major = int(os_bits[0]) if os_bits and os_bits[0].isdigit() else 0
+    os_minor = int(os_bits[1]) if len(os_bits) > 1 and os_bits[1].isdigit() else 0
+    try:
+        box_id = int(args.box_id, 16) & 0xFFFF
+    except ValueError:
+        box_id = 0
+    t_boot = time.monotonic()
 
     sub = None
     sub_seen = 0.0
@@ -140,6 +176,13 @@ def main():
             if tick % info_every == 0:
                 name = b"" if args.no_wheel else args.name.encode("utf-8")[:48]
                 sock.sendto(INFO_FMT.pack(INFO_MAGIC, args.range_deg, flags, name), sub)
+            # Offset by one tick so BOX never shares a tick with INFO.
+            if not args.no_box_report and tick % args.hz == 1:
+                sock.sendto(BOX_FMT.pack(
+                    BOX_MAGIC, 0, box_id, app_num[0], app_num[1], app_num[2],
+                    2, os_major, os_minor, int(now - t_boot),
+                    args.app_version.encode("utf-8")[:20],
+                    args.os_string.encode("utf-8")[:24]), sub)
         except OSError:
             pass                    # drop-tolerant, exactly like the real service
 

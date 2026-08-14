@@ -1,0 +1,22 @@
+[Unit]
+Description=Adiona-TV software updater (checks, offers and stages box releases)
+After=NetworkManager.service adiona-controller.service
+Wants=NetworkManager.service adiona-controller.service
+
+[Service]
+Type=simple
+# Runs as root: it writes /opt/adiona/releases, merges /etc/adiona/box.conf and
+# asks systemd to run the applier. It never opens a listening socket — the only
+# thing that talks to it is adiona_controller.py, through two files on tmpfs.
+ExecStart=/usr/bin/python3 /opt/adiona/updater/adiona-updater.py
+Environment=ADIONA_CONF=/etc/adiona/box.conf
+Restart=always
+RestartSec=5
+# NOT RuntimeDirectory=adiona: systemd deletes a RuntimeDirectory when the unit
+# stops, which would take /run/adiona/wheel.json with it and blind the wheel
+# service's status feed every time this service restarts — and applying an update
+# restarts this service by design. The script creates the directory itself, the
+# same way the controller and the wheel service do.
+
+[Install]
+WantedBy=multi-user.target

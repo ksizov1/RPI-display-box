@@ -199,11 +199,41 @@ edited — and if it also has to reach a live box, `tools/deploy.ps1`'s
 step.
 
 Note that "picked up by `assemble-stage.sh`" only means *copied into the payload*.
-A new **service** additionally needs its `cp`/`install`/`systemctl enable` lines in
-BOTH `image/pi-gen/stage-adiona/00-install/01-run.sh` and the `install.sh`
-here-string inside `tools/deploy.ps1` — the latter so that boxes flashed before the
-service existed pick up its enablement on a live deploy instead of needing a
-reflash. `system/wheel/` is the worked example.
+A new **service** is a **six-file change**, not three:
+
+1. `image/pi-gen/stage-adiona/00-install/01-run.sh` — `cp`, `install` the unit,
+   `systemctl enable`.
+2. The `install.sh` here-string in `tools/deploy.ps1` — the same three things, so
+   that boxes flashed *before* the service existed pick up its enablement on a
+   live deploy instead of needing a reflash. Note this block is layout-aware; add
+   to **both** branches (see "Release layout" below).
+3. `tools/deploy.ps1`'s `-Restart` `ValidateSet` **and** the `case` that maps it
+   to unit names — otherwise you cannot restart the new service from the tool you
+   use every day.
+4. `tools/deploy.ps1`'s `$JournalMatch` — otherwise `-Logs`/`-Follow` silently
+   omit the new service's output, which is worse than no logs because it looks
+   like the service is saying nothing.
+5. `tools/deploy.ps1`'s `$StatusCmd` unit loop — so `-Status` reports it.
+6. `image/assemble-stage.sh` — **only** if the files live outside `web/`,
+   `controller/`, `system/`, `config/`, `VERSION`.
+
+`system/updater/` is the worked example; `system/wheel/` predates points 3-5 and
+was missing from `$StatusCmd` for exactly that reason.
+
+### Release layout
+
+Once a box has taken an over-the-air update, `/opt/adiona/{web,controller,…}` are
+symlinks into `/opt/adiona/current`, which points at one of
+`/opt/adiona/releases/<version>/`. `deploy.ps1` detects this and builds a
+`<version>+deploy` release rather than writing through the symlinks — writing
+through them would overwrite the contents of a *signed release directory* with a
+working tree, and a later rollback would then restore somebody's uncommitted
+edits. `deploy.ps1 -Status` prints which layout a box is on.
+
+Both the OTA applier and `install.sh` take `flock` on `/opt/adiona/.update.lock`,
+so a deploy that lands while an update is applying fails cleanly instead of
+interleaving. See `system/updater/apply-update.sh` for the whole scheme, and
+`bash tools/test-apply-update.sh` (Linux or WSL) to exercise it.
 
 ### B2 — Flash
 

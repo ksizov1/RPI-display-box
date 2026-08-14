@@ -57,10 +57,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CONF_PATH = os.environ.get("ADIONA_CONF", "/etc/adiona/box.conf")
 MAP_PATH = os.environ.get("ADIONA_WHEEL_MAP", "/etc/adiona/wheel-map.json")
 RUN_DIR = os.environ.get("ADIONA_RUN_DIR", "/run/adiona")
+VERSION_FILE = os.environ.get("ADIONA_VERSION_FILE", "/opt/adiona/VERSION")
+SSID_FILE = os.environ.get("ADIONA_SSID_FILE", "/etc/adiona/ssid")
+OS_RELEASE = os.environ.get("ADIONA_OS_RELEASE", "/etc/os-release")
 
 # Dev fallbacks so this runs from a checkout on a workstation.
 if not os.path.exists(CONF_PATH):
     CONF_PATH = os.path.join(HERE, "..", "..", "config", "box.conf")
+if not os.path.exists(VERSION_FILE):
+    VERSION_FILE = os.path.join(HERE, "..", "..", "VERSION")
 
 
 def load_conf(path):
@@ -93,6 +98,9 @@ HOUSEKEEP_HZ = 20                        # status write + command poll rate
 
 STATUS_PATH = os.path.join(RUN_DIR, "wheel.json")
 CMD_PATH = os.path.join(RUN_DIR, "wheel-cmd.json")
+# Written by adiona-updater.py. Read-only here, and entirely optional: a box with
+# no updater service just reports zero flags.
+UPDATE_STATUS_PATH = os.path.join(RUN_DIR, "update.json")
 
 # ── Wire format ──────────────────────────────────────────────────────────────
 # STATE, 28 bytes, little-endian. A `reserved` u16 sits after `flags` purely so
@@ -111,6 +119,36 @@ STATE_MAGIC = b"AW01"
 NAME_LEN = 48
 INFO_FMT = struct.Struct("<4sHH%ds" % NAME_LEN)
 INFO_MAGIC = b"AI01"
+
+# BOX, 64 bytes, 1 Hz. What this box is running, so the headset can decide
+# whether the wheel stream is usable and how to interpret it. Deliberately NOT
+# folded into INFO: INFO's 56-byte layout is already parsed by shipped APKs, and
+# widening it would be a breaking change needing a coordinated headset release.
+#   magic 'AB01' | flags u16 | box_id u16
+#   app_major u8 | app_minor u8 | app_patch u8 | os_id u8
+#   os_major u16 | os_minor u16 | uptime_s u32
+#   app_str 20s (NUL-padded) | os_str 24s (NUL-padded)
+#
+# The version lives in the magic, as with AW01/AI01 — there is no separate wire
+# version field. The headset dispatches on SIZE first, so any field added here
+# changes the size and is already a new dispatch case.
+#
+# PACKET SIZES 28 (STATE), 56 (INFO) and 64 (BOX) ARE TAKEN. Any future message
+# must avoid all three, or the headset's size-then-magic dispatch will confuse it.
+BOX_APP_LEN = 20
+BOX_OS_LEN = 24
+BOX_FMT = struct.Struct("<4sHHBBBBHHI%ds%ds" % (BOX_APP_LEN, BOX_OS_LEN))
+BOX_MAGIC = b"AB01"
+
+BOX_FLAG_UPDATE_AVAILABLE = 1 << 0
+BOX_FLAG_UPDATE_IN_PROGRESS = 1 << 1
+BOX_FLAG_JUST_UPDATED = 1 << 2       # applied within the last 10 minutes
+BOX_FLAG_UPDATER_PRESENT = 1 << 3
+BOX_FLAG_INTERNET_OK = 1 << 4
+
+BOX_OS_UNKNOWN = 0
+BOX_OS_RASPBIAN = 1
+BOX_OS_DEBIAN = 2
 
 # Subscribe keepalive from the headset.
 SUB_FMT = struct.Struct("<4sI")
@@ -338,6 +376,166 @@ def save_user_map(data):
 
 def log(msg):
     print("[adiona-wheel] %s" % msg, flush=True)
+
+
+# ── Box report (AB01) ────────────────────────────────────────────────────────
+# Everything here is cheap and local. It lives in the wheel service rather than
+# in a service of its own because the headset's socket is CONNECTED to
+# <box>:5010 — datagrams from any other source port are dropped by its OS — and
+# a second socket on 5010 would split the headset's ASUB keepalives between two
+# processes. So this is the only process that can reach the headset at all.
+BOX_INFO = {
+    "app_str": "",
+    "app_num": (0, 0, 0),
+    "os_id": BOX_OS_UNKNOWN,
+    "os_major": 0,
+    "os_minor": 0,
+    "os_str": "",
+    "box_id": 0,
+    "version_mtime": None,
+}
+BOX_FLAGS = [0]                          # refreshed at 1 Hz by housekeeping
+
+
+def parse_semver(text):
+    """'1.5.0' -> (1, 5, 0). Anything else -> (0, 0, 0), and the headset must
+    treat that as 'unknown' rather than 'ancient' — app_str stays authoritative."""
+    parts = text.strip().split(".")
+    if len(parts) != 3:
+        return (0, 0, 0)
+    out = []
+    for p in parts:
+        if not p.isdigit():
+            return (0, 0, 0)
+        n = int(p)
+        if n > 255:
+            return (0, 0, 0)
+        out.append(n)
+    return tuple(out)
+
+
+def read_os_release():
+    """(os_id, major, minor, label) from /etc/os-release.
+
+    The label is composed as "Debian 13 (trixie)" rather than taken from
+    PRETTY_NAME, which is "Debian GNU/Linux 13 (trixie)" — 28 characters, four
+    over the 24 the packet carries, and a truncated OS name on the headset's
+    status line reads as a fault rather than as a field-width limit."""
+    fields = {}
+    try:
+        with open(OS_RELEASE) as fh:
+            for line in fh:
+                key, _, val = line.strip().partition("=")
+                if key:
+                    fields[key] = val.strip().strip('"').strip("'")
+    except OSError:
+        return BOX_OS_UNKNOWN, 0, 0, ""
+    ident = fields.get("ID", "").lower()
+    os_id = (BOX_OS_RASPBIAN if ident == "raspbian" else
+             BOX_OS_DEBIAN if ident == "debian" else BOX_OS_UNKNOWN)
+    major = minor = 0
+    bits = fields.get("VERSION_ID", "").split(".")
+    if bits and bits[0].isdigit():
+        major = min(int(bits[0]), 0xFFFF)
+    if len(bits) > 1 and bits[1].isdigit():
+        minor = min(int(bits[1]), 0xFFFF)
+
+    name = ident.capitalize() if ident else ""
+    ver = fields.get("VERSION_ID", "")
+    code = fields.get("VERSION_CODENAME", "")
+    label = " ".join(p for p in (name, ver) if p)
+    if code:
+        label = ("%s (%s)" % (label, code)).strip()
+    return os_id, major, minor, label or fields.get("PRETTY_NAME", "")
+
+
+def utf8_fit(text, limit):
+    """Encode, truncating on a codepoint boundary so the headset never has to
+    decode half a character."""
+    raw = text.encode("utf-8")
+    if len(raw) <= limit:
+        return raw
+    while limit > 0 and (raw[limit] & 0xC0) == 0x80:
+        limit -= 1
+    return raw[:limit]
+
+
+def read_box_id():
+    """The 4 hex chars adiona-firstboot.sh derives from the MAC, as a u16. This is
+    the only fleet-unique identifier the box has that is not an RFC1918 address
+    identical on every box."""
+    try:
+        with open(SSID_FILE) as fh:
+            ssid = fh.read().strip()
+    except OSError:
+        return 0
+    suffix = ssid.rsplit("-", 1)[-1]
+    try:
+        return int(suffix, 16) & 0xFFFF
+    except ValueError:
+        return 0
+
+
+def read_box_info():
+    """Refresh the cached box identity. VERSION is re-read when its mtime moves,
+    so an OTA that swaps the release under us is reported without a restart."""
+    try:
+        mtime = os.stat(VERSION_FILE).st_mtime
+    except OSError:
+        mtime = None
+    if mtime is not None and mtime == BOX_INFO["version_mtime"] and BOX_INFO["app_str"]:
+        return
+    try:
+        with open(VERSION_FILE) as fh:
+            app = fh.read().strip()
+    except OSError:
+        app = ""
+    os_id, os_major, os_minor, pretty = read_os_release()
+    BOX_INFO.update(app_str=app, app_num=parse_semver(app), os_id=os_id,
+                    os_major=os_major, os_minor=os_minor, os_str=pretty,
+                    box_id=read_box_id(), version_mtime=mtime)
+
+
+def refresh_box_flags():
+    """Fold adiona-updater.py's status file into the AB01 flag bits. An absent or
+    unparseable file means zero flags — the updater is optional."""
+    try:
+        with open(UPDATE_STATUS_PATH) as fh:
+            upd = json.load(fh)
+    except (OSError, ValueError):
+        BOX_FLAGS[0] = 0
+        return
+    flags = BOX_FLAG_UPDATER_PRESENT
+    state = upd.get("state", "")
+    if upd.get("available"):
+        flags |= BOX_FLAG_UPDATE_AVAILABLE
+    if state in ("downloading", "verifying", "staged", "applying", "health"):
+        flags |= BOX_FLAG_UPDATE_IN_PROGRESS
+    result = upd.get("last_result") or {}
+    if result.get("ok") and (time.time() - float(result.get("at", 0))) < 600:
+        flags |= BOX_FLAG_JUST_UPDATED
+    if upd.get("internet"):
+        flags |= BOX_FLAG_INTERNET_OK
+    BOX_FLAGS[0] = flags
+
+
+def uptime_seconds():
+    try:
+        with open("/proc/uptime") as fh:
+            return min(int(float(fh.read().split()[0])), 0xFFFFFFFF)
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def box_packet():
+    read_box_info()
+    return BOX_FMT.pack(
+        BOX_MAGIC, BOX_FLAGS[0] & 0xFFFF, BOX_INFO["box_id"],
+        BOX_INFO["app_num"][0], BOX_INFO["app_num"][1], BOX_INFO["app_num"][2],
+        BOX_INFO["os_id"], BOX_INFO["os_major"], BOX_INFO["os_minor"],
+        uptime_seconds(),
+        utf8_fit(BOX_INFO["app_str"], BOX_APP_LEN),
+        utf8_fit(BOX_INFO["os_str"], BOX_OS_LEN))
 
 
 # ── Shared state ─────────────────────────────────────────────────────────────
@@ -696,7 +894,12 @@ SUBSCRIBER = {"addr": None, "seen": 0.0}
 
 
 def sender_thread(sock):
-    """Fixed-rate STATE at TX_HZ, INFO at ~2 Hz. Never blocks on the wheel."""
+    """Fixed-rate STATE at TX_HZ, INFO at ~2 Hz, BOX at 1 Hz. Never blocks on the
+    wheel.
+
+    `tick` only advances while a subscriber is live (see the `continue` below), so
+    every sub-rate cadence here is "per second of streaming", independent of
+    WHEEL_TX_HZ. Do not move the increment above that check."""
     seq = 0
     tick = 0
     next_send = time.monotonic()
@@ -747,6 +950,11 @@ def sender_thread(sock):
             if tick % INFO_EVERY == 0:
                 sock.sendto(INFO_FMT.pack(INFO_MAGIC, range_deg, flags,
                                           name.encode("utf-8")[:NAME_LEN]), addr)
+            # Offset by one tick so this never lands on the same tick as INFO
+            # (INFO_EVERY divides TX_HZ), which would put three datagrams
+            # back to back once a second.
+            if tick % TX_HZ == 1:
+                sock.sendto(box_packet(), addr)
         except OSError:
             pass                                # drop-tolerant by design
 
@@ -755,8 +963,14 @@ def housekeeping_thread(get_wheel, do_command):
     """Publish status and poll for setup commands from the controller."""
     last_seq = 0
     interval = 1.0 / HOUSEKEEP_HZ
+    ticks = 0
     while RUNNING:
         write_status()
+        # The updater's status file only needs reading at the rate we transmit
+        # it, not at the 20 Hz this loop runs at.
+        if ticks % HOUSEKEEP_HZ == 0:
+            refresh_box_flags()
+        ticks += 1
         last_seq, cmd = read_command(last_seq)
         if cmd:
             try:
@@ -826,6 +1040,9 @@ def main():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind(("0.0.0.0", WHEEL_PORT))
     log("listening on 0.0.0.0:%d, tx %d Hz" % (WHEEL_PORT, TX_HZ))
+    read_box_info()
+    log("box report: v%s on %s (id %04X)" %
+        (BOX_INFO["app_str"] or "?", BOX_INFO["os_str"] or "?", BOX_INFO["box_id"]))
 
     current = {"wheel": None}
 
