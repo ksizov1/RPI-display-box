@@ -225,17 +225,27 @@ avoid all three.
 
 ### How an update happens
 
-1. **Check.** Every `UPDATE_CHECK_INTERVAL_HOURS`, and only when the box actually
-   has an uplink, `adiona-updater.py` asks the licence server what the current
-   release is. The reply is signed; a manifest that does not verify against
-   `/etc/adiona/update-key.pub` is discarded and nothing is installed. The check
-   is a few hundred bytes — it is the *download* that is expensive, and that never
-   starts on its own.
-2. **Ask.** A prompt appears on the TV: *v1.5.0 → v1.6.0, Y to update, N for not
+1. **Check — once per power-up.** Shortly after boot, and only when the box
+   actually has an uplink, `adiona-updater.py` asks the licence server what the
+   current release is. The reply is signed; a manifest that does not verify
+   against `/etc/adiona/update-key.pub` is discarded and nothing is installed.
+
+   There is no interval and no background polling. The box is switched on at a
+   venue, used, and switched off, so the start of that is the only moment when
+   somebody is both present and not mid-session. A prompt can therefore never
+   appear hours into an event.
+
+   "Once per boot" means once it *manages* to ask: at power-up the uplink is still
+   associating, so the check retries (30 s, backing off to 15 min) until it gets a
+   verified answer, and only then goes quiet. To ask again without a power cycle:
+   `sudo systemctl restart adiona-updater`.
+2. **Ask.** A prompt appears on the TV: *v1.6.0 → v1.6.1, Y to update, N for not
    now.* **No answer within 60 seconds means no update**, and that version is not
-   offered again for 24 hours. The prompt only appears when no headset is
-   connected — during a session the video surface covers the page completely, and
-   interrupting a demo to ask about an update is the wrong thing to do anyway.
+   offered again until the box is next powered up. The prompt only appears when no
+   headset is connected — during a session the video surface covers the page
+   completely, and interrupting a demo to ask about an update is the wrong thing
+   to do anyway. If a headset turns up mid-prompt the offer is withdrawn without
+   counting as a refusal, and re-shown once the box is idle.
 3. **Download and stage.** The tarball is verified against the sha256 in the
    signed manifest and unpacked into `/opt/adiona/releases/<version>/`. Nothing
    the box is running has changed yet.
@@ -268,7 +278,7 @@ boot, not a dead box.
 
 ```bash
 sudo /opt/adiona/updater/adiona-updater.py --status     # what it thinks is going on
-sudo /opt/adiona/updater/adiona-updater.py --check      # check now, ignore the schedule
+sudo /opt/adiona/updater/adiona-updater.py --check      # ask again without rebooting
 sudo /opt/adiona/updater/adiona-updater.py --apply 1.6.0  # install now, no prompt
 sudo /opt/adiona/updater/adiona-updater.py --rollback   # back to the previous release
 ```
@@ -276,11 +286,35 @@ sudo /opt/adiona/updater/adiona-updater.py --rollback   # back to the previous r
 Set `UPDATE_ENABLED="0"` in `box.conf` for a box that must not change during a
 long installation.
 
+Note that these commands run **on the box**, over SSH — not in PowerShell on the
+workstation, where `sudo` is a different (and usually disabled) thing:
+
+```powershell
+ssh -i $env:USERPROFILE\.ssh\adiona_ed25519 -o IdentitiesOnly=yes `
+    adionauser@adiona-tv-6ced.local sudo /opt/adiona/updater/adiona-updater.py --status
+```
+
 ### Publishing a release
 
-`git tag v1.6.0 && git push --tags` builds the OTA tarball (and the image), then
-follow **`Adiona-license-server/docs/BOX_UPDATES.md`**. `bash tools/make-release.sh`
-does the same build locally.
+```powershell
+.	ools
+elease.ps1              # bump the patch version, commit, tag, push
+.	ools
+elease.ps1 1.7.0        # an explicit version
+.	ools
+elease.ps1 1.6.2 -Retag # move a tag that points at the wrong commit
+```
+
+Do not tag by hand. A release is five ordered steps — write `VERSION`, commit it,
+push the commit, tag that commit, push the tag — and skipping any one of them
+fails in CI rather than locally. The failure that keeps happening is a commit
+*message* that says `v1.6.2` while the `VERSION` file inside it still says
+`1.6.1`: the message is not the version, the file is. `release.ps1` writes the
+file, reads it back, and runs the exact check CI runs before pushing anything.
+
+That builds the OTA tarball (and the image); then follow
+**`Adiona-license-server/docs/BOX_UPDATES.md`**. `bash tools/make-release.sh`
+does just the tarball build locally, without tagging.
 
 Before publishing anything anyone is waiting for:
 
@@ -319,6 +353,7 @@ system/
                        update-key.pub    — verifies the signed release manifest
 tools/
   deploy.ps1           live deploy from a Windows checkout
+  release.ps1          cut a release: bump VERSION, commit, tag, push - in order
   make-release.sh      build the OTA tarball + manifest fragment for a release
   verify-signing.sh    prove the server signs with the pair of update-key.pub
   test-apply-update.sh sandbox test for the update/rollback machinery (Linux/WSL)

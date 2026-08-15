@@ -9,32 +9,38 @@ and the rollback machinery.
 
 Design notes, in the order they matter:
 
-  1. NOTHING HAPPENS WITHOUT A HUMAN. Boxes go to public events where the uplink
-     is frequently somebody's phone hotspot, so an update that started on its own
-     would be spending a stranger's data. The check is free (a few hundred bytes);
-     the download is not, and only happens after someone presses Y on the TV.
-     No answer within UPDATE_PROMPT_SECONDS means no, and that version is not
-     offered again for 24 hours.
+  1. ONCE PER POWER-UP, NEVER MID-SESSION. The box is switched on at a venue,
+     used, and switched off. It asks the server exactly once per boot, offers
+     whatever it finds, and then goes quiet — so a prompt can never interrupt an
+     event hours in, and there is no background polling on somebody's hotspot.
+     "Once per boot" means once it MANAGES to ask: at power-up the uplink is still
+     associating, so the check retries until it gets a verified answer and only
+     then stops. Power-cycling is the way to ask again; `--check` forces it.
 
-  2. THE PROMPT ONLY EXISTS WHEN NOBODY IS WATCHING A HEADSET. While a headset is
+  2. NOTHING HAPPENS WITHOUT A HUMAN. The check is free (a few hundred bytes); the
+     download is not, and only happens after someone presses Y on the TV. No
+     answer within UPDATE_PROMPT_SECONDS means no, and that version is not
+     offered again until the next power-up.
+
+  3. THE PROMPT ONLY EXISTS WHEN NOBODY IS WATCHING A HEADSET. While a headset is
      casting, the native video surface covers the kiosk page entirely, so a modal
      drawn underneath it would be invisible — and interrupting a demo to ask about
      an update is the wrong thing to do anyway. We gate on "no headset associated
      at all", not merely "not casting right now", because a headset that is
      between streams can start casting a second after the operator presses Y.
 
-  3. A SEPARATE PROCESS, NOT A THREAD IN THE CONTROLLER. A 30-second DNS stall
+  4. A SEPARATE PROCESS, NOT A THREAD IN THE CONTROLLER. A 30-second DNS stall
      inside the controller's selection_loop would freeze /state, and both the
      kiosk page and kiosk-session.sh's poll loop drive off /state. The controller
      must never block on the internet.
 
-  4. NO IPC SOCKETS. Status goes to /run/adiona/update.json, commands arrive via
+  5. NO IPC SOCKETS. Status goes to /run/adiona/update.json, commands arrive via
      /run/adiona/update-cmd.json — the same two-files-on-tmpfs pattern
      adiona-wheel.py uses, for the same reason: neither service can take the
      other down and either can restart independently. That matters more here than
      anywhere else, because applying an update restarts this very process.
 
-  5. THE SERVER IS NOT TRUSTED, ONLY THE SIGNATURE IS. These boxes join customer
+  6. THE SERVER IS NOT TRUSTED, ONLY THE SIGNATURE IS. These boxes join customer
      venue Wi-Fi, where whoever controls DNS would otherwise control root on the
      fleet. The manifest is verified against a public key baked into the image
      before a single field of it is acted on, and the tarball is verified against
@@ -45,7 +51,7 @@ stdlib only — nothing to pip-install on the image (same rule as the rest).
 Manual operation, for when something misbehaves in the field:
 
     adiona-updater.py --status        what it thinks is going on
-    adiona-updater.py --check         check now, ignoring the schedule
+    adiona-updater.py --check         ask again without rebooting
     adiona-updater.py --apply 1.6.0   download and install, no prompt
     adiona-updater.py --rollback      go back to the previous release
     adiona-updater.py --migrate       flat layout -> release layout
@@ -105,7 +111,6 @@ ENABLED = CONF.get("UPDATE_ENABLED", "1") not in ("0", "no", "false", "")
 MANIFEST_URL = CONF.get("UPDATE_MANIFEST_URL",
                         "https://license.drivingsimulator.com/api/box/updates")
 CHANNEL = CONF.get("UPDATE_CHANNEL", "stable")
-CHECK_INTERVAL = max(1.0, float(CONF.get("UPDATE_CHECK_INTERVAL_HOURS", "6"))) * 3600.0
 PROMPT_SECONDS = max(10, int(CONF.get("UPDATE_PROMPT_SECONDS", "60")))
 KEEP_RELEASES = max(2, int(CONF.get("UPDATE_KEEP_RELEASES", "3")))
 ALLOW_PACKAGES = CONF.get("UPDATE_ALLOW_PACKAGES", "1") not in ("0", "no", "false", "")
@@ -117,7 +122,6 @@ PHASE_PATH = os.path.join(RUN_DIR, "apply.phase")
 LOCK_PATH = os.path.join(RUN_DIR, "updater.lock")
 MARKER_PATH = os.path.join(ETC_DIR, "update-pending")
 IMAGE_VERSION_PATH = os.path.join(ETC_DIR, "image-version")
-PERSIST_PATH = os.path.join(STATE_DIR, "update-state.json")
 RESULT_PATH = os.path.join(STATE_DIR, "last-apply.json")
 DOWNLOAD_DIR = os.path.join(STATE_DIR, "downloads")
 RELEASES_DIR = os.path.join(ROOT, "releases")
@@ -127,9 +131,10 @@ STATE_URL = "http://127.0.0.1:%d/state" % CONTROLLER_PORT
 APPLY_PROTOCOL = 1                  # bumped only when apply-update.sh's contract changes
 HTTP_TIMEOUT = 10.0
 MANIFEST_MAX_BYTES = 256 * 1024
-DECLINE_SECONDS = 24 * 3600
-BACKOFF_MIN = 5 * 60
-BACKOFF_MAX = 4 * 3600
+# The box checks ONCE per power-up, so these govern only how long it keeps trying
+# to land that one check when the network is not ready yet — not a polling cycle.
+RETRY_MIN = 30.0
+RETRY_MAX = 15 * 60.0
 # Refuse to download unless the card has room for the tarball, the unpacked tree,
 # and headroom. Running /opt out of space mid-unpack is recoverable but ugly.
 SPACE_MULTIPLIER = 3
@@ -161,7 +166,9 @@ STATE = {
     "progress": 0.0,
     "prompt_expires_in": 0,
     "last_check_at": 0,
-    "next_check_at": 0,
+    # True once this boot's single check has produced a verified answer. There is
+    # no "next check": the box asks once per power-up and then goes quiet.
+    "checked": False,
     "last_result": None,
     "layout": "flat",
     "internet": False,
@@ -214,69 +221,16 @@ def read_command(last_seq):
     return seq, cmd
 
 
-# ── Persistent state (survives the restart every apply causes) ───────────────
-
-def load_persist():
-    try:
-        with open(PERSIST_PATH) as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def save_persist(data):
-    try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        tmp = PERSIST_PATH + ".tmp"
-        with open(tmp, "w") as fh:
-            json.dump(data, fh, indent=2)
-        os.replace(tmp, PERSIST_PATH)
-    except OSError as e:
-        log("could not save %s: %s" % (PERSIST_PATH, e))
-
-
-def decline(version):
-    """Remember that this version was refused, or timed out, so it is not
-    re-offered on the next check."""
-    data = load_persist()
-    data.setdefault("declined", {})[version] = int(time.time())
-    save_persist(data)
-
-
-def is_declined(version):
-    data = load_persist()
-    at = data.get("declined", {}).get(version)
-    if at is None:
-        return False
-    now = time.time()
-    # The Pi 5 has no RTC battery in this build, so the clock can step backwards
-    # when NTP lands after boot. A decline that appears to be in the future is a
-    # stepped clock, not a decline 24 hours from now — treat it as expired rather
-    # than suppressing the update until the timestamp catches up.
-    if now < at:
-        return False
-    return (now - at) < DECLINE_SECONDS
-
-
-def blacklist(version, reason):
-    """A version that failed to download, verify or unpack. Same 24 h window as a
-    decline, so a bad artifact does not burn the uplink retrying every check."""
-    data = load_persist()
-    data.setdefault("failed", {})[version] = {"at": int(time.time()), "reason": reason}
-    save_persist(data)
-
-
-def is_blacklisted(version):
-    entry = load_persist().get("failed", {}).get(version)
-    if not entry:
-        return False
-    at = entry.get("at", 0)
-    now = time.time()
-    if now < at:
-        return False
-    return (now - at) < DECLINE_SECONDS
-
+# There is deliberately NO persistent decline/blacklist state here any more.
+#
+# It existed to bridge PERIODIC checks: with the box checking every few hours, a
+# refusal had to be remembered or the same prompt would reappear all afternoon.
+# The box now checks once per power-up, so "declined" simply means "no more
+# offers until the next boot", which needs no file — and power-cycling is then
+# the obvious, discoverable way to ask again.
+#
+# A release that fails to download is likewise just not retried until the next
+# boot, and nothing is downloaded at all until somebody answers the prompt.
 
 # ── Box identity ─────────────────────────────────────────────────────────────
 
@@ -794,34 +748,48 @@ def apply_release(version, release_dir):
 # ── The update cycle ─────────────────────────────────────────────────────────
 
 class Updater(object):
+    """One check per power-up.
+
+    The box is not a server; it is switched on at a venue, used, and switched off.
+    So it asks the licence server exactly once per boot, offers whatever it finds,
+    and then stays out of the way for the rest of the session — no background
+    polling, and no possibility of a prompt appearing hours into an event.
+
+    "Once per boot" has to mean "once it manages to ask", though, not "once, 60
+    seconds after systemd started me". At power-up NetworkManager is still
+    associating, DHCP has not finished and DNS may not resolve for a while; a
+    single early attempt would simply miss. So the check is retried until it
+    actually reaches the server and gets a verified answer, and only then does the
+    updater go quiet for the rest of the boot.
+    """
+
     def __init__(self):
-        self.next_check = 0.0
-        self.backoff = BACKOFF_MIN
+        self.checked = False            # a verified answer has been obtained
+        self.retry_at = 0.0             # monotonic; 0 = try as soon as there is a link
+        self.retry_delay = RETRY_MIN
         self.candidate = None           # release dict awaiting an answer
         self.staged_dir = None          # release dir ready to apply
         self.prompt_deadline = None     # time.monotonic() when the offer lapses
         self.pending_accept = False     # accepted, waiting for the box to go idle
+        self.declined = set()           # versions refused THIS BOOT; cleared by a reboot
+        self.waiting_logged = False     # so "no uplink yet" is said once, not every tick
         self.last_cmd_seq = 0
 
-    # ── scheduling ──
-    def schedule_next(self, seconds=None):
-        # Per-box jitter from box_id, so a fleet of boxes on one venue's uplink
-        # does not all check within the same second.
-        try:
-            jitter = int(box_id() or "0", 16) % 3600
-        except ValueError:
-            jitter = 0
-        delay = CHECK_INTERVAL if seconds is None else seconds
-        self.next_check = time.monotonic() + delay + (jitter if seconds is None else 0)
-        set_state(next_check_at=int(time.time() + delay))
+    def done_checking(self):
+        """A verified answer. Nothing further happens until the box is restarted."""
+        self.checked = True
+        self.retry_at = 0.0
+        set_state(checked=True, last_check_at=int(time.time()))
 
-    def note_failure(self, reason):
+    def retry_later(self, reason):
+        """Could not reach or trust the server. Back off and try for the one check
+        again — the box may still be bringing its uplink up."""
         log(reason)
-        self.schedule_next(self.backoff)
-        self.backoff = min(BACKOFF_MAX, self.backoff * 2)
+        self.retry_at = time.monotonic() + self.retry_delay
+        self.retry_delay = min(RETRY_MAX, self.retry_delay * 2)
 
     # ── the check ──
-    def check(self, force=False):
+    def check(self, force=False, cstate=None):
         # Refresh the box's own identity first. run() does this every tick, but
         # check() is also reachable from `--check` in a one-shot process where
         # nothing else ever has — and a diagnostic that reports the STATE defaults
@@ -830,40 +798,62 @@ class Updater(object):
         set_state(current=current_version(), layout=layout(), releases=list_releases())
         if not ENABLED:
             set_state(state="blocked", blocked_reason="updates disabled in box.conf")
-            self.schedule_next()
+            self.done_checking()
             return
 
-        cstate = controller_state()
+        if cstate is None:
+            cstate = controller_state()
         online = bool((cstate.get("uplink") or {}).get("internet"))
         set_state(internet=online)
         if not online and not force:
-            # Not a failure: most of the time this box is on an isolated LAN by
-            # design. Try again on the normal schedule, not on the backoff.
+            # Not a failure, and not the boot's check either. The uplink may take
+            # minutes or an hour to come up — a venue's Wi-Fi, a phone hotspot
+            # someone gets round to enabling, a cable plugged in later — and the
+            # box waits for it indefinitely rather than giving up.
+            #
+            # retry_at is cleared rather than pushed forward, so the decision is
+            # re-made on the NEXT TICK. run() already has the controller's state in
+            # hand, so this costs a dictionary lookup once a second, and the check
+            # fires within about a second of the uplink coming up rather than up to
+            # a polling interval later.
+            if not self.waiting_logged:
+                log("no uplink yet — will check as soon as one appears")
+                self.waiting_logged = True
             set_state(state="idle", message="")
-            self.schedule_next()
+            self.retry_at = 0.0
+            # A link that has just come up deserves a fresh retry budget; failures
+            # against the previous one say nothing about this one.
+            self.retry_delay = RETRY_MIN
             return
+
+        if self.waiting_logged:
+            log("uplink is up — checking for updates")
+            self.waiting_logged = False
 
         set_state(state="checking", message="")
         write_status()
         try:
             body = fetch_manifest()
         except (urllib.error.URLError, socket.timeout, OSError, ValueError) as e:
+            # Reached for it and failed — DNS not up, captive portal, server down.
+            # Still no answer, so this does not count as the boot's check.
             set_state(state="idle")
-            self.note_failure("update check failed: %s" % e)
+            self.retry_later("update check failed: %s" % e)
             return
 
         good, why = verify_manifest(body)
         if not good:
-            # Refusing to act is the whole point of signing. Back all the way off
-            # rather than retrying an endpoint that is lying to us.
+            # A security refusal, not a network problem. Retrying cannot make an
+            # untrusted answer trustworthy, so this counts as the boot's check and
+            # the box simply runs on with what it has.
             set_state(state="blocked", blocked_reason=why, available="")
             log("MANIFEST REJECTED: %s" % why)
-            self.schedule_next(BACKOFF_MAX)
+            self.done_checking()
             return
 
         manifest = body.get("manifest") or {}
-        self.backoff = BACKOFF_MIN
-        set_state(last_check_at=int(time.time()), blocked_reason="")
+        set_state(blocked_reason="")
+        self.done_checking()
 
         rel, blocked = choose_release(manifest)
         if rel is None:
@@ -873,19 +863,14 @@ class Updater(object):
                 log("update available but not installable: %s" % blocked)
             else:
                 log("up to date (v%s)" % current_version())
-            self.schedule_next()
             return
 
         version = rel.get("version", "")
-        if is_declined(version):
-            log("v%s was declined recently — not re-offering yet" % version)
+        if version in self.declined:
+            # Only reachable via a forced re-check (--check or the kiosk's check
+            # command) after someone already said no in this session.
+            log("v%s was declined this session — not re-offering until a restart" % version)
             set_state(state="idle", available="")
-            self.schedule_next()
-            return
-        if is_blacklisted(version):
-            log("v%s failed recently — not retrying yet" % version)
-            set_state(state="idle", available="")
-            self.schedule_next()
             return
 
         self.candidate = rel
@@ -893,7 +878,6 @@ class Updater(object):
                   notes=str(rel.get("notes", ""))[:400],
                   size=int(rel.get("size", 0) or 0), progress=0.0)
         log("v%s is available (v%s installed)" % (version, current_version()))
-        self.schedule_next()
 
     # ── the offer ──
     def maybe_prompt(self, cstate):
@@ -913,8 +897,9 @@ class Updater(object):
             return
         if not box_is_idle(cstate):
             # A headset turned up mid-offer. Withdraw the prompt WITHOUT counting
-            # it as a refusal, or a box that is busy all day would silently use up
-            # its one offer per 24 h while nobody could even see it.
+            # it as a refusal: this boot gets exactly one offer, and burning it
+            # while nobody could even see the screen would mean the box silently
+            # never updates. It is re-shown as soon as the box is idle again.
             log("headset present — withdrawing the offer, will re-ask when idle")
             self.prompt_deadline = None
             set_state(state="available", prompt_expires_in=0)
@@ -924,10 +909,11 @@ class Updater(object):
             set_state(prompt_expires_in=int(left + 0.5))
             return
         version = self.candidate.get("version", "") if self.candidate else ""
-        log("no answer in %d s — staying on v%s" % (PROMPT_SECONDS, current_version()))
+        log("no answer in %d s — staying on v%s until the next power-up"
+            % (PROMPT_SECONDS, current_version()))
         self.prompt_deadline = None
         if version:
-            decline(version)
+            self.declined.add(version)
         self.candidate = None
         set_state(state="idle", available="", prompt_expires_in=0,
                   message="Update postponed")
@@ -976,10 +962,10 @@ class Updater(object):
             log("update to v%s failed: %s" % (version, reason))
             shutil.rmtree(os.path.join(RELEASES_DIR, version + ".partial"),
                           ignore_errors=True)
-            # 24 h before this version is tried again: a bad artifact or a CDN
-            # serving a stale object must not burn a hotspot's data retrying on
-            # every check.
-            blacklist(version, reason)
+            # Not retried until the next power-up. Nothing is downloaded without
+            # someone pressing Y, so a bad artifact costs a hotspot nothing while
+            # it sits there.
+            self.declined.add(version)
             self.candidate = None
             self.pending_accept = False
             set_state(state="failed", available="", progress=0.0,
@@ -1015,14 +1001,17 @@ class Updater(object):
         action = cmd.get("action", "")
         version = str(cmd.get("version", ""))
         if action == "check":
-            self.next_check = 0.0
+            # An explicit ask-again, without a reboot.
+            self.checked = False
+            self.retry_at = 0.0
+            self.retry_delay = RETRY_MIN
             return
         if action == "decline":
             if self.candidate is not None:
                 v = self.candidate.get("version", "")
                 if not version or version == v:
-                    log("v%s declined at the keyboard" % v)
-                    decline(v)
+                    log("v%s declined at the keyboard — not re-offering until a restart" % v)
+                    self.declined.add(v)
                     self.candidate = None
                     self.prompt_deadline = None
                     set_state(state="idle", available="", prompt_expires_in=0,
@@ -1075,7 +1064,11 @@ class Updater(object):
     # ── main loop ──
     def run(self):
         self.resume()
-        self.schedule_next(60 if not os.path.exists(MARKER_PATH) else CHECK_INTERVAL)
+        # An update is mid-flight (this process was restarted BY the applier). Do
+        # not check: the box is in the middle of changing version, and the answer
+        # would be about a version it is no longer running.
+        if os.path.exists(MARKER_PATH):
+            self.checked = True
         clear_at = 0.0
         while RUNNING:
             cstate = controller_state()
@@ -1105,12 +1098,17 @@ class Updater(object):
                 clear_at = 0.0
 
             if state not in ("downloading", "verifying", "applying", "health"):
-                if time.monotonic() >= self.next_check:
+                # One check per power-up. `checked` is set once a verified answer
+                # arrives, and nothing clears it except an explicit ask-again or a
+                # restart of this service — which is what a power cycle is.
+                if not self.checked and time.monotonic() >= self.retry_at:
                     try:
-                        self.check()
+                        # Hand over the state run() already fetched, so the
+                        # waiting-for-an-uplink path is a dict lookup per tick.
+                        self.check(cstate=cstate)
                     except Exception as e:
                         set_state(state="idle")
-                        self.note_failure("check raised: %s" % e)
+                        self.retry_later("check raised: %s" % e)
                 self.maybe_prompt(cstate)
                 self.tick_prompt(cstate)
                 self.maybe_apply(cstate)
@@ -1220,9 +1218,8 @@ def main():
     # Past every CLI subcommand, so this process is the service: it may publish.
     PUBLISH[0] = True
 
-    log("started — %s every %.1f h, prompt %d s, channel %s"
-        % ("enabled" if ENABLED else "DISABLED", CHECK_INTERVAL / 3600.0,
-           PROMPT_SECONDS, CHANNEL))
+    log("started — %s, one check per power-up, prompt %d s, channel %s"
+        % ("enabled" if ENABLED else "DISABLED", PROMPT_SECONDS, CHANNEL))
     try:
         Updater().run()
     except KeyboardInterrupt:
