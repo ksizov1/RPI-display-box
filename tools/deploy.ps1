@@ -21,11 +21,14 @@
     Debian trixie's sshd has PerSourcePenalties: a burst of connections gets the
     source address temporarily blocked. So a deploy is ONE ssh connection - the
     payload tarball (which carries the install script inside it) is fed to ssh on
-    stdin. Only -Status / -Probe / -Logs / -Follow open a second one.
+    stdin.
+
+    -Status / -Probe / -Logs / -Follow are READ-ONLY: each opens one connection,
+    does its job and exits WITHOUT deploying.
 
     Requires ssh.exe and tar.exe (both ship with Windows 10/11) and passwordless
-    sudo on the box. Key-based SSH auth is strongly recommended: one deploy is
-    one password prompt, and -Logs/-Follow add another.
+    sudo on the box. Key-based SSH auth is strongly recommended: without it every
+    connection costs a password prompt.
 
 .PARAMETER Box
     Target hostname or IP. Defaults to $env:ADIONA_BOX, else adiona-tv-6ced.local.
@@ -59,10 +62,13 @@
     wheel), controller, kiosk, wheel, none.
 
 .PARAMETER Logs
-    After deploying, tail this many journal lines from all units. E.g. -Logs 60.
+    Tail this many journal lines from all units and exit. E.g. -Logs 60.
+    READ-ONLY: it does not deploy.
 
 .PARAMETER Follow
-    After deploying, follow the journal until Ctrl-C.
+    Follow the journal until Ctrl-C, and exit. READ-ONLY: it does not deploy.
+    To deploy and then watch, run the deploy and then run -Follow - ideally in a
+    second window opened BEFORE the thing you want to observe.
 
 .PARAMETER SetupSudo
     One-time setup: grant this user passwordless sudo on the box by installing
@@ -93,6 +99,25 @@
     Skip the ssh-agent handling and let ssh prompt for the key passphrase per
     connection.
 
+.PARAMETER Discover
+    Find Adiona boxes on this machine's subnet and exit. No deploy.
+
+    Names are unreliable here: .local depends on mDNS, the bare name depends on
+    the router registering DHCP hostnames, and both have been observed failing
+    while the box was perfectly reachable. There is also no PTR record to reverse.
+    So this does not resolve anything - it sweeps the /24 for a listening sshd
+    (about 2 s, all connections in flight at once) and then asks each responder
+    who it is over SSH, using the deploy key with BatchMode so a machine that is
+    not ours fails instantly instead of prompting.
+
+    Identification is the box's own answer - /etc/adiona/ssid and
+    /opt/adiona/VERSION - not a guess from its MAC. The MAC would not work: this
+    box's uplink is the USB Wi-Fi dongle, so its address carries the DONGLE
+    vendor's OUI, not Raspberry Pi's.
+
+    Prints an ADIONA_BOX line you can paste, and caches the address so an
+    immediately following deploy finds it without probing again.
+
 .PARAMETER Status
     Report what the box is running and exit. No deploy.
 
@@ -108,8 +133,12 @@
     Push everything and restart both services.
 
 .EXAMPLE
-    .\tools\deploy.ps1 -Packages -Logs 60
-    First deploy after a change that adds a dependency, then show the journal.
+    .\tools\deploy.ps1 -Packages
+    First deploy after a change that adds a dependency.
+
+.EXAMPLE
+    .\tools\deploy.ps1 -Logs 60
+    Show the last 60 journal lines. Deploys nothing.
 
 .EXAMPLE
     .\tools\deploy.ps1 -Restart controller -NoConf
@@ -118,6 +147,10 @@
 .EXAMPLE
     .\tools\deploy.ps1 -Box 192.168.1.155 -Status
     Ask a specific box what it is running.
+
+.EXAMPLE
+    .\tools\deploy.ps1 -Discover
+    Find the boxes on this subnet when the name will not resolve.
 
 .EXAMPLE
     .\tools\deploy.ps1 -SetupSudo
@@ -139,6 +172,7 @@ param(
     [switch] $SetupKey,
     [switch] $Reflashed,
     [switch] $NoAgent,
+    [switch] $Discover,
     [switch] $Status,
     [switch] $Probe,
     [switch] $DryRun
@@ -241,6 +275,82 @@ function Get-Ipv4For {
                 Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
                 Select-Object -First 1).IPAddressToString
     } catch { return $null }
+}
+
+# Sweep the local /24 for boxes and ask each candidate who it is.
+#
+# Deliberately not name-based. On this network .local and the bare name have both
+# been seen to fail while the box was up and answering on its IP, and there is no
+# PTR record, so nothing can be reversed either. Positive identification comes from
+# the box telling us its SSID and version.
+function Find-Boxes {
+    param([int] $SweepWaitMs = 2500)
+
+    $local = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+             Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+             Sort-Object -Property SkipAsSource, InterfaceMetric |
+             Select-Object -First 1
+    if (-not $local) { Fail 'no usable IPv4 interface found' }
+    $prefix = ($local.IPAddress -split '\.')[0..2] -join '.'
+    Say "sweeping $prefix.0/24 for a listening sshd (from $($local.IPAddress))"
+
+    # All 254 connections started before any is awaited, so the sweep costs one
+    # wait rather than 254 timeouts.
+    $pending = @{}
+    foreach ($i in 1..254) {
+        $ip = "$prefix.$i"
+        if ($ip -eq $local.IPAddress) { continue }
+        $c = New-Object System.Net.Sockets.TcpClient
+        try { $pending[$ip] = @{ Client = $c; Task = $c.ConnectAsync($ip, 22) } }
+        catch { $c.Close() }
+    }
+    Start-Sleep -Milliseconds $SweepWaitMs
+
+    $listening = @()
+    foreach ($ip in $pending.Keys) {
+        if ($pending[$ip].Task.Status -eq 'RanToCompletion') { $listening += $ip }
+        $pending[$ip].Client.Close()
+    }
+    if (-not $listening) {
+        Note 'nothing on this subnet is listening on :22'
+        return @()
+    }
+    Note ("ssh open on: " + (($listening | Sort-Object) -join ', '))
+
+    # BatchMode so a non-box fails immediately rather than waiting on a password
+    # prompt. UserKnownHostsFile=NUL keeps a survey of the whole subnet from
+    # writing an entry per machine into your known_hosts.
+    $found = @()
+    foreach ($ip in ($listening | Sort-Object)) {
+        # LogLevel=ERROR suppresses ssh's "Permanently added ..." notice, and
+        # $ErrorActionPreference is dropped to Continue for the call: in Windows
+        # PowerShell anything a native command writes to stderr becomes a
+        # NativeCommandError, which under 'Stop' is a TERMINATING error - so a
+        # single chatty ssh invocation would abort the whole survey. Failure is
+        # detected from the exit code instead, which is what we check.
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $probe = & $ssh '-i' $DeployKey '-o' 'IdentitiesOnly=yes' '-o' 'BatchMode=yes' `
+                            '-o' 'ConnectTimeout=4' '-o' 'StrictHostKeyChecking=no' `
+                            '-o' 'UserKnownHostsFile=NUL' '-o' 'LogLevel=ERROR' "$User@$ip" `
+                            'cat /etc/adiona/ssid 2>/dev/null; cat /opt/adiona/VERSION 2>/dev/null' 2>$null
+            $rc = $LASTEXITCODE
+        }
+        finally { $ErrorActionPreference = $prevEap }
+        if ($rc -ne 0 -or -not $probe) { continue }
+        $lines = @($probe | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
+        $ssid = @($lines | Where-Object { $_ -like 'Adiona-*' })[0]
+        if (-not $ssid) { continue }
+        $ver = @($lines | Where-Object { $_ -match '^\d+\.\d+\.\d+' })[0]
+        $found += [pscustomobject]@{
+            Ip       = $ip
+            Ssid     = $ssid
+            Version  = $(if ($ver) { $ver } else { '?' })
+            HostName = $ssid.ToLower()
+        }
+    }
+    return $found
 }
 
 function Resolve-Box {
@@ -521,9 +631,53 @@ Initialize-SshAgent
 
 if ($SetupSudo) { exit (Invoke-SetupSudo) }
 
+if ($Discover) {
+    $boxes = Find-Boxes
+    if (-not $boxes) {
+        Write-Host ''
+        Fail @"
+no Adiona boxes found on this subnet.
+      The box may be off, on another network, or reachable only through its own
+      AP. If you know its address:
+        .\tools\deploy.ps1 -Box 192.168.1.153
+"@
+    }
+    Write-Host ''
+    foreach ($b in $boxes) {
+        Write-Host ("  {0,-16} {1,-18} v{2}" -f $b.Ip, $b.Ssid, $b.Version) -ForegroundColor Green
+    }
+    Write-Host ''
+    # Cache it against the configured name so a deploy straight after this one
+    # finds the box even while the name is still not resolving.
+    Set-CachedBoxIp $Box $boxes[0].Ip
+    Write-Host 'To use the first one for the rest of this session:'
+    Write-Host ("  `$env:ADIONA_BOX = '{0}'" -f $boxes[0].Ip) -ForegroundColor Cyan
+    exit 0
+}
+
 if ($Status) {
     Say "status of $Target"
     exit (Invoke-RemoteScript $StatusCmd)
+}
+
+# Read-only, like -Status and -Probe: they EXIT here rather than falling through to
+# the deploy. -Follow used to sit at the bottom of the file and therefore meant
+# "deploy, THEN follow" - a flag whose name says it only watches, silently pushing
+# a new build to the box. That is a genuinely dangerous shape for a command you
+# reach for while something else is mid-flight: it cost a whole OTA test, because
+# the box was quietly moved to the version that was supposed to be the update.
+# To deploy and then watch, run the deploy and then run -Follow - preferably in a
+# second window, started BEFORE the thing you want to observe.
+if ($Follow) {
+    Say "following journal on $Target (Ctrl-C to stop; this does NOT deploy)"
+    & $ssh '-t' @SshOpts $Target $JournalFollowCmd
+    exit 0
+}
+
+if ($Logs -gt 0) {
+    Say "last $Logs journal lines from $Target (this does NOT deploy)"
+    & $ssh @SshOpts $Target ($JournalTailCmd -replace '__N__', $Logs)
+    exit 0
 }
 
 if ($Probe) {
@@ -849,14 +1003,5 @@ finally {
     if (Test-Path $tarball) { Remove-Item $tarball -Force -ErrorAction SilentlyContinue }
 }
 
-# ---------------------------------------------------------------------------
-# Optional journal tail (second connection)
-# ---------------------------------------------------------------------------
-
-if ($Follow) {
-    Say 'following journal (Ctrl-C to stop)'
-    & $ssh '-t' @SshOpts $Target $JournalFollowCmd
-}
-elseif ($Logs -gt 0) {
-    & $ssh @SshOpts $Target ($JournalTailCmd -replace '__N__', $Logs)
-}
+# -Follow and -Logs are handled far above, before the deploy, and exit there.
+# Nothing to do here.

@@ -127,9 +127,61 @@ Default is `adiona-tv-6ced.local`. Override per-run or per-session:
 $env:ADIONA_BOX = 'adiona-tv-1f3a.local'    # for the rest of the session
 ```
 
-The box is a DHCP client on `eth0`, so with an Ethernet uplink it is reachable at
-`<hostname>.local`. The hostname is derived from the Pi's Wi-Fi MAC, not from the
-card, so **reflashing the same Pi keeps the same name**.
+The hostname is derived from the Pi's Wi-Fi MAC, not from the card, so
+**reflashing the same Pi keeps the same name** — but swapping to different
+hardware does not: a new MAC gives a new `HASH4`, so a new SSID, hostname and
+`box_id`.
+
+### When the name will not resolve
+
+`<hostname>.local` needs mDNS; the bare name needs the router to have registered
+the DHCP hostname. Both have been observed failing while the box was up and
+answering on its IP, and there is no PTR record to reverse either. When that
+happens, do not hunt for the name — ask the boxes directly:
+
+```powershell
+.\tools\deploy.ps1 -Discover
+```
+
+```
+==> sweeping 192.168.1.0/24 for a listening sshd (from 192.168.1.159)
+    ssh open on: 192.168.1.153
+
+  192.168.1.153    Adiona-TV-6CED     v1.6.2
+
+To use the first one for the rest of this session:
+  $env:ADIONA_BOX = '192.168.1.153'
+```
+
+About 3 seconds. It sweeps the /24 for a listening sshd with every connection in
+flight at once, then asks each responder who it is over SSH — with the deploy
+key and `BatchMode`, so a machine that is not ours fails instantly instead of
+prompting for a password.
+
+Identification is the box's **own answer** (`/etc/adiona/ssid` and
+`/opt/adiona/VERSION`), never a guess from its MAC. A MAC-based filter would not
+work: when the uplink is the USB Wi-Fi dongle the address carries the *dongle*
+vendor's OUI, not Raspberry Pi's.
+
+`-Discover` also caches the address it found, so a deploy run straight afterwards
+reaches the box even while the name is still failing.
+
+### Fixed address?
+
+The box has two addresses and only one of them moves:
+
+| | Address | Assigned by | Changes |
+|---|---|---|---|
+| AP (`wlan0`), the headset's LAN | `192.168.50.1/24` | `box.conf`, same on every box | never |
+| Uplink (`eth0` / USB Wi-Fi) | DHCP | the venue's router | freely |
+
+Nothing functional depends on the uplink address. The box makes outbound HTTPS to
+the licence server and nothing calls back; the headset finds the box at the AP
+gateway. Only *your* ability to SSH to it cares.
+
+If you want a bench box at a predictable address, make it a **DHCP reservation on
+the router**, keyed to the uplink MAC. Do not configure a static address on the
+box: it would be correct on your desk and wrong at every venue.
 
 You should not normally have to think about this: the script tries the `.local`
 name, then the bare name (most routers answer that from the DHCP lease, by a

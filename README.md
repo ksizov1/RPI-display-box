@@ -272,49 +272,40 @@ boot, not a dead box.
 ### Operating it
 
 ```powershell
-.\tools\deploy.ps1 -Status          # version, image version, layout, releases, in-flight update
-.\tools\deploy.ps1 -Logs 100        # includes the updater and the applier
+.\tools\release.ps1              # bump the patch version, commit, push
+.\tools\release.ps1 1.7.0        # an explicit version
 ```
 
-```bash
-sudo /opt/adiona/updater/adiona-updater.py --status     # what it thinks is going on
-sudo /opt/adiona/updater/adiona-updater.py --check      # ask again without rebooting
-sudo /opt/adiona/updater/adiona-updater.py --apply 1.6.0  # install now, no prompt
-sudo /opt/adiona/updater/adiona-updater.py --rollback   # back to the previous release
-```
+**The version lives in one place — the `VERSION` file — and everything else is
+derived from it.** Push a changed `VERSION` to `main` and CI tags it, builds the
+OTA tarball and publishes the release. Push anything else and nothing happens;
+ordinary work lands on `main` without producing releases.
 
-Set `UPDATE_ENABLED="0"` in `box.conf` for a box that must not change during a
-long installation.
+You never type a tag. The tag and `VERSION` used to be the same fact typed
+twice, they drifted twice, and each time it failed in a build log rather than on
+the machine that made the mistake. CI now derives one from the other, so they
+cannot disagree.
 
-Note that these commands run **on the box**, over SSH — not in PowerShell on the
-workstation, where `sudo` is a different (and usually disabled) thing:
+`release.ps1` still exists for what CI cannot do: writing the file correctly
+(LF, no BOM), reading it back to prove the write landed, and refusing to release
+from a dirty tree. `bash tools/make-release.sh` builds just the tarball locally,
+without releasing anything.
 
-```powershell
-ssh -i $env:USERPROFILE\.ssh\adiona_ed25519 -o IdentitiesOnly=yes `
-    adionauser@adiona-tv-6ced.local sudo /opt/adiona/updater/adiona-updater.py --status
-```
+Everything for a version ends up on **one page**, `Releases/vX.Y.Z`:
 
-### Publishing a release
+| Asset | Built | For |
+|---|---|---|
+| `adiona-tv-X.Y.Z.tar.gz` | automatically, on push | the OTA update boxes download |
+| `adiona-tv-X.Y.Z.tar.gz.sha256` | automatically | checking that download by hand |
+| `manifest-fragment.json` | automatically | pasting into `box_versions.json` |
+| `*.img.xz` | **by hand** | flashing a new SD card |
 
-```powershell
-.	ools
-elease.ps1              # bump the patch version, commit, tag, push
-.	ools
-elease.ps1 1.7.0        # an explicit version
-.	ools
-elease.ps1 1.6.2 -Retag # move a tag that points at the wrong commit
-```
-
-Do not tag by hand. A release is five ordered steps — write `VERSION`, commit it,
-push the commit, tag that commit, push the tag — and skipping any one of them
-fails in CI rather than locally. The failure that keeps happening is a commit
-*message* that says `v1.6.2` while the `VERSION` file inside it still says
-`1.6.1`: the message is not the version, the file is. `release.ps1` writes the
-file, reads it back, and runs the exact check CI runs before pushing anything.
-
-That builds the OTA tarball (and the image); then follow
-**`Adiona-license-server/docs/BOX_UPDATES.md`**. `bash tools/make-release.sh`
-does just the tarball build locally, without tagging.
+The tarball is ready a couple of minutes after the push and is all an OTA needs.
+The SD-card image costs 45-75 minutes and is only wanted when new hardware is
+being prepared, so it is **not** built by a push — start the workflow from the
+Actions tab (Run workflow) and it attaches the `.img.xz` to the release its
+`VERSION` already names. If no release exists for that version yet it falls back
+to a run artifact and says so.
 
 Before publishing anything anyone is waiting for:
 
@@ -353,7 +344,7 @@ system/
                        update-key.pub    — verifies the signed release manifest
 tools/
   deploy.ps1           live deploy from a Windows checkout
-  release.ps1          cut a release: bump VERSION, commit, tag, push - in order
+  release.ps1          cut a release: bump VERSION, commit, push (CI tags it)
   make-release.sh      build the OTA tarball + manifest fragment for a release
   verify-signing.sh    prove the server signs with the pair of update-key.pub
   test-apply-update.sh sandbox test for the update/rollback machinery (Linux/WSL)

@@ -1,36 +1,34 @@
 <#
 .SYNOPSIS
-    Cut a release: bump VERSION, commit, tag and push - in the one order that works.
+    Cut a release: bump VERSION, commit and push. CI does the rest.
 
 .DESCRIPTION
-    Releasing by hand is five ordered steps, and skipping or reordering any of them
-    fails late and confusingly:
+    The version lives in ONE place - the VERSION file - and everything else is
+    derived from it:
 
-      1. write VERSION            - miss it and CI rejects the tag ("does not match")
-      2. commit it                - miss it and the tag points at the OLD version
-      3. push the commit          - miss it and the tag references an unknown commit
-      4. create the tag           - on the commit that carries the bump, not before
-      5. push the tag             - which is what actually triggers the build
+        .\tools\release.ps1 1.6.4      ->  writes VERSION, commits, pushes
+        CI (on push to main)           ->  tags v1.6.4, builds the OTA tarball,
+                                           publishes the GitHub release
 
-    The failure mode that keeps happening is a commit MESSAGE that says v1.6.2 while
-    the VERSION file inside it still says 1.6.1. The message is not the version; the
-    file is. This script writes the file, verifies it reads back, and runs the exact
-    check CI runs BEFORE pushing anything - so a mismatch costs seconds locally
-    instead of a failed build and a tag that has to be deleted from the remote.
+    You never type a tag. That is deliberate: the tag and VERSION used to be the
+    same fact typed twice, they drifted twice, and each time it failed in CI rather
+    than locally. Now CI reads VERSION and creates the matching tag, so they cannot
+    disagree.
 
-    Why VERSION is not simply derived from the tag: deploy.ps1 stamps boxes from the
-    working tree on untagged dev builds, the pi-gen stage copies it to
-    /etc/adiona/image-version, and adiona-updater compares against it. It has to
-    exist as a file in the tree, so the file and the tag must be kept in step.
+    A push that does NOT change VERSION is a no-op for CI - ordinary work lands on
+    main without producing releases.
+
+    This script still exists for the part CI cannot do: writing the file correctly
+    (LF, no BOM), reading it back to prove the write landed, and refusing to
+    release from a dirty tree.
+
+    The SD-card image is NOT built by a push. Start the workflow by hand from the
+    Actions tab when a new card is needed; it attaches the .img.xz to the release
+    its VERSION already names.
 
 .PARAMETER Version
     The version to release, x.y.z. Omit to bump the patch component of the current
-    VERSION (1.6.1 -> 1.6.2).
-
-.PARAMETER Retag
-    Move a tag that already exists. Deletes it locally and on the remote first.
-    Refused without this switch, because moving a published tag rewrites what a
-    release points at.
+    VERSION (1.6.3 -> 1.6.4).
 
 .PARAMETER DryRun
     Print the plan and change nothing.
@@ -39,16 +37,14 @@
     Skip the confirmation prompt.
 
 .EXAMPLE
-    .\tools\release.ps1                 # 1.6.1 -> 1.6.2
+    .\tools\release.ps1                 # 1.6.3 -> 1.6.4
     .\tools\release.ps1 1.7.0
-    .\tools\release.ps1 1.6.2 -Retag    # fix a tag pointing at the wrong commit
     .\tools\release.ps1 -DryRun
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
     [string] $Version,
-    [switch] $Retag,
     [switch] $DryRun,
     [switch] $Yes
 )
@@ -111,8 +107,8 @@ $Tag = "v$Version"
 $cv = [version]$current
 $nv = [version]$Version
 if ($nv -lt $cv) { Fail "$Version is older than the current $current" }
-if ($nv -eq $cv -and -not $Retag) {
-    Fail "VERSION is already $current. Pass a new version, or -Retag to re-cut this one."
+if ($nv -eq $cv) {
+    Fail "VERSION is already $current - CI would see no change and publish nothing. Pass a new version."
 }
 
 Say "releasing $current -> $Version (tag $Tag)"
@@ -138,9 +134,13 @@ $remoteRaw = Invoke-Git ls-remote --tags origin $Tag
 if ($remoteRaw.Code -ne 0) { Fail "cannot reach the remote: $($remoteRaw.Out)" }
 $remoteTag = [bool]$remoteRaw.Out
 
-if (($localTag -or $remoteTag) -and -not $Retag) {
+if ($localTag -or $remoteTag) {
     $where = @(); if ($localTag) { $where += 'locally' }; if ($remoteTag) { $where += 'on the remote' }
-    Fail "$Tag already exists $($where -join ' and '). Pass -Retag to move it."
+    Fail @"
+$Tag already exists $($where -join ' and ') - that version has been released.
+      CI creates tags from VERSION, so it would see nothing new and publish
+      nothing. Pick a higher version.
+"@
 }
 
 # ---------------------------------------------------------------------------
@@ -150,13 +150,9 @@ if (($localTag -or $remoteTag) -and -not $Retag) {
 Write-Host ""
 Write-Host "  VERSION      $current -> $Version"
 Write-Host "  commit       `"$Version`" on $branch"
-if ($localTag -or $remoteTag) {
-    Write-Host "  tag          $Tag (DELETED and re-created)" -ForegroundColor Yellow
-} else {
-    Write-Host "  tag          $Tag"
-}
-Write-Host "  push         origin $branch, then origin $Tag"
-Write-Host "  triggers     release-tarball (minutes) + image build (45-75 min)"
+Write-Host "  push         origin $branch"
+Write-Host "  then CI      tags $Tag, builds the OTA tarball, publishes the release"
+Write-Host "  NOT built    the SD-card image (start it by hand from the Actions tab)"
 Write-Host ""
 
 if ($DryRun) { Say 'dry run - nothing changed'; exit 0 }
@@ -181,9 +177,10 @@ if (-not $Yes) {
 $readBack = (Get-Content $VersionFile -TotalCount 1).Trim()
 if ($readBack -ne $Version) { Fail "wrote $Version but VERSION reads '$readBack'" }
 
-# The exact check CI runs, run here first.
+# The same derivation CI performs, done here first so a bad write is caught on
+# this machine rather than in a build log.
 if ("v$readBack" -ne $Tag) { Fail "VERSION '$readBack' does not match tag '$Tag'" }
-Say "VERSION is $readBack and matches $Tag"
+Say "VERSION is $readBack; CI will tag $Tag"
 
 $r = Invoke-Git add -- VERSION
 if ($r.Code -ne 0) { Fail "git add failed: $($r.Out)" }
@@ -192,37 +189,21 @@ if ($r.Code -ne 0) { Fail "git commit failed: $($r.Out)" }
 $head = (Invoke-Git rev-parse --short HEAD).Out
 Say "committed $head"
 
-# Push the commit BEFORE the tag: a tag pushed first would reference an object the
-# remote has never seen.
+# No tagging here. CI reads VERSION from this commit and creates the tag itself,
+# which is what makes the two impossible to disagree.
 $r = Invoke-Git push origin $branch
 if ($r.Code -ne 0) { Fail "git push failed: $($r.Out)" }
-Say "pushed $branch"
-
-if ($localTag)  { Invoke-Git tag -d $Tag | Out-Null; Say "deleted local $Tag" }
-if ($remoteTag) {
-    $r = Invoke-Git push origin ":refs/tags/$Tag"
-    if ($r.Code -ne 0) { Fail "could not delete the remote tag: $($r.Out)" }
-    Say "deleted remote $Tag"
-}
-
-$r = Invoke-Git tag $Tag
-if ($r.Code -ne 0) { Fail "git tag failed: $($r.Out)" }
-
-# Prove the tag really carries the bump before it goes anywhere.
-$tagged = (Invoke-Git show "${Tag}:VERSION").Out.Trim()
-if ($tagged -ne $Version) { Fail "tag $Tag carries VERSION '$tagged', not $Version" }
-Say "$Tag points at $head, whose VERSION is $tagged"
-
-$r = Invoke-Git push origin $Tag
-if ($r.Code -ne 0) { Fail "could not push the tag: $($r.Out)" }
-Say "pushed $Tag - the build is running"
+Say "pushed $branch - CI will tag $Tag and publish the release"
 
 Write-Host ""
 Write-Host "Next:" -ForegroundColor Green
-Write-Host "  1. wait for release-tarball, then take adiona-tv-$Version.tar.gz and"
-Write-Host "     manifest-fragment.json from the RELEASES page (not the run's Artifacts)"
+Write-Host "  1. wait a couple of minutes, then open Releases/$Tag and take"
+Write-Host "     adiona-tv-$Version.tar.gz and manifest-fragment.json"
 Write-Host "  2. scp the tarball to /var/www/license-api-binaries/5/ on the licence server"
 Write-Host "  3. paste the fragment into data/box_versions.json - write a real 'notes'"
 Write-Host "     line, and leave min_image empty unless the release needs a reflash"
 Write-Host "  4. push the licence server, then: bash tools/verify-signing.sh"
-Write-Host "  5. restart adiona-updater on a box and answer the prompt on the TV"
+Write-Host "  5. power-cycle a box and answer the prompt on the TV"
+Write-Host ""
+Write-Host "  (SD-card image: not built by this push. Start the workflow by hand" -ForegroundColor DarkGray
+Write-Host "   from the Actions tab; it attaches the .img.xz to Releases/$Tag.)" -ForegroundColor DarkGray

@@ -1,31 +1,28 @@
-name: Build Adiona-TV image
+name: Adiona-TV release
 
-# Tagging a commit that was just pushed produces TWO runs seconds apart - one for
-# the branch, one for the tag - and only the tag one builds an image. Identical
-# names in the Actions list made it look like the build had failed to start, so
-# each run says which it is.
-run-name: >-
-  ${{ startsWith(github.ref, 'refs/tags/v')
-      && format('Image {0}', github.ref_name)
-      || (github.event_name == 'workflow_dispatch'
-          && format('Image (manual, {0})', github.ref_name)
-          || format('Preflight only, no image ({0})', github.ref_name)) }}
-
-# Builds the flashable 64-bit Raspberry Pi OS image in the cloud and uploads it
-# as a build artifact — no local Linux/Docker needed. Run it from the Actions
-# tab (workflow_dispatch) or on a version tag.
+# Two independent things live here, on deliberately different triggers:
 #
-# Drives pi-gen directly (same as image/build-image.sh) rather than via a wrapper
-# action, so the full pi-gen build log streams into the Actions output.
+#   push to main       -> package preflight + the OTA tarball, and the version TAG
+#                         that names it. Fully automatic, a couple of minutes.
+#   workflow_dispatch  -> the flashable SD-card image. 45-75 minutes, needed only
+#                         for new hardware, so it is started by hand from the
+#                         Actions tab.
+#
+# THE TAG IS DERIVED FROM THE VERSION FILE, never typed. A push whose VERSION is
+# new gets tagged and released; a push whose VERSION is unchanged is a no-op. That
+# makes "tag disagrees with VERSION" impossible rather than merely guarded against
+# - it cost two failed builds and a re-tag before it worked this way.
+#
+# Pushes made with GITHUB_TOKEN do not trigger workflows, so the tag this creates
+# cannot start another run.
+run-name: >-
+  ${{ github.event_name == 'workflow_dispatch'
+      && format('Image build (manual, {0})', github.ref_name)
+      || format('Release check ({0})', github.ref_name) }}
+
 on:
   workflow_dispatch:
   push:
-    tags:
-      - "v*"
-    # Ordinary pushes to main run the one-minute package preflight only (the
-    # build job filters itself out below). Without this the preflight would run
-    # solely on release tags, i.e. only ever be exercised at the moment it is
-    # most expensive to have wrong -- which is exactly how it shipped broken.
     branches:
       - main
 
@@ -121,42 +118,81 @@ jobs:
   # The OTA payload boxes in the field download, as opposed to the image a fresh
   # card is flashed with. Minutes, not an hour — an image build is for new
   # hardware, this is for the fleet that already exists.
+  # The OTA payload boxes in the field download, as opposed to the image a fresh
+  # card is flashed with. Minutes, not an hour - an image build is for new
+  # hardware, this is for the fleet that already exists.
   release-tarball:
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push'
     permissions:
       contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history AND tags: the gate below has to know whether this
+          # version has already been released, and from which commit.
+          fetch-depth: 0
 
-      # Nothing enforced this before, and it did not matter while VERSION only
-      # reached a box by reflash or by a developer running deploy.ps1. With OTA it
-      # does: the tag names the release the server offers, VERSION is what the box
-      # reports afterwards, and a mismatch means the whole fleet reports a version
-      # nobody can correlate with a commit.
-      - name: Tag must match VERSION
+      # The whole release decision, in one place: is VERSION a version we have not
+      # published yet? Everything after this is conditional on the answer.
+      #
+      # A push that does not bump VERSION is a no-op, not a failure. Ordinary work
+      # lands on main constantly; turning each of those into a red X would train
+      # everyone to ignore red.
+      - name: Decide whether this push is a release
+        id: gate
         run: |
-          tag="${GITHUB_REF_NAME}"
-          ver="v$(head -1 VERSION | tr -d '[:space:]')"
-          if [ "$tag" != "$ver" ]; then
-            echo "::error::tag $tag does not match VERSION ($ver). Bump VERSION and re-tag."
-            exit 1
+          ver="$(head -1 VERSION | tr -d '[:space:]')"
+          case "$ver" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::VERSION is '$ver', which is not x.y.z"; exit 1 ;;
+          esac
+          tag="v$ver"
+          head="$(git rev-parse HEAD)"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"     >> "$GITHUB_OUTPUT"
+
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            at="$(git rev-parse "$tag^{commit}")"
+            if [ "$at" = "$head" ]; then
+              echo "$tag already exists and points here - nothing to do (re-run?)."
+            else
+              echo "$tag already exists at ${at:0:7}, and this is ${head:0:7}."
+              echo "Bump VERSION to publish a new release."
+            fi
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "### No release: VERSION is still \`$ver\`" >> "$GITHUB_STEP_SUMMARY"
+            echo "Bump \`VERSION\` and push to publish one." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
           fi
-          echo "$tag matches VERSION."
+
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "$tag is new - releasing ${head:0:7}."
 
       - name: Build OTA tarball
+        if: steps.gate.outputs.publish == 'true'
         run: |
-          # Fixed timestamps from the tagged commit, so the archive — and
-          # therefore its sha256 — is reproducible from the tag alone.
+          # Fixed timestamps from the commit, so the archive - and therefore its
+          # sha256 - is reproducible from the tag alone.
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" bash tools/make-release.sh
           cat dist/manifest-fragment.json
+
+      # Created here rather than typed by a human: the tag and VERSION are then the
+      # same fact expressed twice, and cannot drift. Lightweight, so it needs no
+      # committer identity. Pushed BEFORE the release is cut so the release has
+      # something to attach to.
+      - name: Tag ${{ steps.gate.outputs.tag }}
+        if: steps.gate.outputs.publish == 'true'
+        run: |
+          git tag "${{ steps.gate.outputs.tag }}"
+          git push origin "${{ steps.gate.outputs.tag }}"
 
       # There is deliberately NO fragment-signing step here, and no
       # ADIONA_UPDATE_SIGNING_KEY secret on this repository.
       #
       # The signature a box verifies is produced by the licence server at request
-      # time from Key Vault — it has to be, because the manifest varies per box
+      # time from Key Vault - it has to be, because the manifest varies per box
       # with `pins` and `rollout` and so cannot be signed in advance. A signature
       # over this fragment would be checked by nothing, while requiring the key
       # that authorises running code as root across the whole fleet to sit in CI,
@@ -164,51 +200,68 @@ jobs:
       #
       # The fragment already arrives over an authenticated channel (a GitHub
       # release), and what protects data/box_versions.json from a bad edit is
-      # review of that commit — not a detached signature nobody verifies.
-      #
-      # An earlier version of this file did sign it, warned on every release that
-      # the secret was unset, and then never uploaded the .sig anyway.
-      - name: Attach to the release
+      # review of that commit - not a detached signature nobody verifies.
+      - name: Publish the release
+        if: steps.gate.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.gate.outputs.tag }}
+          name: ${{ steps.gate.outputs.tag }}
           files: |
             dist/adiona-tv-*.tar.gz
             dist/adiona-tv-*.tar.gz.sha256
             dist/manifest-fragment.json
           body: |
-            Paste `manifest-fragment.json` into `data/box_versions.json` in
-            Adiona-license-server, and upload the tarball to
-            `/var/www/license-api-binaries/5/`.
+            **OTA update** for boxes already in the field.
+
+            1. Upload `adiona-tv-${{ steps.gate.outputs.version }}.tar.gz` to
+               `/var/www/license-api-binaries/5/` on the licence server.
+            2. Paste `manifest-fragment.json` into `data/box_versions.json` there -
+               write a real `notes` line, and leave `min_image` empty unless this
+               release needs a reflashed card.
+            3. Push, then run `bash tools/verify-signing.sh`.
+
             See `Adiona-license-server/docs/BOX_UPDATES.md`.
+
+            The flashable SD-card image is NOT built automatically. Start
+            "Adiona-TV release" from the Actions tab with workflow_dispatch when a
+            new card is needed; it attaches the `.img.xz` to this release.
 
   build:
     runs-on: ubuntu-latest
-    # An image build costs 45-75 minutes, so only produce one for a release tag
-    # or a deliberate manual run - never for a routine push to main.
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
+    # MANUAL ONLY. 45-75 minutes, and needed only when a card is being flashed -
+    # which is rare, and never a consequence of an ordinary push. Start it from the
+    # Actions tab: Run workflow -> pick the branch.
+    if: github.event_name == 'workflow_dispatch'
+    # Needed to attach the .img.xz to the release. Without it the upload fails at
+    # the very end of a 45-minute build, which is the worst possible moment.
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # The same guard release-tarball applies, because this job does not depend
-      # on it (it also serves workflow_dispatch, where there is no tag) and so
-      # runs in parallel regardless of whether that one failed.
-      #
-      # It matters more here than there: 01-run.sh copies VERSION to
-      # /etc/adiona/image-version, which is what `min_image` compares against. A
-      # card built from a v1.6.1 tag but stamped 1.6.0 would quietly fail exactly
-      # the gate that exists to stop reflash-class releases half-applying.
-      # Skipped on manual runs, which have no tag to check.
-      - name: Tag must match VERSION
-        if: startsWith(github.ref, 'refs/tags/v')
+      # No tag/VERSION guard here any more: the tag IS derived from VERSION by the
+      # release job, so they cannot disagree. What this needs to know instead is
+      # whether a release already exists for the version being built, because that
+      # is where the image belongs.
+      - name: Which release does this image belong to?
+        id: target
         run: |
-          tag="${GITHUB_REF_NAME}"
-          ver="v$(head -1 VERSION | tr -d '[:space:]')"
-          if [ "$tag" != "$ver" ]; then
-            echo "::error::tag $tag does not match VERSION ($ver). Bump VERSION and re-tag."
-            exit 1
+          ver="$(head -1 VERSION | tr -d '[:space:]')"
+          tag="v$ver"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "attach=true" >> "$GITHUB_OUTPUT"
+            echo "will attach the image to release $tag"
+          else
+            echo "attach=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::no release $tag yet - the image will be a run artifact."
+            echo "Push a VERSION bump to main first if you want it on the release."
           fi
-          echo "$tag matches VERSION."
 
       # pi-gen cross-builds arm64 on this x86 runner. build-docker.sh does a
       # host-side `which qemu-aarch64` check and registers the binfmt handler
@@ -243,7 +296,24 @@ jobs:
         working-directory: pi-gen
         run: ./build-docker.sh
 
-      - name: Upload image artifact
+      # Two destinations, deliberately:
+      #
+      #   * a RELEASE asset on a tag, so the flashable image and the OTA tarball
+      #     for the same version sit on one page. Hunting an .img.xz down inside a
+      #     45-minute workflow run - a different tab, a different retention policy,
+      #     and a zip wrapper around it - is not where a release artifact belongs.
+      #   * a workflow ARTIFACT otherwise, because a manual workflow_dispatch build
+      #     has no tag and therefore no release to attach to.
+      - name: Attach the image to release ${{ steps.target.outputs.tag }}
+        if: steps.target.outputs.attach == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.target.outputs.tag }}
+          files: pi-gen/deploy/*
+          fail_on_unmatched_files: true
+
+      - name: Upload image artifact (no release to attach to)
+        if: steps.target.outputs.attach != 'true' 
         uses: actions/upload-artifact@v4
         with:
           name: adiona-tv-image
