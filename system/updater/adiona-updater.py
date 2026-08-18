@@ -1049,6 +1049,46 @@ class Updater(object):
             return
         log("unknown command %r" % action)
 
+    # ── watch an apply through to its end ──
+    def poll_apply(self):
+        """Notice when the applier has finished.
+
+        resume() latches "an update is in flight" from the marker at startup -
+        which is right, because the applier restarts this process mid-apply. What
+        was missing is that the applier then FINISHES, seconds later, clears the
+        marker and writes its result, and nothing looked again. The box sat on
+        "Installing - do not remove power" indefinitely after a completely
+        successful update, and only a restart of this service cleared it.
+
+        Called on every tick while the state says an apply is running, so the
+        screen follows the applier's phase and lands on its outcome.
+        """
+        if os.path.exists(MARKER_PATH):
+            # Still going. Track the phase so applying -> health is visible.
+            phase = read_first_line(PHASE_PATH, "applying")
+            set_state(state=("health" if phase == "health" else "applying"),
+                      message="Installing — do not remove power")
+            return
+
+        # Marker gone: the applier is done, one way or the other.
+        set_state(current=current_version(), layout=layout(), releases=list_releases())
+        try:
+            with open(RESULT_PATH) as fh:
+                result = json.load(fh)
+        except (OSError, ValueError):
+            set_state(state="idle", message="")
+            return
+        set_state(last_result=result)
+        if result.get("ok"):
+            set_state(state="ok", available="",
+                      message="Updated to v%s" % result.get("to", current_version()))
+            log("update to v%s completed" % result.get("to"))
+        else:
+            set_state(state="failed", available="",
+                      message="Update failed — still on v%s" % current_version())
+            log("update to v%s failed: %s"
+                % (result.get("to"), result.get("reason")))
+
     # ── reconstruct after the restart every apply causes ──
     def resume(self):
         """An apply restarts this process half way through its own job. Work out
@@ -1105,6 +1145,14 @@ class Updater(object):
 
             with LOCK:
                 state = STATE["state"]
+
+            # An apply is owned by a separate process that outlives restarts of
+            # this one, so its progress has to be READ, not remembered. Without
+            # this the screen keeps whatever resume() latched at startup.
+            if state in ("applying", "health"):
+                self.poll_apply()
+                with LOCK:
+                    state = STATE["state"]
 
             # Transient result banners clear themselves so the waiting screen does
             # not carry "Updated to v1.6.0" for the rest of the event.
