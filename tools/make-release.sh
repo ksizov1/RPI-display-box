@@ -18,8 +18,21 @@
 #     bash tools/make-release.sh                 # -> dist/
 #     bash tools/make-release.sh /tmp/out        # somewhere else
 #
-# Then: scp the tarball to /var/www/license-api-binaries/5/ on the licence server
-# and paste dist/manifest-fragment.json into data/box_versions.json there.
+# Produces exactly two files, both ready to use as-is:
+#   adiona-tv-<version>.tar.gz   -> scp to /var/www/license-api-binaries/5/
+#   box_versions.json            -> REPLACES data/box_versions.json on the server
+#
+# box_versions.json is the COMPLETE manifest, not a fragment to splice into an
+# existing one. Editing a fragment into an array by hand went wrong the first time
+# it was tried: the file was replaced BY the fragment, which is still signed and
+# still valid JSON but has no `releases` key, so every box reported "up to date"
+# and installed nothing, silently. Emitting the whole file removes that step and
+# therefore that failure.
+#
+# Only one release is ever listed. The box takes the newest it is offered, and a
+# server holding a history of old releases serves no purpose - the artefacts stay
+# on the GitHub release if an older one is ever needed.
+#
 # See Adiona-license-server/docs/BOX_UPDATES.md.
 
 set -euo pipefail
@@ -58,7 +71,9 @@ tar --sort=name \
 
 SHA="$(sha256sum "$TARBALL" | cut -d' ' -f1)"
 SIZE="$(wc -c < "$TARBALL" | tr -d '[:space:]')"
-printf '%s  %s\n' "$SHA" "$(basename "$TARBALL")" > "$TARBALL.sha256"
+# No .sha256 sidecar is written. Nothing read it: the box checks the tarball
+# against the sha256 inside the SIGNED manifest, which is the only copy that
+# carries any authority, and a second unsigned copy alongside it added nothing.
 
 # Sanity: the archive must contain everything adiona-updater.py's stage() insists
 # on, or the failure surfaces on a box in the field rather than here.
@@ -87,29 +102,49 @@ done
 # fleet a first OTA release is aimed at. Set it ONLY when a release genuinely
 # depends on something a reflash provides.
 BASE_URL="${ADIONA_RELEASE_BASE_URL:-https://license.drivingsimulator.com/5}"
-cat > "$OUT/manifest-fragment.json" <<JSON
+
+# min_from and min_image default to EMPTY, i.e. no constraint, because both fail
+# CLOSED when set and neither is normally wanted.
+#
+# min_image especially: a box upgraded by a live deploy reports image-version
+# 0.0.0 (a deploy changes /opt/adiona, never the boot configuration, so it cannot
+# honestly claim to know what the card was flashed with), and an unknown image is
+# treated as too old on purpose. A min_image copied in without thinking would
+# refuse the release on every box in the existing fleet - exactly the fleet a
+# release is aimed at. Set it only when a release genuinely needs a reflash.
+cat > "$OUT/box_versions.json" <<JSON
 {
-  "version": "$VERSION",
-  "url": "$BASE_URL/$(basename "$TARBALL")",
-  "size": $SIZE,
-  "sha256": "$SHA",
-  "notes": "TODO: one line, shown on the TV in the update prompt",
-  "min_from": "",
-  "min_image": "",
-  "packages": [],
-  "rollout": 100
+  "schema": 1,
+  "channel": "stable",
+  "min_client_protocol": 1,
+  "releases": [
+    {
+      "version": "$VERSION",
+      "url": "$BASE_URL/$(basename "$TARBALL")",
+      "size": $SIZE,
+      "sha256": "$SHA",
+      "notes": "TODO: one line, shown on the TV in the update prompt",
+      "min_from": "",
+      "min_image": "",
+      "packages": [],
+      "rollout": 100
+    }
+  ],
+  "pins": {}
 }
 JSON
 
 echo "built $TARBALL"
 echo "  size   $SIZE bytes"
 echo "  sha256 $SHA"
-echo "  manifest fragment: $OUT/manifest-fragment.json"
 echo
-echo "Before pasting it into data/box_versions.json:"
-echo "  * write a real 'notes' line — it is what the operator reads on the TV;"
-echo "  * leave min_image empty unless this release needs a REFLASHED card. Setting"
-echo "    it blocks every box upgraded by deploy.ps1, which report image 0.0.0;"
+echo "  $OUT/box_versions.json  <- the COMPLETE manifest; replace the server's copy"
+echo
+echo "Before uploading, edit box_versions.json:"
+echo "  * write a real 'notes' line - it is what the operator reads on the TV;"
 echo "  * set 'rollout' below 100 to try it on a few boxes first."
 echo
-echo "Then follow Adiona-license-server/docs/BOX_UPDATES.md."
+echo "Then, on the licence server:"
+echo "  scp $(basename "$TARBALL") <vm>:/var/www/license-api-binaries/5/"
+echo "  cp box_versions.json data/box_versions.json && git commit && git push"
+echo "  bash tools/verify-signing.sh     # confirms a box would actually be offered it"

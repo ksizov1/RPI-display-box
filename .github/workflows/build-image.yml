@@ -176,7 +176,7 @@ jobs:
           # Fixed timestamps from the commit, so the archive - and therefore its
           # sha256 - is reproducible from the tag alone.
           SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)" bash tools/make-release.sh
-          cat dist/manifest-fragment.json
+          cat dist/box_versions.json
 
       # Created here rather than typed by a human: the tag and VERSION are then the
       # same fact expressed twice, and cannot drift. Lightweight, so it needs no
@@ -209,18 +209,17 @@ jobs:
           name: ${{ steps.gate.outputs.tag }}
           files: |
             dist/adiona-tv-*.tar.gz
-            dist/adiona-tv-*.tar.gz.sha256
-            dist/manifest-fragment.json
+            dist/box_versions.json
           body: |
             **OTA update** for boxes already in the field.
 
             1. Upload `adiona-tv-${{ steps.gate.outputs.version }}.tar.gz` to
                `/var/www/license-api-binaries/5/` on the licence server.
-            2. Paste `manifest-fragment.json` into `data/box_versions.json` there -
-               write a real `notes` line, and leave `min_image` empty unless this
-               release needs a reflashed card.
-            3. Push, then run `bash tools/verify-signing.sh`.
-
+            2. Write a real `notes` line in `box_versions.json`, then use it to
+               REPLACE `data/box_versions.json` there. It is the complete manifest,
+               not a fragment - nothing to splice.
+            3. Run `bash tools/verify-signing.sh`, which checks the signature and
+               the shape and tells you what a box would actually be offered.
             See `Adiona-license-server/docs/BOX_UPDATES.md`.
 
             The flashable SD-card image is NOT built automatically. Start

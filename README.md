@@ -296,8 +296,7 @@ Everything for a version ends up on **one page**, `Releases/vX.Y.Z`:
 | Asset | Built | For |
 |---|---|---|
 | `adiona-tv-X.Y.Z.tar.gz` | automatically, on push | the OTA update boxes download |
-| `adiona-tv-X.Y.Z.tar.gz.sha256` | automatically | checking that download by hand |
-| `manifest-fragment.json` | automatically | pasting into `box_versions.json` |
+| `box_versions.json` | automatically | the complete manifest; replaces the server's copy |
 | `*.img.xz` | **by hand** | flashing a new SD card |
 
 The tarball is ready a couple of minutes after the push and is all an OTA needs.
