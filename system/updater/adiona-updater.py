@@ -165,6 +165,11 @@ STATE = {
     # staged | applying | health | ok | failed | rolled_back | blocked
     "state": "idle",
     "current": "",
+    # The version an in-flight apply is replacing. It cannot be derived from
+    # "current": the swap flips VERSION well before the apply finishes, so a
+    # screen built from current_version() reads "v1.6.14 -> v1.6.14" for most of
+    # the install. The applier's marker is the only thing that still knows.
+    "from": "",
     "available": "",
     "notes": "",
     "size": 0,
@@ -1044,6 +1049,7 @@ class Updater(object):
         self.applying_version = version
         self.saw_marker = False
         self.apply_started = time.monotonic()
+        set_state(**{"from": current_version()})
         apply_release(version, release_dir)
 
     # ── commands from the kiosk page, relayed by the controller ──
@@ -1108,7 +1114,8 @@ class Updater(object):
             phase = read_first_line(PHASE_PATH, "applying")
             set_state(state=("health" if phase == "health" else "applying"),
                       available=self.applying_version,
-                      message="Installing — do not remove power")
+                      message="Installing — do not remove power",
+                      **{"from": STATE.get("from") or marker_field("from")})
             return
 
         result = None
@@ -1128,7 +1135,7 @@ class Updater(object):
                 return
             log("apply finished with no result of its own; returning to idle")
             self.applying_version = ""
-            set_state(state="idle", message="", available="")
+            set_state(state="idle", message="", available="", **{"from": ""})
             return
 
         set_state(current=current_version(), layout=layout(), releases=list_releases(),
@@ -1141,6 +1148,7 @@ class Updater(object):
             set_state(state="failed", available="",
                       message="Update failed — still on v%s" % current_version())
             log("update to v%s failed: %s" % (result.get("to"), result.get("reason")))
+        set_state(**{"from": ""})
         self.applying_version = ""
         self.saw_marker = False
 
@@ -1160,7 +1168,8 @@ class Updater(object):
             self.apply_started = time.monotonic()
             set_state(state="applying" if phase not in ("health",) else "health",
                       available=self.applying_version,
-                      message="Installing — do not remove power")
+                      message="Installing — do not remove power",
+                      **{"from": marker_field("from")})
             log("an update is in flight (phase %s, installing v%s)"
                 % (phase, self.applying_version or "?"))
             return

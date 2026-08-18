@@ -467,6 +467,30 @@
     });
   }                                    // next frame was already queued at the top
 
+  // ── Keep the splash on screen ─────────────────────────────────────────────
+  // #overlay draws splash.png as a CSS background, and a CSS background that
+  // fails to load is never retried by the browser - one refused connection and
+  // the box shows a white screen with only the status bar for the rest of the
+  // day. That is not hypothetical: it is what a mid-apply reload produced. The
+  // page cannot see a background fail, so probe the same URL with an Image and
+  // re-point the background at a cache-busting URL when it comes back.
+  var splashTries = 0;
+  function ensureSplash() {
+    var probe = new Image();
+    probe.onload = function () {
+      if (splashTries) {
+        overlay.style.backgroundImage = 'url("' + probe.src + '")';
+      }
+    };
+    probe.onerror = function () {
+      // Back off to every 10 s; the controller restarts in well under that, and
+      // this keeps running for as long as the box is up.
+      setTimeout(ensureSplash, Math.min(1000 * ++splashTries, 10000));
+    };
+    probe.src = splashTries ? "splash.png?r=" + splashTries : "splash.png";
+  }
+  ensureSplash();
+
   // ── Poll the controller for what to display ───────────────────────────────
   // The version this page was served with. An update that swaps the release
   // under a running controller leaves Chromium showing the OLD index.html, and
@@ -488,9 +512,18 @@
         // on a SUCCESSFUL fetch, so a reload can never land on an error page.
         var cameBack = pollFailures >= 10;
         pollFailures = 0;
+        // ...but NOT while an update is still being applied. The swap flips
+        // VERSION several steps before the applier restarts the controller, so a
+        // reload here loads index.html from a controller that is about to go
+        // away, and the splash.png request a moment later lands in the restart.
+        // A CSS background that fails is never retried: the box came up on the
+        // new version with a blank white screen. Wait for a terminal state - the
+        // controller is back up by then, and the reload is a plain refresh.
+        var us = (s.update || {}).state;
+        var applying = us === "applying" || us === "health" || us === "staged";
         if (loadedVersion === null) {
           loadedVersion = s.version || "";
-        } else if (cameBack || (s.version && s.version !== loadedVersion)) {
+        } else if (!applying && (cameBack || (s.version && s.version !== loadedVersion))) {
           location.reload();
           return;
         }
@@ -1018,7 +1051,10 @@
     if (visible !== updateOpen) updShow(visible);
     if (!visible) return;
 
-    var cur = esc(upd.current || state.version || "");
+    // "from" only exists while an apply is in flight, and it is the only correct
+    // left-hand side then: the swap flips VERSION - and so "current" - long
+    // before the install finishes.
+    var cur = esc(upd.from || upd.current || state.version || "");
     var to = esc(upd.available || "");
     var versLine = to
       ? '<span class="from">v' + cur + '</span><span class="arrow">&rarr;</span>' +

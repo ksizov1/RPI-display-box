@@ -227,6 +227,8 @@ def update_summary(status):
     return {
         "state": status.get("state", "idle"),
         "current": status.get("current", ""),
+        # Only set while an apply is in flight; see the updater's STATE.
+        "from": status.get("from", ""),
         "available": status.get("available", ""),
         "notes": status.get("notes", ""),
         "progress": status.get("progress", 0.0),
