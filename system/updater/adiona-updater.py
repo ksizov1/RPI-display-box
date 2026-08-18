@@ -707,10 +707,28 @@ def run_apply(args, detached=True):
     Detached through systemd-run, not as a child: applying an update restarts
     adiona-updater, and `systemctl restart` kills the unit's whole cgroup. A
     subprocess (even with setsid) is in that cgroup and dies mid-swap.
-    `--collect` unloads the transient unit whatever its exit status, or the next
-    run with the same name fails with "unit already exists". `TimeoutStartSec=0`
-    because Type=oneshot otherwise inherits Debian's 90 s default, which would
-    SIGTERM the script in the middle of the swap.
+
+    Every flag below is load-bearing, and two of them were wrong in a way that
+    only showed up on hardware:
+
+      --collect                unloads the transient unit whatever its exit
+                               status; without it the next run with the same
+                               name fails with "unit already exists".
+      TimeoutStartSec=infinity NOT 0. In systemd, 0 means "time out
+                               IMMEDIATELY", not "no timeout" - `infinity` is
+                               the documented way to disable it. With 0 the unit
+                               was SIGTERMed in the same second it started, and
+                               the whole apply never ran a single line. Verified
+                               on the box: `systemd-run … TimeoutStartSec=0
+                               /bin/sleep 3` fails.
+      --no-block               systemd-run otherwise WAITS for the start job,
+                               and for Type=oneshot that job only completes when
+                               the script exits - i.e. it would block for the
+                               entire apply (two minutes plus a 90 s soak),
+                               blowing the timeout below and making the updater
+                               report failure while the apply was still running.
+                               Measured: without it, a `sleep 5` unit takes 5 s
+                               to return; with it, ~0 s.
     """
     if not os.path.exists(APPLY_SCRIPT):
         return False, "apply script missing at %s" % APPLY_SCRIPT
@@ -718,7 +736,9 @@ def run_apply(args, detached=True):
         rc = subprocess.run(["bash", APPLY_SCRIPT] + args)
         return rc.returncode == 0, ("" if rc.returncode == 0 else "exit %d" % rc.returncode)
     cmd = ["systemd-run", "--unit=adiona-apply", "--service-type=oneshot", "--collect",
-           "--property=TimeoutStartSec=0", "--property=SyslogIdentifier=adiona-apply",
+           "--no-block",
+           "--property=TimeoutStartSec=infinity",
+           "--property=SyslogIdentifier=adiona-apply",
            "--property=WorkingDirectory=/",
            "bash", APPLY_SCRIPT] + args
     try:
