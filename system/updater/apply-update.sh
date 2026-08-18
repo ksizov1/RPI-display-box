@@ -103,21 +103,47 @@ phase() {
 # ── Relocate out of the release tree ─────────────────────────────────────────
 # Both --migrate and the apply path delete or repoint the directory this script
 # lives in. The open inode would survive, but bash reads the script lazily and any
-# sibling file read would break, so re-exec from tmpfs first. /run is cleared at
-# boot, so nothing stale can accumulate.
+# sibling file read would break, so re-exec from a copy outside the tree first.
+#
+# The copy goes in STATE_DIR (/var/lib/adiona), NOT /run. /run is tmpfs and looks
+# ideal - cleared at boot, so nothing stale accumulates - but on this image it is
+# mounted `noexec`:
+#
+#     tmpfs /run tmpfs rw,nosuid,nodev,noexec,relatime,...
+#
+# so exec'ing from there fails with "Permission denied" even as root with mode
+# 755, which reads like a file-permission problem and is not one. The apply died
+# on that line, before logging anything, leaving the screen on "Installing
+# update" with nothing in the applier's journal to explain it.
+#
+# STATE_DIR is on the card and therefore persistent, which is fine: the copy is
+# overwritten from the outgoing release on every run, so it is never stale.
+RELOC="$STATE_DIR/apply.sh"
 if [ -z "${ADIONA_APPLY_RELOCATED:-}" ]; then
 	self="$(readlink -f "$0")"
 	case "$self" in
 		"$ROOT"/*)
-			mkdir -p "$RUN_DIR"
-			cp -f "$self" "$RUN_DIR/apply.sh"
-			chmod +x "$RUN_DIR/apply.sh"
+			mkdir -p "$STATE_DIR"
+			cp -f "$self" "$RELOC"
+			chmod +x "$RELOC"
+			# Prove the destination is actually exec-capable before relying on it.
+			# A noexec mount here is otherwise a bare "Permission denied" at a line
+			# number, with no hint that the filesystem is the problem.
+			if ! "$RELOC" --exec-probe >/dev/null 2>&1; then
+				log "FATAL: cannot execute $RELOC - is its filesystem mounted noexec?"
+				log "       $(grep -E \" $(df --output=target "$STATE_DIR" | tail -1) \" /proc/mounts 2>/dev/null | head -1)"
+				exit 1
+			fi
 			export ADIONA_APPLY_RELOCATED=1
-			exec "$RUN_DIR/apply.sh" "$@"
+			exec "$RELOC" "$@"
 			;;
 	esac
 	export ADIONA_APPLY_RELOCATED=1
 fi
+
+# Answer the probe above and exit. Must come after the relocation block (so the
+# probe runs against the COPY) and before anything that touches the system.
+case "${1:-}" in --exec-probe) exit 0 ;; esac
 
 # ── Durability helpers ───────────────────────────────────────────────────────
 # bash cannot fsync a directory; python3 can, and it is already a hard dependency
