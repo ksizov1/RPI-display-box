@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# Ask the licence server what it would tell a box, and check three things a box
-# checks: is the manifest signed by the pair of our public key, is it the right
-# SHAPE, and what would a box actually decide to do with it.
+# Ask the licence server what it would tell a box, and check four things a box
+# depends on: is the manifest signed by the pair of our public key, is it the
+# right SHAPE, what would a box actually decide to do with it, and is the release
+# it points at genuinely DOWNLOADABLE.
 #
 # The signature is only the first of those, and on its own it is misleading. A
 # perfectly signed manifest with `releases: []` - or with a release entry pasted in
@@ -235,6 +236,46 @@ if offered is None:
     print("                  If that is not what you intended, the reasons above say why.")
     sys.exit(1)
 
-print("\nVERIFIED: signed by the pair of this public key, well-formed, and a box on")
-print("          v%s would be offered v%s." % (boxver, offered["version"]))
+# ── 4. is it actually downloadable? ──────────────────────────────────────────
+# The manifest is a promise about a file. Checking the promise without checking
+# the file is how a signed, well-formed manifest still fails on the box.
+url = offered.get("url", "")
+want = int(offered.get("size", 0) or 0)
+print("\nfetching %s" % url)
+
+probe = subprocess.run(
+    ["curl", "-sSL", "-o", os.devnull, "-w", "%{http_code} %{size_download} %{url_effective}",
+     "--max-time", "60", url],
+    capture_output=True, text=True)
+parts = (probe.stdout or "").split()
+if probe.returncode != 0 or len(parts) < 2:
+    print("\nUNREACHABLE: could not fetch the release.")
+    print("             %s" % (probe.stderr or probe.stdout or "curl failed").strip()[:200])
+    print("             A box would fail here, AFTER the operator pressed Y.")
+    sys.exit(1)
+
+code, got = parts[0], int(parts[1])
+final = parts[2] if len(parts) > 2 else url
+if code != "200":
+    print("\nUNREACHABLE: the release URL returns HTTP %s." % code)
+    if final != url:
+        print("             It redirected to %s" % final)
+        print("             A trailing slash added here means the web server resolved the")
+        print("             path to a DIRECTORY - the filename never reached it. With")
+        print("             nginx that is `alias` in a regex location dropping the")
+        print("             unmatched tail; use `root` instead.")
+    print("             The file may not be uploaded, or may not be readable by the")
+    print("             web server's user.")
+    sys.exit(1)
+
+if want and got != want:
+    print("\nMISMATCH: the manifest says %d bytes, the server returned %d." % (want, got))
+    print("          The uploaded tarball is not the one this manifest describes, so")
+    print("          the box would reject it on the sha256 check after downloading it.")
+    sys.exit(1)
+
+print("download : HTTP 200, %d bytes, matches the manifest" % got)
+
+print("\nVERIFIED: signed by the pair of this public key, well-formed, downloadable,")
+print("          and a box on v%s would be offered v%s." % (boxver, offered["version"]))
 PY
