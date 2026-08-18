@@ -135,6 +135,11 @@ MANIFEST_MAX_BYTES = 256 * 1024
 # to land that one check when the network is not ready yet — not a polling cycle.
 RETRY_MIN = 30.0
 RETRY_MAX = 15 * 60.0
+# How long after launching the applier we keep saying "Installing" before its
+# marker appears. It writes the marker a few seconds in (after the package and
+# box.conf phases, plus a deliberate pause so the screen can paint), and until
+# then the absence of a marker means "not started", not "finished".
+APPLY_START_GRACE = 120.0
 # Refuse to download unless the card has room for the tarball, the unpacked tree,
 # and headroom. Running /opt out of space mid-unpack is recoverable but ugly.
 SPACE_MULTIPLIER = 3
@@ -233,6 +238,23 @@ def read_command(last_seq):
 # boot, and nothing is downloaded at all until somebody answers the prompt.
 
 # ── Box identity ─────────────────────────────────────────────────────────────
+
+def marker_field(name):
+    """Read one KEY=value line out of /etc/adiona/update-pending.
+
+    The applier owns that file; it names the version being installed, which is
+    how this process knows what it is watching after being restarted mid-apply.
+    """
+    try:
+        with open(MARKER_PATH, encoding="utf-8") as fh:
+            for line in fh:
+                key, _, val = line.strip().partition("=")
+                if key == name:
+                    return val
+    except OSError:
+        pass
+    return ""
+
 
 def read_first_line(path, default=""):
     try:
@@ -794,6 +816,11 @@ class Updater(object):
         self.declined = set()           # versions refused THIS BOOT; cleared by a reboot
         self.waiting_logged = False     # so "no uplink yet" is said once, not every tick
         self.last_cmd_seq = 0
+        # Which apply we are watching, so a result belonging to a PREVIOUS one is
+        # never mistaken for it. See poll_apply().
+        self.applying_version = ""
+        self.saw_marker = False
+        self.apply_started = 0.0
 
     def done_checking(self):
         """A verified answer. Nothing further happens until the box is restarted."""
@@ -1014,6 +1041,9 @@ class Updater(object):
         self.pending_accept = False
         self.staged_dir = None
         self.candidate = None
+        self.applying_version = version
+        self.saw_marker = False
+        self.apply_started = time.monotonic()
         apply_release(version, release_dir)
 
     # ── commands from the kiosk page, relayed by the controller ──
@@ -1051,34 +1081,58 @@ class Updater(object):
 
     # ── watch an apply through to its end ──
     def poll_apply(self):
-        """Notice when the applier has finished.
+        """Follow the applier to its outcome.
 
-        resume() latches "an update is in flight" from the marker at startup -
-        which is right, because the applier restarts this process mid-apply. What
-        was missing is that the applier then FINISHES, seconds later, clears the
-        marker and writes its result, and nothing looked again. The box sat on
-        "Installing - do not remove power" indefinitely after a completely
-        successful update, and only a restart of this service cleared it.
+        Two traps, both of which produced a wrong screen on real hardware:
 
-        Called on every tick while the state says an apply is running, so the
-        screen follows the applier's phase and lands on its outcome.
+        1. resume() latches "an update is in flight" from the marker at startup -
+           correct, because the applier restarts this process mid-apply - but the
+           applier then FINISHES and clears the marker, and nothing looked again.
+           A successful update sat on "Installing" indefinitely.
+
+        2. The absence of the marker does NOT mean "finished". systemd-run is
+           fire-and-forget, so this can run within a second of launching the
+           applier, while it is still in `preparing`/`config` and has not written
+           the marker yet - roughly a three-second window. Treating that as
+           completion made it publish the PREVIOUS apply's result: a 1.6.10 ->
+           1.6.11 update briefly announced "Updated to v1.6.9".
+
+        So a result is only ours if it names the version we launched, and until we
+        have seen the marker at least once we assume the applier is still starting.
         """
         if os.path.exists(MARKER_PATH):
-            # Still going. Track the phase so applying -> health is visible.
+            self.saw_marker = True
+            if not self.applying_version:
+                # Restarted mid-apply: the marker itself says what is being installed.
+                self.applying_version = marker_field("to")
             phase = read_first_line(PHASE_PATH, "applying")
             set_state(state=("health" if phase == "health" else "applying"),
+                      available=self.applying_version,
                       message="Installing — do not remove power")
             return
 
-        # Marker gone: the applier is done, one way or the other.
-        set_state(current=current_version(), layout=layout(), releases=list_releases())
+        result = None
         try:
             with open(RESULT_PATH) as fh:
                 result = json.load(fh)
         except (OSError, ValueError):
-            set_state(state="idle", message="")
+            result = None
+
+        ours = bool(result) and (not self.applying_version
+                                 or result.get("to") == self.applying_version)
+        if not ours:
+            # Either the applier has not started writing yet, or this result belongs
+            # to an earlier update. Keep showing "Installing" while it could still
+            # be the former; the marker appearing will confirm it.
+            if not self.saw_marker and (time.monotonic() - self.apply_started) < APPLY_START_GRACE:
+                return
+            log("apply finished with no result of its own; returning to idle")
+            self.applying_version = ""
+            set_state(state="idle", message="", available="")
             return
-        set_state(last_result=result)
+
+        set_state(current=current_version(), layout=layout(), releases=list_releases(),
+                  last_result=result)
         if result.get("ok"):
             set_state(state="ok", available="",
                       message="Updated to v%s" % result.get("to", current_version()))
@@ -1086,8 +1140,9 @@ class Updater(object):
         else:
             set_state(state="failed", available="",
                       message="Update failed — still on v%s" % current_version())
-            log("update to v%s failed: %s"
-                % (result.get("to"), result.get("reason")))
+            log("update to v%s failed: %s" % (result.get("to"), result.get("reason")))
+        self.applying_version = ""
+        self.saw_marker = False
 
     # ── reconstruct after the restart every apply causes ──
     def resume(self):
@@ -1098,9 +1153,16 @@ class Updater(object):
                   releases=list_releases())
         if os.path.exists(MARKER_PATH):
             phase = read_first_line(PHASE_PATH, "applying")
+            # Seed what poll_apply() needs, so the result it eventually reads is
+            # matched against the version actually being installed.
+            self.saw_marker = True
+            self.applying_version = marker_field("to")
+            self.apply_started = time.monotonic()
             set_state(state="applying" if phase not in ("health",) else "health",
+                      available=self.applying_version,
                       message="Installing — do not remove power")
-            log("an update is in flight (phase %s)" % phase)
+            log("an update is in flight (phase %s, installing v%s)"
+                % (phase, self.applying_version or "?"))
             return
         try:
             with open(RESULT_PATH) as fh:

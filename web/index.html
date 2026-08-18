@@ -1059,13 +1059,19 @@
       elUpdVers.innerHTML = versLine;
       elUpdBody.innerHTML = "";
       // The single most important line on this screen. Without it the operator
-      // sees an unexplained black screen and pulls the power — which is exactly
-      // the failure the rollback machinery exists to survive, and the one case
-      // where it costs a reboot to recover from.
+      // sees an install that appears to hang and pulls the power — exactly the
+      // failure the rollback machinery exists to survive, and the one case where
+      // recovering costs a reboot.
+      //
+      // It used to promise the display would go black. It usually does not: the
+      // Pi holds the last frame, and most updates do not restart the kiosk at all
+      // (the applier only does that when the kiosk files actually changed). The
+      // duration is the part worth saying, because the health soak alone is 90
+      // seconds and silence for that long reads as a hang.
       elUpdMsg.innerHTML = upd.state === "staged"
         ? esc(upd.message || "Waiting for the session to end.")
-        : '<span class="upd-warn">The display will go black for a few seconds.' +
-          '<br>Do not remove power.</span>';
+        : '<span class="upd-warn">Do not remove power.' +
+          '<br>This takes a minute or two.</span>';
       return;
     }
 
