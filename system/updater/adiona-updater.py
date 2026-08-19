@@ -140,6 +140,14 @@ RETRY_MAX = 15 * 60.0
 # box.conf phases, plus a deliberate pause so the screen can paint), and until
 # then the absence of a marker means "not started", not "finished".
 APPLY_START_GRACE = 120.0
+# How long the result banner stays up before the waiting screen comes back.
+# Success is a confirmation - the operator already watched the install and only
+# needs to see that it finished, and a couple of those seconds are spent on the
+# page reload that the new version triggers. Failure is different: it is the only
+# place the reason is shown, nobody is necessarily watching when it happens, and
+# whoever walks up next has to be able to read it.
+RESULT_HOLD_OK = 6.0
+RESULT_HOLD_FAIL = 60.0
 # Refuse to download unless the card has room for the tarball, the unpacked tree,
 # and headroom. Running /opt out of space mid-unpack is recoverable but ugly.
 SPACE_MULTIPLIER = 3
@@ -1229,7 +1237,8 @@ class Updater(object):
             # not carry "Updated to v1.6.0" for the rest of the event.
             if state in ("ok", "failed"):
                 if clear_at == 0.0:
-                    clear_at = time.monotonic() + 60
+                    clear_at = time.monotonic() + (
+                        RESULT_HOLD_OK if state == "ok" else RESULT_HOLD_FAIL)
                 elif time.monotonic() > clear_at:
                     clear_at = 0.0
                     set_state(state="idle", message="")
