@@ -14,6 +14,7 @@ Usage
     python3 tools/wheel-sim.py --static 90     # hold 90 deg right, no sweep
     python3 tools/wheel-sim.py --no-wheel      # box alive, nothing plugged in
     python3 tools/wheel-sim.py --app-version 1.6.0   # what the box claims to run
+    python3 tools/wheel-sim.py --keys F1,TAB,CTRL+S  # send these keystrokes on a loop
 
 Then in Godot set Global.lan_wheel.box_ip_override to this machine's IP (or
 "127.0.0.1" when the game runs on the same box).
@@ -32,19 +33,59 @@ import struct
 import sys
 import time
 
-# Mirrors the wire format in system/wheel/adiona-wheel.py. PACKET SIZES 28
+# Mirrors the wire format in system/wheel/adiona-wheel.py. PACKET SIZES 48
 # (STATE), 56 (INFO) and 64 (BOX) ARE TAKEN — the headset dispatches on size
 # first, so any new message must avoid all three. Change this file and the
 # service together, or the sim stops being a valid stand-in.
-STATE_FMT = struct.Struct("<4sIHHfHHIi")
+KEY_SLOTS = 4
+STATE_FMT = struct.Struct("<4sIHHfHHIiHBB" + "HBB" * KEY_SLOTS)
 INFO_FMT = struct.Struct("<4sHH48s")
 BOX_FMT = struct.Struct("<4sHHBBBBHHI20s24s")
 SUB_FMT = struct.Struct("<4sI")
-STATE_MAGIC, INFO_MAGIC, BOX_MAGIC, SUB_MAGIC = b"AW01", b"AI01", b"AB01", b"ASUB"
+STATE_MAGIC, INFO_MAGIC, BOX_MAGIC, SUB_MAGIC = b"AW02", b"AI01", b"AB01", b"ASUB"
 
 FLAG_WHEEL_PRESENT = 1 << 0
 FLAG_PEDALS_MAPPED = 1 << 1
 FLAG_RANGE_APPLIED = 1 << 2
+FLAG_KEYBOARD_PRESENT = 1 << 4
+
+# Keystrokes, as adiona_keys.py encodes them: a printable key is its uppercase
+# ASCII value, anything else is 0x8000 | the ordinal Godot gives it past
+# KEY_SPECIAL. Only the handful --keys accepts are listed; the real table lives
+# in adiona_keys.GODOT_KEYS.
+KEY_NAMES = {
+    "ESC": 0x8001, "TAB": 0x8002, "BACKSPACE": 0x8004, "ENTER": 0x8005,
+    "LEFT": 0x800F, "UP": 0x8010, "RIGHT": 0x8011, "DOWN": 0x8012,
+    "PAGEUP": 0x8013, "PAGEDOWN": 0x8014, "SPACE": ord(" "),
+}
+for _i in range(12):
+    KEY_NAMES["F%d" % (_i + 1)] = 0x801C + _i
+for _c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789":
+    KEY_NAMES[_c] = ord(_c)
+
+MOD_NAMES = {"SHIFT": 1 << 0, "CTRL": 1 << 1, "ALT": 1 << 2, "META": 1 << 3}
+
+ACTION_UP, ACTION_DOWN, ACTION_REPEAT = 0, 1, 2
+
+
+def parse_keys(text):
+    """'F1,CTRL+S,SHIFT+LEFT' -> [(code, mods), ...]. Exits on a bad name."""
+    combos = []
+    for chunk in text.split(","):
+        chunk = chunk.strip().upper()
+        if not chunk:
+            continue
+        parts = chunk.split("+")
+        name, mods = parts[-1], 0
+        for m in parts[:-1]:
+            if m not in MOD_NAMES:
+                sys.exit("unknown modifier %r (use %s)" % (m, "/".join(MOD_NAMES)))
+            mods |= MOD_NAMES[m]
+        if name not in KEY_NAMES:
+            sys.exit("unknown key %r (try F1, TAB, SPACE, LEFT, a letter or a digit)"
+                     % name)
+        combos.append((KEY_NAMES[name], mods))
+    return combos
 
 
 def parse_semver(text):
@@ -58,7 +99,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", type=int, default=5010)
-    ap.add_argument("--hz", type=int, default=120)
+    ap.add_argument("--hz", type=int, default=90)
     ap.add_argument("--range", type=int, default=900, dest="range_deg",
                     help="hardware rotation range in degrees (900 or 270)")
     ap.add_argument("--static", type=float, default=None, metavar="DEG",
@@ -78,7 +119,14 @@ def main():
                     help="4 hex chars, as adiona-firstboot.sh derives from the MAC")
     ap.add_argument("--no-box-report", action="store_true",
                     help="omit AB01 entirely, to test a headset against an old box")
+    ap.add_argument("--keys", default="",
+                    help="comma-separated keystrokes to send on a loop, e.g. "
+                         "'F1,TAB,CTRL+S,SHIFT+LEFT'")
+    ap.add_argument("--key-period", type=float, default=2.0, dest="key_period",
+                    help="seconds between keystrokes when --keys is given")
     args = ap.parse_args()
+
+    combos = parse_keys(args.keys)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -116,6 +164,14 @@ def main():
     seq = tick = 0
     t0 = time.monotonic()
     next_send = t0
+
+    # Keystroke ring, exactly as adiona_keys.py keeps it: the last four, oldest
+    # first, repeated in every packet. Each one is sent as a down followed by an
+    # up, which is what a tap looks like on the wire.
+    key_ring = []
+    key_seq = 0
+    next_key = t0 + args.key_period
+    key_at = 0
 
     while True:
         # Drain every pending subscribe; the newest source address wins.
@@ -167,12 +223,32 @@ def main():
             brake = int((0.5 + 0.5 * math.sin(2.0 * math.pi * t / 7.0)) * 65535)
             flags = FLAG_WHEEL_PRESENT | FLAG_PEDALS_MAPPED | FLAG_RANGE_APPLIED
 
+        if combos:
+            flags |= FLAG_KEYBOARD_PRESENT
+            if now >= next_key:
+                next_key = now + args.key_period
+                code, mods = combos[key_at % len(combos)]
+                key_at += 1
+                for action in (ACTION_DOWN, ACTION_UP):
+                    key_seq = (key_seq + 1) & 0xFFFF
+                    key_ring.append((code, mods, action))
+                key_ring = key_ring[-KEY_SLOTS:]
+                print("key: %s%s" %
+                      ("+".join(n for n, b in MOD_NAMES.items() if mods & b) + "+"
+                       if mods else "",
+                       next(n for n, c in KEY_NAMES.items() if c == code)))
+
+        key_fields = [key_seq, len(key_ring), 0]
+        for k in key_ring:
+            key_fields += list(k)
+        key_fields += [0, 0, 0] * (KEY_SLOTS - len(key_ring))
+
         seq = (seq + 1) & 0xFFFFFFFF
         tick += 1
         t_us = int(time.monotonic_ns() // 1000) & 0x7FFFFFFF
         try:
             sock.sendto(STATE_FMT.pack(STATE_MAGIC, seq, flags, 0, steer,
-                                       throttle, brake, 0, t_us), sub)
+                                       throttle, brake, 0, t_us, *key_fields), sub)
             if tick % info_every == 0:
                 name = b"" if args.no_wheel else args.name.encode("utf-8")[:48]
                 sock.sendto(INFO_FMT.pack(INFO_MAGIC, args.range_deg, flags, name), sub)

@@ -360,8 +360,9 @@ sudo systemctl start adiona-wheel
 
 - **`"present": false`** → the kernel never enumerated it. `dmesg | tail`, try
   another port/cable. A G920 must finish its power-up calibration sweep first.
-- **`"present": true, "mapped": false`** → unrecognised device. Press **C** on the
-  box's keyboard and map the three axes (see README).
+- **`"present": true, "mapped": false`** → unrecognised device. Press **F12** on
+  the box's keyboard, pick the **Steering wheel** tab, and map the three axes
+  (see README).
 - **`"subscriber": null`** → the headset isn't asking. Confirm it joined *this*
   box's SSID and that Controller Type is "Wheel over LAN". The headset derives the
   box address as `<its own /24>.1`, exactly like the video path.
@@ -369,16 +370,50 @@ sudo systemctl start adiona-wheel
   Confirm with `--dump` (one axis moving for both), then check the driver's
   `combine_pedals` parameter is `0`.
 - **Steering is backwards or over/under-sensitive** → range and axis assignment are
-  box-side (press **C**); the sensitivity and curve sliders are headset-side.
+  box-side (**F12** → *Steering wheel*); the sensitivity and curve sliders are
+  headset-side.
 
 The headset holds no device knowledge at all, so a wheel problem is almost always
 on the box. `tools/wheel-sim.py` settles it: if the game drives correctly against
-the simulator, the fault is in the wheel service or the device, not the game.
+the simulator, the fault is in the wheel service or the device, not the game. It
+sends keystrokes too — `--keys F1,TAB,CTRL+S` — which is the same test for the
+LAN keyboard.
+
+---
+
+## Verifying the LAN keyboard
+
+1. Plug a USB keyboard into the box. Press **F12** — the settings panel opens,
+   **← →** switch tabs, **Esc** closes. That much works with no headset at all.
+2. Start a headset casting. Press **F12** again: the video should step aside
+   within about a second and come back a second after **Esc**.
+3. With the panel closed, press **Tab** — the *headset* toggles its debug
+   overlay. **F1** opens the game's help screen. Neither does anything to the box.
+
+```bash
+curl -s localhost:8090/ui | python3 -m json.tool   # devices, forwarding, F12 count
+journalctl -u adiona-wheel -n 30                   # 'keyboard ... grabbed/released'
+```
+
+- **`"present": false`** → the device was not recognised as a keyboard. It must
+  report the letters and Enter and must have no absolute axes (that rule is what
+  keeps the wheel from being grabbed). `sudo evtest` to see what it does report.
+- **`"forwarding": false` with a keyboard present** → no headset is subscribed
+  (check `/wheel` for `subscriber`), the panel is open, or the updater is
+  prompting. All three are deliberate.
+- **Keys reach the box's browser instead of the headset** → the grab is not
+  held; same causes as above, or `KEYS_ENABLED="0"` in `box.conf`.
+- **F12 does nothing** → `journalctl -u adiona-wheel | grep keyboard` for an
+  import failure. The page falls back to handling F12 itself when the bridge is
+  not running, so the settings stay reachable either way.
+- **Nothing reaches the game, but the wheel works** → the app is older than the
+  box. `AW02` needs the matching Adiona-G build; the headset's LAN wheel status
+  line says "display box software too old" for the reverse case.
 
 ### Latency
 
 Expect **~10–25 ms**, wheel to game physics. Unlike the video path there is no
-encoder in the way, and every packet is a full snapshot at 120 Hz, so loss shows up
+encoder in the way, and every packet is a full snapshot at 90 Hz, so loss shows up
 as a few ms of staleness rather than a stuck control.
 
 ---

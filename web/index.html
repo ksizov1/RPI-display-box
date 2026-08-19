@@ -77,12 +77,25 @@
   #sv-txt { width: 68vw;   height: 6.66vw;
             background-size: 123.87% 710.53%; background-position: 47.569% 67.457%; }
 
-  /* Keyboard-driven upstream-Wi-Fi setup overlay (no mouse — arrows/Tab/Enter/Esc). */
-  #wifi { position: fixed; inset: 0; z-index: 10; display: flex;
-          align-items: center; justify-content: center;
-          background: rgba(255, 255, 255, 0.98);
-          font-family: system-ui, "DejaVu Sans", sans-serif; color: #1a1a1a; }
-  #wifi.wifi-hidden { display: none; }
+  /* The settings panel: one card behind F12, two tabs (no mouse — arrows for the
+     tabs and the lists, Tab between the fields, Enter/Esc). Both screens used to
+     have a hotkey of their own; they were merged because every other key now
+     belongs to the headset, and one thing to remember from across a room beats
+     two. */
+  #settings { position: fixed; inset: 0; z-index: 10; display: flex;
+              align-items: center; justify-content: center;
+              background: rgba(255, 255, 255, 0.98);
+              font-family: system-ui, "DejaVu Sans", sans-serif; color: #1a1a1a; }
+  #settings.settings-hidden { display: none; }
+  .set-tabs { display: flex; align-items: center; gap: 1vmin; margin-bottom: 2vmin;
+              padding-bottom: 1vmin; border-bottom: 2px solid #e0e0e0; }
+  .set-tab { font-size: 2.4vmin; font-weight: 600; padding: 0.9vmin 2.4vmin;
+             border: 2px solid transparent; border-radius: 1vmin;
+             background: none; color: #777; }
+  .set-tab.on { background: #e8f0fe; color: #1a73e8; }
+  .set-tab:focus { outline: none; border-color: #1a73e8; }
+  .set-hint { margin-left: auto; font-size: 1.7vmin; color: #888; white-space: nowrap; }
+  .set-pane.pane-hidden { display: none; }
   .wifi-card { width: min(860px, 92vw); max-height: 94vh; display: flex; flex-direction: column; }
   .wifi-title { font-size: 3.4vmin; font-weight: 700; text-align: center; }
   .wifi-note { font-size: 1.9vmin; color: #555; text-align: center; margin: 1vmin 0 2vmin; line-height: 1.4; }
@@ -129,14 +142,8 @@
   .band-hint:empty { display: none; }   /* reserve no space when it has nothing to say */
   .band-hint.warn { color: #c1121f; }
 
-  /* Keyboard-driven USB wheel setup overlay. Same shell as the Wi-Fi overlay —
-     the operator drives both from the same keyboard on the same TV, so they
-     deliberately look and behave identically. */
-  #wheel { position: fixed; inset: 0; z-index: 10; display: flex;
-           align-items: center; justify-content: center;
-           background: rgba(255, 255, 255, 0.98);
-           font-family: system-ui, "DejaVu Sans", sans-serif; color: #1a1a1a; }
-  #wheel.wheel-hidden { display: none; }
+  /* USB wheel setup — the second tab of the same card, so it deliberately looks
+     and behaves identically to the Wi-Fi one. */
   .whl-dev { font-size: 2.2vmin; text-align: center; color: #555; margin-bottom: 2vmin; }
   .whl-dev b { color: #111; }
   .whl-rows { border: 2px solid #ccc; border-radius: 1vmin; background: #fff; }
@@ -210,58 +217,67 @@
   <div id="sv-txt" class="sv"></div>
 </div>
 
-<!-- Upstream-internet Wi-Fi setup (opened with the 'W' key; keyboard-only) -->
-<div id="wifi" class="wifi-hidden">
-  <div class="wifi-card">
-    <div class="wifi-title">Internet (upstream) Wi-Fi setup</div>
-    <div class="wifi-note">
-      Connects this box to an existing Wi-Fi for <b>internet</b> (repeater) via the USB adapter.<br>
-      This is <b>not</b> the headset network <b id="wifiApName">Adiona-TV</b> — that one stays fixed.
-    </div>
-    <div id="wifiList" class="wifi-list" tabindex="0" role="listbox"
-         aria-label="Available and saved networks"></div>
-    <div class="wifi-fields">
-      <label>Network (SSID)
-        <input id="wifiSsid" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
-      <label>Password (blank = use saved)
-        <input id="wifiPass" type="password" autocomplete="off"></label>
-    </div>
-    <div class="wifi-btns">
-      <button id="wifiConnect">Connect</button>
-      <button id="wifiForget">Forget</button>
-      <button id="wifiRescan">Rescan</button>
-      <button id="wifiClose">Close (Esc)</button>
-    </div>
-    <div class="wifi-band">
-      <div class="band-row">
-        <span id="bandCurrent" class="band-current"></span>
-        <button id="bandToggle">Switch</button>
-      </div>
-      <!-- Carries text ONLY when it says something the operator needs: the
-           reason the switch is unavailable, or the confirm warning. Empty and
-           collapsed the rest of the time. -->
-      <div id="bandHint" class="band-hint"></div>
-    </div>
-    <div id="wifiMsg" class="wifi-msg"></div>
-  </div>
-</div>
+<!-- Adiona-TV settings, opened with F12 (keyboard-only).
+     F12 is the ONLY key this box keeps for itself: while a headset is subscribed
+     the keyboard is grabbed and every other keystroke goes to the headset, so
+     there is no room for a per-screen hotkey any more. See adiona_keys.py.
 
-<!-- USB wheel setup (opened with the 'C' key; keyboard-only).
-     Lives here rather than in the headset because the person mapping the wheel
-     is standing at this box with the wheel in their hands, and this is a big
-     screen. The headset never learns anything about the device. -->
-<div id="wheel" class="wheel-hidden">
+     The wheel tab lives here rather than in the headset because the person
+     mapping a wheel is standing at this box with the wheel in their hands, and
+     this is a big screen. The headset never learns anything about the device. -->
+<div id="settings" class="settings-hidden">
   <div class="wifi-card">
-    <div class="wifi-title">Steering wheel setup</div>
-    <div id="whlDev" class="whl-dev"></div>
-    <div id="whlRows" class="whl-rows" tabindex="0" role="listbox"
-         aria-label="Wheel axis assignments"></div>
-    <div id="whlAxes" class="whl-axes"></div>
-    <div class="wifi-btns">
-      <button id="whlSave">Save (S)</button>
-      <button id="whlClose">Close (Esc)</button>
+    <div class="set-tabs" role="tablist" aria-label="Adiona-TV settings">
+      <button id="tabWifi" class="set-tab on" role="tab" aria-selected="true"
+              aria-controls="paneWifi">Internet Wi-Fi</button>
+      <button id="tabWheel" class="set-tab" role="tab" aria-selected="false"
+              aria-controls="paneWheel">Steering wheel</button>
+      <span class="set-hint">← → switch tab &nbsp;·&nbsp; Esc close</span>
     </div>
-    <div id="whlMsg" class="wifi-msg"></div>
+
+    <div id="paneWifi" class="set-pane" role="tabpanel" aria-labelledby="tabWifi">
+      <div class="wifi-note">
+        Connects this box to an existing Wi-Fi for <b>internet</b> (repeater) via the USB adapter.<br>
+        This is <b>not</b> the headset network <b id="wifiApName">Adiona-TV</b> — that one stays fixed.
+      </div>
+      <div id="wifiList" class="wifi-list" tabindex="0" role="listbox"
+           aria-label="Available and saved networks"></div>
+      <div class="wifi-fields">
+        <label>Network (SSID)
+          <input id="wifiSsid" type="text" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
+        <label>Password (blank = use saved)
+          <input id="wifiPass" type="password" autocomplete="off"></label>
+      </div>
+      <div class="wifi-btns">
+        <button id="wifiConnect">Connect</button>
+        <button id="wifiForget">Forget</button>
+        <button id="wifiRescan">Rescan</button>
+        <button id="wifiClose">Close (Esc)</button>
+      </div>
+      <div class="wifi-band">
+        <div class="band-row">
+          <span id="bandCurrent" class="band-current"></span>
+          <button id="bandToggle">Switch</button>
+        </div>
+        <!-- Carries text ONLY when it says something the operator needs: the
+             reason the switch is unavailable, or the confirm warning. Empty and
+             collapsed the rest of the time. -->
+        <div id="bandHint" class="band-hint"></div>
+      </div>
+      <div id="wifiMsg" class="wifi-msg"></div>
+    </div>
+
+    <div id="paneWheel" class="set-pane pane-hidden" role="tabpanel" aria-labelledby="tabWheel">
+      <div id="whlDev" class="whl-dev"></div>
+      <div id="whlRows" class="whl-rows" tabindex="0" role="listbox"
+           aria-label="Wheel axis assignments"></div>
+      <div id="whlAxes" class="whl-axes"></div>
+      <div class="wifi-btns">
+        <button id="whlSave">Save (S)</button>
+        <button id="whlClose">Close (Esc)</button>
+      </div>
+      <div id="whlMsg" class="wifi-msg"></div>
+    </div>
   </div>
 </div>
 
@@ -328,8 +344,7 @@
     var line = net === true ? (dot(true) + "Internet via " + esc(how || "uplink")) :
                net === false ? (dot(false) + "No internet (local network only)") :
                (dot(null) + "Internet status unknown");
-    var hint = up.wifi_present ?
-      "&nbsp;&nbsp;&nbsp;<span class='hint'>Keyboard: press W to set up internet (upstream Wi-Fi)</span>" : "";
+    var hint = "&nbsp;&nbsp;&nbsp;<span class='hint'>Keyboard: press F12 for settings</span>";
 
     // Wheel line. Worth its own row on the splash: at an event the first thing
     // that goes wrong is a wheel that did not enumerate, and this answers it
@@ -339,8 +354,7 @@
     if (wh.present) {
       wline = "<br>" + dot(!!wh.mapped) + "Wheel: <b>" + esc(wh.name || "unknown") + "</b>" +
         (wh.range_deg ? (" &nbsp;·&nbsp; " + wh.range_deg + "°") : "") +
-        (wh.mapped ? "" : " &nbsp;·&nbsp; not mapped") +
-        "&nbsp;&nbsp;&nbsp;<span class='hint'>Keyboard: press C for wheel setup</span>";
+        (wh.mapped ? "" : " &nbsp;·&nbsp; not mapped");
     }
     elUplink.innerHTML = line + hint + wline;
   }
@@ -502,7 +516,11 @@
   var pollFailures = 0;
 
   function poll() {
-    fetch("/state", { cache: "no-store" }).then(function (r) { return r.json(); })
+    // ?ui=1 identifies this as the PAGE polling, not kiosk-session.sh, which
+    // fetches the same endpoint. The controller only believes the settings panel
+    // is open — and only keeps the video suspended for it — while these keep
+    // arriving, so a crashed or reloading page cannot black out the box.
+    fetch("/state?ui=1", { cache: "no-store" }).then(function (r) { return r.json(); })
       .then(function (s) {
         state = s;
         // Two reasons to reload, both meaning "the HTML behind us may have
@@ -552,7 +570,7 @@
         // would be invisible work, and the picture is moving anyway. Nor over the
         // update prompt — burning in for three minutes is a smaller problem than
         // hiding a question that installs software.
-        if (!wifiOpen && !wheelOpen && !updateOpen && !s.casting &&
+        if (!settingsOpen && !updateOpen && !s.casting &&
             (Date.now() - lastChangeMs) > IDLE_MS) saverStart();
       })
       .catch(function () {
@@ -565,14 +583,13 @@
       });
   }
 
-  // ── Upstream Wi-Fi setup overlay (keyboard-only: W opens, arrows/Tab/Enter/Esc) ──
-  var wifiEl = document.getElementById("wifi");
+  // ── Upstream Wi-Fi tab (keyboard-only: arrows/Tab/Enter) ──────────────────
   var wifiListEl = document.getElementById("wifiList");
   var elSsid = document.getElementById("wifiSsid");
   var elPass = document.getElementById("wifiPass");
   var elWifiMsg = document.getElementById("wifiMsg");
   var elApName = document.getElementById("wifiApName");
-  var wifiOpen = false, wifiItems = [], wifiSel = 0;
+  var wifiItems = [], wifiSel = 0;
 
   function wifiPost(p) {
     return fetch("/wifi", { method: "POST", body: JSON.stringify(p) }).then(function (r) { return r.json(); });
@@ -720,9 +737,9 @@
       renderBand(w);
     }).catch(function () {});
   }
-  function wifiShow(open) { wifiOpen = open; wifiEl.classList.toggle("wifi-hidden", !open); }
+  // Entering the Wi-Fi tab: always a fresh scan. A list of networks from the last
+  // time someone opened this — possibly a different venue — is worse than none.
   function openWifi() {
-    wifiShow(true);
     elApName.textContent = state.ssid || "the headset network";
     elSsid.value = ""; elPass.value = ""; wifiSel = 0;
     bandArmed = false;          // never reopen with a confirm still primed
@@ -760,20 +777,19 @@
   document.getElementById("wifiConnect").addEventListener("click", doConnect);
   document.getElementById("wifiForget").addEventListener("click", doForget);
   document.getElementById("wifiRescan").addEventListener("click", doRescan);
-  document.getElementById("wifiClose").addEventListener("click", function () { wifiShow(false); });
+  document.getElementById("wifiClose").addEventListener("click", function () { settingsShow(false); });
 
-  // ── USB wheel setup overlay (keyboard-only: C opens, arrows/Enter/S/Esc) ──
+  // ── USB wheel setup tab (keyboard-only: arrows/Enter/S) ───────────────────
   // Two presses per role: Enter arms detection (which zeroes the service's
   // per-axis excursion counters), you move the control, Enter again assigns
   // whichever axis moved most. Detecting by largest excursion rather than by
   // "which axis is non-zero" means a wheel resting off-centre, or a pedal that
   // idles at half scale, cannot be mistaken for the one you just moved.
-  var wheelEl = document.getElementById("wheel");
   var whlRowsEl = document.getElementById("whlRows");
   var whlAxesEl = document.getElementById("whlAxes");
   var elWhlDev = document.getElementById("whlDev");
   var elWhlMsg = document.getElementById("whlMsg");
-  var wheelOpen = false, whlSel = 0, whlArmed = false, whlTimer = 0;
+  var whlSel = 0, whlArmed = false, whlTimer = 0;
   var whl = { present: false, axes: {}, map: {}, range_deg: 900 };
 
   var WHL_ROLES = [
@@ -903,16 +919,14 @@
       .catch(function () {});
   }
 
-  function wheelShow(open) {
-    wheelOpen = open;
-    wheelEl.classList.toggle("wheel-hidden", !open);
+  // 10 Hz only while the wheel TAB is the one on screen — not merely while the
+  // panel is open. Off the rest of the time: this page sits on a waiting screen
+  // for hours and has no business polling then.
+  function wheelPolling(on) {
     if (whlTimer) { clearInterval(whlTimer); whlTimer = 0; }
-    // 10 Hz only while the overlay is up. Off the rest of the time — this page
-    // sits on a waiting screen for hours and has no business polling then.
-    if (open) whlTimer = setInterval(loadWheel, 100);
+    if (on) whlTimer = setInterval(loadWheel, 100);
   }
   function openWheel() {
-    wheelShow(true);
     whlSel = 0; whlArmed = false;
     whlMsg("Select a control with ↑ ↓, press Enter, then move it.");
     loadWheel();
@@ -988,7 +1002,96 @@
     }
   });
   document.getElementById("whlSave").addEventListener("click", whlSave);
-  document.getElementById("whlClose").addEventListener("click", function () { wheelShow(false); });
+  document.getElementById("whlClose").addEventListener("click", function () { settingsShow(false); });
+
+  // ── The settings panel itself (F12) ───────────────────────────────────────
+  // F12 does NOT arrive here as a keypress. While a headset is subscribed the
+  // wheel service holds the keyboard exclusively — that is exactly what lets
+  // every other key reach the headset — so Chromium sees nothing at all. The
+  // reader counts F12 presses instead and this page follows that counter.
+  //
+  // It follows the COUNTER rather than an open/closed flag on purpose: when the
+  // keyboard is NOT grabbed (no headset, panel already open, update prompt up)
+  // Chromium receives the very same F12, and a flag would be toggled twice.
+  var settingsEl = document.getElementById("settings");
+  var TABS = ["wifi", "wheel"];
+  var paneEls = { wifi: document.getElementById("paneWifi"),
+                  wheel: document.getElementById("paneWheel") };
+  var tabEls = { wifi: document.getElementById("tabWifi"),
+                 wheel: document.getElementById("tabWheel") };
+  var settingsOpen = false, settingsTab = "wifi";
+
+  // Tell the box what the panel is doing. The reader cannot see Esc or a mouse
+  // click once it has let go of the keyboard, so this is the only way it learns
+  // the panel closed and can take the keys back — and it is what
+  // kiosk-session.sh watches to suspend the video while the panel is up.
+  function uiReport() {
+    fetch("/ui", { method: "POST",
+                   body: JSON.stringify({ open: settingsOpen, tab: settingsTab }) })
+      .catch(function () {});
+  }
+
+  function setTab(tab) {
+    if (TABS.indexOf(tab) < 0) tab = "wifi";
+    settingsTab = tab;
+    TABS.forEach(function (t) {
+      paneEls[t].classList.toggle("pane-hidden", t !== tab);
+      tabEls[t].classList.toggle("on", t === tab);
+      tabEls[t].setAttribute("aria-selected", t === tab ? "true" : "false");
+    });
+    wheelPolling(settingsOpen && tab === "wheel");
+    if (!settingsOpen) return;
+    if (tab === "wifi") openWifi(); else openWheel();
+    uiReport();
+  }
+
+  function settingsShow(open, tab) {
+    settingsOpen = open;
+    settingsEl.classList.toggle("settings-hidden", !open);
+    if (open) {
+      setTab(tab || settingsTab);            // reports on our behalf
+    } else {
+      wheelPolling(false);
+      uiReport();
+    }
+  }
+
+  function cycleTab(dir) {
+    var i = TABS.indexOf(settingsTab);
+    setTab(TABS[(i + dir + TABS.length) % TABS.length]);
+  }
+
+  tabEls.wifi.addEventListener("click", function () { setTab("wifi"); });
+  tabEls.wheel.addEventListener("click", function () { setTab("wheel"); });
+
+  // Long poll. Deliberately not a fast repeating one: this box sits on its
+  // waiting screen for hours and has no business generating traffic then, which
+  // is the same reason the wheel tab only polls while it is on screen.
+  // uiReader false means that counter cannot move — the wheel service is down,
+  // the keyboard module failed to import, or KEYS_ENABLED=0. Nothing is holding
+  // the keyboard in that case, so F12 reaches this page and we act on it here
+  // instead. Without this fallback a broken keyboard bridge would take the Wi-Fi
+  // setup with it, which is the one screen that must never become unreachable.
+  var uiSeq = -1, uiReader = false;
+  function uiPoll() {
+    fetch("/ui?seq=" + uiSeq + "&reader=" + (uiReader ? "1" : "0"), { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (u) {
+        uiReader = !!u.reader;
+        var seq = u.panel_seq || 0;
+        // uiSeq < 0 is the first answer: it only establishes where the counter
+        // is. A box that has been running for hours must not open the panel
+        // just because this page reloaded. A counter that went BACKWARDS means
+        // the wheel service restarted, which is a resync and not a keypress.
+        if (uiSeq >= 0 && seq > uiSeq && (seq - uiSeq) % 2 === 1) {
+          // Parity, because presses can arrive faster than this page re-arms.
+          settingsShow(!settingsOpen);
+        }
+        uiSeq = seq;
+        setTimeout(uiPoll, 0);
+      })
+      .catch(function () { setTimeout(uiPoll, 1000); });
+  }
 
   // ── Software update prompt ────────────────────────────────────────────────
   // The updater owns every decision here: whether there is an update, whether now
@@ -1142,8 +1245,18 @@
     // Someone is at the keyboard: dismiss the screensaver and restart the
     // countdown before anything else looks at the key.
     noteActivity();
+    // F12 belongs to the box, never to the browser and never to a dialog on this
+    // page. Normally the toggle arrives through /ui — the reader sees the key
+    // even when Chromium cannot — and acting on it here as well would toggle
+    // twice in the states where we do receive it. The exception is a reader that
+    // is not running at all, where this is the only way in.
+    if (e.key === "F12") {
+      e.preventDefault();
+      if (!uiReader) settingsShow(!settingsOpen);
+      return;
+    }
     // The update prompt is checked FIRST and swallows everything. It is drawn
-    // over the two setup overlays, and the wifiOpen branch below returns early —
+    // over the settings panel, and the settingsOpen branch below returns early —
     // so anywhere later in this chain its Y/N would be eaten by whatever dialog
     // happens to be open underneath.
     if (updateOpen) {
@@ -1155,22 +1268,36 @@
       } else if (e.key === "Escape" && (upd.state === "ok" || upd.state === "failed")) {
         updShow(false); e.preventDefault();     // dismiss the result banner early
       }
-      // Everything else is deliberately dropped: W and C must not open a dialog
-      // underneath a question that is about to install software.
+      // Everything else is deliberately dropped: nothing may act underneath a
+      // question that is about to install software.
       return;
     }
-    if (wifiOpen) { if (e.key === "Escape") { wifiShow(false); e.preventDefault(); } return; }
-    if (wheelOpen) {
-      if (e.key === "Escape") { wheelShow(false); e.preventDefault(); }
-      else if (e.key === "s" || e.key === "S") { whlSave(); e.preventDefault(); }
+    if (settingsOpen) {
+      if (e.key === "Escape") { settingsShow(false); e.preventDefault(); }
+      else if ((e.key === "s" || e.key === "S") && settingsTab === "wheel") {
+        whlSave(); e.preventDefault();
+      } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") &&
+                 !e.defaultPrevented && !isTextField(e.target)) {
+        // Tab switching is on the arrows, NOT on Tab: Tab is the only way to
+        // reach the password field. defaultPrevented is what gives the controls
+        // inside a pane first refusal — the network list and the wheel rows
+        // already consume the arrows they care about while bubbling to here.
+        cycleTab(e.key === "ArrowRight" ? 1 : -1);
+        e.preventDefault();
+      }
       return;
     }
-    if (e.key === "w" || e.key === "W") { openWifi(); }
-    else if (e.key === "c" || e.key === "C") { openWheel(); }
+    // Nothing else is ours. Every other key either belongs to the headset (the
+    // keyboard is grabbed, so we never see it) or to nobody.
   });
+
+  function isTextField(el) {
+    return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA");
+  }
 
   poll();
   setInterval(poll, 1000);
+  uiPoll();
 })();
 </script>
 </body>

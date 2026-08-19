@@ -102,6 +102,16 @@ WHEEL_STATUS_PATH = os.path.join(RUN_DIR, "wheel.json")
 WHEEL_CMD_PATH = os.path.join(RUN_DIR, "wheel-cmd.json")
 WHEEL_CMD_SEQ = [0]
 
+# ── USB keyboard bridge ──────────────────────────────────────────────────────
+# Same arrangement again, for adiona_keys.py inside the wheel service. It reads
+# the box's keyboard, and while it holds that keyboard exclusively (so the
+# keystrokes can go to the headset) the kiosk page cannot see a single key —
+# including the F12 that opens the settings panel. So F12 arrives here as a
+# counter in keys.json, and the page reports back through keys-cmd.json.
+KEYS_STATUS_PATH = os.path.join(RUN_DIR, "keys.json")
+KEYS_CMD_PATH = os.path.join(RUN_DIR, "keys-cmd.json")
+KEYS_CMD_SEQ = [0]
+
 # ── Software update bridge ───────────────────────────────────────────────────
 # Identical arrangement to the wheel bridge above, and for the same reason: the
 # updater must be able to restart — which applying an update forces it to do —
@@ -137,8 +147,28 @@ STATE = {
     # to a summary here; the full axis dump lives behind /wheel so the /state
     # poll every kiosk page runs stays small.
     "wheel": {"present": False},
+    # True while the settings panel is open on the kiosk page. kiosk-session.sh
+    # watches this and takes the video player down for the duration: the player's
+    # Wayland surface is mapped ON TOP of Chromium, so nothing the page draws is
+    # visible — or focusable — while a headset is casting.
+    "panel": False,
     "version": read_version(),
 }
+
+# Monotonic time of the page's last panel report, and what it said. Held outside
+# STATE because the panel is only believed while the page is demonstrably alive:
+# a crashed or reloading page must not be able to suppress the video for ever.
+PANEL = {"open": False, "tab": "wifi", "at": 0.0}
+# Monotonic time of the last /state fetch that identified itself as the PAGE
+# (?ui=1). Deliberately not UI_SEEN: kiosk-session.sh polls /state as well, so
+# UI_SEEN cannot tell a live page from a live shell loop.
+PAGE_SEEN = [0.0]
+# How long a panel report is trusted without hearing from the page again. It
+# polls at 1 Hz, so this is five missed polls.
+PANEL_TTL = 5.0
+# How long GET /ui holds a connection open waiting for the F12 counter to move.
+# Well inside any proxy or browser idle timeout, and the page re-arms instantly.
+UI_POLL_HOLD = 25.0
 
 
 def wheel_status():
@@ -209,6 +239,48 @@ def wheel_command(data):
     except OSError as e:
         return {"ok": False, "message": "wheel service unreachable: %s" % e}
     return {"ok": True, "message": action}
+
+
+def keys_status():
+    """Read the keyboard bridge's status file. Absent service == no keyboard."""
+    try:
+        with open(KEYS_STATUS_PATH) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {"present": False, "panel_seq": 0, "forwarding": False}
+
+
+def keys_panel_report(data):
+    """Record what the kiosk page says its settings panel is doing.
+
+    The page is authoritative about this — it also closes on Esc and on a mouse
+    click, neither of which the reader can see once it has released the keyboard.
+    Nothing else is accepted here: this endpoint exists solely so the reader
+    knows when to take the keyboard back."""
+    is_open = bool(data.get("open"))
+    tab = str(data.get("tab", "wifi"))
+    if tab not in ("wifi", "wheel"):
+        tab = "wifi"
+    with LOCK:
+        PANEL["open"] = is_open
+        PANEL["tab"] = tab
+        PANEL["at"] = time.monotonic()
+        PAGE_SEEN[0] = PANEL["at"]          # a POST is proof the page is alive
+        STATE["panel"] = is_open
+
+    KEYS_CMD_SEQ[0] += 1
+    cmd = {"open": is_open, "tab": tab, "seq": KEYS_CMD_SEQ[0]}
+    tmp = KEYS_CMD_PATH + ".tmp"
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        with open(tmp, "w") as fh:
+            json.dump(cmd, fh)
+        os.replace(tmp, KEYS_CMD_PATH)
+    except OSError as e:
+        # Not fatal: with no wheel service there is no keyboard bridge to tell,
+        # and the panel still works because nothing took the keys away.
+        return {"ok": False, "message": "keyboard bridge unreachable: %s" % e}
+    return {"ok": True}
 
 
 def update_status():
@@ -842,13 +914,70 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _ui_wait(self, query):
+        """
+        Long poll for the F12 counter.
+
+        Returns as soon as adiona_keys' panel_seq differs from the value the page
+        already has, or after UI_POLL_HOLD seconds. A long poll rather than a
+        fast repeating one because this box sits on its waiting screen for hours
+        at a time and has no business generating traffic then — the same reason
+        the wheel overlay only polls while it is on screen.
+
+        The page follows the COUNTER, not an open/closed flag: when the keyboard
+        is not grabbed (no headset, panel already open, update prompt) Chromium
+        receives the very same F12 we do, and a flag would then be toggled twice.
+
+        `reader` says whether that counter can move at all — false when the wheel
+        service is down, when adiona_keys failed to import, or when KEYS_ENABLED
+        is 0. The page falls back to acting on the F12 keypress itself then, so a
+        broken keyboard bridge cannot make the settings unreachable. It is
+        returned as a change trigger of its own, so the page learns within a poll
+        that the reader has appeared and stops handling F12 twice.
+        """
+        want = -1
+        want_reader = None
+        for part in query.split("&"):
+            key, _, val = part.partition("=")
+            if key == "seq":
+                try:
+                    want = int(val)
+                except ValueError:
+                    want = -1
+            elif key == "reader":
+                want_reader = val == "1"
+        deadline = time.monotonic() + UI_POLL_HOLD
+        while True:
+            status = keys_status()
+            seq = int(status.get("panel_seq", 0))
+            reader = bool(status.get("enabled"))
+            if seq != want or reader != want_reader or time.monotonic() >= deadline:
+                return {
+                    "panel_seq": seq,
+                    "reader": reader,
+                    "present": bool(status.get("present")),
+                    "forwarding": bool(status.get("forwarding")),
+                    "devices": status.get("devices", []),
+                }
+            time.sleep(0.05)
+
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
+        path, _, query = self.path.partition("?")
         if path == "/state":
             now = time.monotonic()
             seen_ago = (now - UI_SEEN[0]) if UI_SEEN[0] else None
             UI_SEEN[0] = now
             with LOCK:
+                # ?ui=1 marks a fetch by the kiosk PAGE rather than by
+                # kiosk-session.sh, which polls this endpoint too. Only the page
+                # can close the settings panel, so only the page's own polls may
+                # keep `panel` alive — otherwise a crashed or reloading page
+                # would suppress the video until someone power-cycled the box.
+                if "ui=1" in query:
+                    PAGE_SEEN[0] = now
+                if STATE["panel"] and (now - PAGE_SEEN[0]) > PANEL_TTL:
+                    STATE["panel"] = False
+                    PANEL["open"] = False
                 snapshot = dict(STATE)
             # Built per request, not in selection_loop: SCAN_INTERVAL is 2 s but
             # the page polls at 1 Hz, so an update countdown assembled in the loop
@@ -864,6 +993,10 @@ class Handler(BaseHTTPRequestHandler):
             # Full status including the live axis dump — this is what the setup
             # overlay polls at 10 Hz while the operator is mapping the wheel.
             self._send(200, json.dumps(wheel_status()).encode("utf-8"),
+                       "application/json")
+            return
+        if path == "/ui":
+            self._send(200, json.dumps(self._ui_wait(query)).encode("utf-8"),
                        "application/json")
             return
         # Serve any asset in WEB_DIR (index.html, splash.png, …).
@@ -882,7 +1015,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path not in ("/wifi", "/wheel", "/update"):
+        if path not in ("/wifi", "/wheel", "/update", "/ui"):
             self._send(404, b"not found", "text/plain")
             return
         try:
@@ -897,6 +1030,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/update":
             self._send(200, json.dumps(update_command(data)).encode("utf-8"),
+                       "application/json")
+            return
+        if path == "/ui":
+            self._send(200, json.dumps(keys_panel_report(data)).encode("utf-8"),
                        "application/json")
             return
         action = data.get("action")

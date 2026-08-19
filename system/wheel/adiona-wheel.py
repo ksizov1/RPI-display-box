@@ -11,7 +11,7 @@ already at every event, becomes the wheel's radio.
 Design notes, in the order they matter:
 
   1. SEMANTIC, NOT RAW. This service owns all device knowledge: it identifies
-     the wheel, maps its axes to steer/gas/brake, and sends a fixed 28-byte
+     the wheel, maps its axes to steer/gas/brake, and sends a fixed 48-byte
      packet of *game* quantities (steering degrees, throttle, brake). The
      headset carries no per-device table at all. That is deliberate — adding a
      new wheel model is a 30-second `deploy.ps1` to one box, not an APK rebuild
@@ -23,15 +23,21 @@ Design notes, in the order they matter:
      that a dropped packet could corrupt.
 
   3. FIXED-RATE ABSOLUTE SNAPSHOTS. We send the latest complete state every
-     8.3 ms whether or not the wheel moved. A lost packet therefore costs 8.3 ms
+     11 ms whether or not the wheel moved. A lost packet therefore costs 11 ms
      of staleness rather than sticking a stale value until the next physical
      movement — which is what an event-driven design would do on a link with no
-     retransmission. 28 B x 120 Hz is ~3.4 KB/s, nothing next to the video.
+     retransmission. 48 B x 90 Hz is ~4.3 KB/s, nothing next to the video.
 
   4. NO IPC SOCKETS. Status goes to /run/adiona/wheel.json, commands arrive via
      /run/adiona/wheel-cmd.json. adiona_controller.py reads/writes those files
      for the on-TV setup UI. Neither service can take the other down, and either
      can restart independently.
+
+  5. IT CARRIES THE KEYBOARD TOO. The same packet carries the last four
+     keystrokes from a USB keyboard plugged into the box, so the operator's one
+     keyboard drives the headset as well as this box's own settings screens. See
+     adiona_keys.py — that module is imported defensively, and a fault in it
+     costs the keyboard and nothing else.
 
 evdev is read directly with struct + ioctl: stdlib only, nothing to
 pip-install on the image (same rule as adiona_controller.py).
@@ -86,9 +92,11 @@ def load_conf(path):
 
 CONF = load_conf(CONF_PATH)
 WHEEL_PORT = int(CONF.get("WHEEL_PORT", "5010"))
-TX_HZ = int(CONF.get("WHEEL_TX_HZ", "120"))
+TX_HZ = int(CONF.get("WHEEL_TX_HZ", "90"))
 DEFAULT_RANGE_DEG = int(CONF.get("WHEEL_DEFAULT_RANGE_DEG", "900"))
 DEFAULT_AUTOCENTER_PCT = int(CONF.get("WHEEL_AUTOCENTER_PCT", "50"))
+KEYS_ENABLED = CONF.get("KEYS_ENABLED", "1") not in ("0", "false", "no")
+KEYS_REPEAT_HZ = int(CONF.get("KEYS_REPEAT_HZ", "10"))
 
 TX_INTERVAL = 1.0 / TX_HZ
 INFO_EVERY = max(1, TX_HZ // 2)          # INFO at ~2 Hz
@@ -98,18 +106,49 @@ HOUSEKEEP_HZ = 20                        # status write + command poll rate
 
 STATUS_PATH = os.path.join(RUN_DIR, "wheel.json")
 CMD_PATH = os.path.join(RUN_DIR, "wheel-cmd.json")
+# Same status/command pair for the keyboard bridge, read and written by
+# adiona_controller.py on behalf of the kiosk page.
+KEYS_STATUS_PATH = os.path.join(RUN_DIR, "keys.json")
+KEYS_CMD_PATH = os.path.join(RUN_DIR, "keys-cmd.json")
 # Written by adiona-updater.py. Read-only here, and entirely optional: a box with
 # no updater service just reports zero flags.
 UPDATE_STATUS_PATH = os.path.join(RUN_DIR, "update.json")
 
+# The keyboard bridge is imported defensively. It is a convenience; the wheel is
+# not. A syntax error or a missing file here must cost the keyboard and leave the
+# steering, the pedals and the box's version report exactly as they were —
+# Restart=always would otherwise turn it into a two-second crash loop.
+KEYS_IMPORT_ERROR = ""
+try:
+    if HERE not in sys.path:
+        sys.path.insert(0, HERE)
+    import adiona_keys
+except Exception as e:                             # deliberately broad
+    # `as e` is unbound once the block ends, so the reason is copied out here.
+    adiona_keys = None
+    KEYS_IMPORT_ERROR = str(e) or e.__class__.__name__
+
 # ── Wire format ──────────────────────────────────────────────────────────────
-# STATE, 28 bytes, little-endian. A `reserved` u16 sits after `flags` purely so
+# STATE, 48 bytes, little-endian. A `reserved` u16 sits after `flags` purely so
 # steer_deg lands on a 4-byte boundary; it is not optional padding, it is part
 # of the format and must stay zero.
-#   magic 'AW01' | seq u32 | flags u16 | reserved u16
+#   magic 'AW02' | seq u32 | flags u16 | reserved u16
 #   steer_deg f32 | throttle u16 | brake u16 | buttons u32 | t_us i32
-STATE_FMT = struct.Struct("<4sIHHfHHIi")
-STATE_MAGIC = b"AW01"
+#   key_seq u16 | key_count u8 | reserved u8 | keys[4]
+#
+# keys[] is the last four keystrokes from the box's USB keyboard, oldest first;
+# entry i has id = key_seq - key_count + 1 + i and each is
+#   code u16 (Godot keycode, see adiona_keys.GODOT_KEYS) | mods u8 | action u8
+#
+# Riding in the wheel packet rather than in one of its own is what makes the
+# keyboard reliable for free: there is no send scheduling and no retransmit
+# anywhere, because a keystroke stays in the ring until four newer ones push it
+# out and is therefore transmitted ~90 times. It also survives the headset's
+# receive loop keeping only the NEWEST packet of each drain and discarding the
+# rest — a keystroke that lived in one packet alone would be thrown away there.
+KEY_SLOTS = 4
+STATE_FMT = struct.Struct("<4sIHHfHHIiHBB" + "HBB" * KEY_SLOTS)
+STATE_MAGIC = b"AW02"
 
 # INFO, 56 bytes, ~2 Hz. Tells the headset the configured hardware range so it
 # can derive its own full-lock angle (range / 2) without a device table.
@@ -129,11 +168,11 @@ INFO_MAGIC = b"AI01"
 #   os_major u16 | os_minor u16 | uptime_s u32
 #   app_str 20s (NUL-padded) | os_str 24s (NUL-padded)
 #
-# The version lives in the magic, as with AW01/AI01 — there is no separate wire
+# The version lives in the magic, as with AW02/AI01 — there is no separate wire
 # version field. The headset dispatches on SIZE first, so any field added here
 # changes the size and is already a new dispatch case.
 #
-# PACKET SIZES 28 (STATE), 56 (INFO) and 64 (BOX) ARE TAKEN. Any future message
+# PACKET SIZES 48 (STATE), 56 (INFO) and 64 (BOX) ARE TAKEN. Any future message
 # must avoid all three, or the headset's size-then-magic dispatch will confuse it.
 BOX_APP_LEN = 20
 BOX_OS_LEN = 24
@@ -158,6 +197,7 @@ FLAG_WHEEL_PRESENT = 1 << 0
 FLAG_PEDALS_MAPPED = 1 << 1
 FLAG_RANGE_APPLIED = 1 << 2
 FLAG_BUTTONS_MAPPED = 1 << 3   # at least one button role is bound on this wheel
+FLAG_KEYBOARD_PRESENT = 1 << 4  # a USB keyboard is plugged into the box
 
 # The `buttons` field carries SEMANTIC ROLES, not raw button bits. Same principle
 # as the axes: the box knows which physical button is the left paddle, the
@@ -336,7 +376,7 @@ WHEEL_PROFILES = [
     },
     # No G29 entry on purpose. It is the same driver family, but its pedal axis
     # order has not been measured, and a WRONG profile is far worse than none:
-    # an unknown wheel falls through to the on-TV mapping UI (press C on the
+    # an unknown wheel falls through to the on-TV mapping UI (press F12 on the
     # box), whereas a wrong one silently puts the throttle on the brake pedal.
     # Add it here only after confirming it the same way this one was.
 ]
@@ -564,9 +604,33 @@ STATE = {
     "subscriber": None,
     "tx_hz": TX_HZ,
     "seq": 0,
+    "keyboard": False,        # a USB keyboard is plugged into the box
 }
 
 RUNNING = True
+
+# The keyboard bridge, once main() has started it. None means no keyboard on this
+# box, the module failed to import, or KEYS_ENABLED=0 — in all three cases every
+# keystroke field on the wire stays zero and the headset simply never sees a key.
+KEYS = [None]
+
+
+def keys_fields():
+    """The keystroke half of STATE_FMT, flattened for pack()."""
+    empty = (0, 0, 0) + (0, 0, 0) * KEY_SLOTS
+    reader = KEYS[0]
+    if reader is None:
+        return empty
+    seq, ring = reader.snapshot()
+    ring = list(ring)[-KEY_SLOTS:]
+    fields = [seq, len(ring), 0]
+    for code, mods, action in ring:
+        fields += [code, mods, action]
+    # Unused slots stay zero. The headset reads only the first key_count of them,
+    # so their contents are irrelevant — but a zeroed tail makes a hex dump of a
+    # captured packet readable, which is worth more than the microsecond.
+    fields += [0, 0, 0] * (KEY_SLOTS - len(ring))
+    return tuple(fields)
 
 
 def norm_symmetric(raw, info, centre=None):
@@ -831,7 +895,7 @@ def open_wheel():
             (name, path, {r: mapping[r]["code"] for r in ROLES if mapping.get(r)}))
     else:
         log("wheel '%s' on %s — NO MAPPING. Map it from the box's TV "
-            "(press C on the kiosk screen)." % (name, path))
+            "(press F12 on the kiosk screen)." % (name, path))
     # Applied whether or not the axes are mapped: centring is a property of the
     # wheel, not of whether we know which axis is the throttle.
     wheel.apply_autocenter()
@@ -839,26 +903,46 @@ def open_wheel():
 
 
 # ── Status + command files ───────────────────────────────────────────────────
-def write_status():
+def write_json(path, body):
+    """Publish a status file atomically. Silent on failure: /run may not exist
+    yet on a workstation, and no status file is worth a traceback."""
     try:
         os.makedirs(RUN_DIR, exist_ok=True)
     except OSError:
         return
-    with LOCK:
-        body = json.dumps(STATE)
-    tmp = STATUS_PATH + ".tmp"
+    tmp = path + ".tmp"
     try:
         with open(tmp, "w") as fh:
             fh.write(body)
-        os.replace(tmp, STATUS_PATH)
+        os.replace(tmp, path)
     except OSError:
         pass
 
 
-def read_command(last_seq):
+def write_status():
+    with LOCK:
+        body = json.dumps(STATE)
+    write_json(STATUS_PATH, body)
+
+
+def write_keys_status():
+    """Publish the keyboard bridge's state for the kiosk page.
+
+    Written even with no keyboard attached, so the page can tell "no keyboard on
+    this box" apart from "the wheel service is not running"."""
+    reader = KEYS[0]
+    status = reader.status() if reader else {
+        "present": False, "devices": [], "forwarding": False,
+        "panel_seq": 0, "panel_open": False, "tab": "wifi", "key_seq": 0,
+    }
+    status["enabled"] = KEYS_ENABLED and adiona_keys is not None
+    write_json(KEYS_STATUS_PATH, json.dumps(status))
+
+
+def read_command(last_seq, path=CMD_PATH):
     """Return (seq, command dict) if a newer command is waiting, else (last_seq, None)."""
     try:
-        with open(CMD_PATH) as fh:
+        with open(path) as fh:
             cmd = json.load(fh)
     except (OSError, ValueError):
         return last_seq, None
@@ -934,6 +1018,8 @@ def sender_thread(sock):
                 flags |= FLAG_RANGE_APPLIED
             if STATE["button_map"]:
                 flags |= FLAG_BUTTONS_MAPPED
+            if STATE["keyboard"]:
+                flags |= FLAG_KEYBOARD_PRESENT
             steer = STATE["steer_deg"]
             throttle = int(round(STATE["throttle"] * 65535))
             brake = int(round(STATE["brake"] * 65535))
@@ -943,8 +1029,10 @@ def sender_thread(sock):
             STATE["seq"] = seq
 
         t_us = int(time.monotonic_ns() // 1000) & 0x7FFFFFFF
+        # Read the keystroke ring here, not under the lock above: it has its own,
+        # and holding both at once is the shape a deadlock grows from.
         pkt = STATE_FMT.pack(STATE_MAGIC, seq, flags, 0, steer,
-                             throttle, brake, buttons, t_us)
+                             throttle, brake, buttons, t_us, *keys_fields())
         try:
             sock.sendto(pkt, addr)
             if tick % INFO_EVERY == 0:
@@ -962,10 +1050,16 @@ def sender_thread(sock):
 def housekeeping_thread(get_wheel, do_command):
     """Publish status and poll for setup commands from the controller."""
     last_seq = 0
+    last_keys_seq = 0
     interval = 1.0 / HOUSEKEEP_HZ
     ticks = 0
     while RUNNING:
+        reader = KEYS[0]
+        if reader is not None:
+            with LOCK:
+                STATE["keyboard"] = reader.present()
         write_status()
+        write_keys_status()
         # The updater's status file only needs reading at the rate we transmit
         # it, not at the 20 Hz this loop runs at.
         if ticks % HOUSEKEEP_HZ == 0:
@@ -977,10 +1071,45 @@ def housekeeping_thread(get_wheel, do_command):
                 do_command(cmd)
             except Exception as e:              # a bad command must never kill us
                 log("command failed: %s" % e)
+        # The panel's open/closed state, straight from the kiosk page. It is the
+        # only thing that can tell the reader to let go of the keyboard, because
+        # a page that has the keys is a page we cannot hear.
+        last_keys_seq, keys_cmd = read_command(last_keys_seq, KEYS_CMD_PATH)
+        if keys_cmd and reader is not None:
+            try:
+                reader.set_panel(bool(keys_cmd.get("open")), keys_cmd.get("tab"))
+            except Exception as e:
+                log("panel command failed: %s" % e)
         time.sleep(interval)
 
 
 # ── Main loop ────────────────────────────────────────────────────────────────
+def subscriber_live():
+    """True while a headset's ASUB keepalives are still arriving.
+
+    The keyboard bridge gates its exclusive grab on this: with no headset there
+    is nowhere to send a keystroke, so taking the keyboard away from Chromium
+    would cost the Ctrl+Alt+F2 shell and buy nothing."""
+    addr = SUBSCRIBER["addr"]
+    return bool(addr) and (time.monotonic() - SUBSCRIBER["seen"]) <= SUBSCRIBER_TIMEOUT
+
+
+def start_keyboard():
+    """Bring up the USB keyboard bridge, or explain in the log why not."""
+    if adiona_keys is None:
+        log("keyboard bridge unavailable: %s" % KEYS_IMPORT_ERROR)
+        return
+    if not KEYS_ENABLED:
+        log("keyboard bridge disabled (KEYS_ENABLED=0)")
+        return
+    reader = adiona_keys.KeyReader(
+        log, repeat_hz=KEYS_REPEAT_HZ, enabled=True,
+        update_status_path=UPDATE_STATUS_PATH, subscriber_live=subscriber_live)
+    KEYS[0] = reader
+    threading.Thread(target=reader.run, daemon=True).start()
+    log("keyboard bridge started (repeat %d Hz)" % KEYS_REPEAT_HZ)
+
+
 def publish_wheel(wheel):
     """Copy the wheel's live values into STATE for the sender and the UI."""
     if wheel is None:
@@ -1043,6 +1172,7 @@ def main():
     read_box_info()
     log("box report: v%s on %s (id %04X)" %
         (BOX_INFO["app_str"] or "?", BOX_INFO["os_str"] or "?", BOX_INFO["box_id"]))
+    start_keyboard()
 
     current = {"wheel": None}
 

@@ -154,6 +154,11 @@ while true; do
     state_json="$(curl -sf --max-time 2 "$STATE_URL" 2>/dev/null)"
     casting="$(printf '%s' "$state_json" \
             | sed -n 's/.*"casting"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')"
+    # The settings panel (F12) is drawn by Chromium, which the video surface
+    # covers completely. So the panel being open is a reason to take the player
+    # down even mid-session.
+    panel="$(printf '%s' "$state_json" \
+            | sed -n 's/.*"panel"[[:space:]]*:[[:space:]]*\(true\|false\).*/\1/p')"
 
     # A sustained false->true edge means a NEW cast session on the headset: the app
     # was restarted, Live Stream was toggled, or the resolution changed. Each of
@@ -199,6 +204,20 @@ while true; do
         have_stream=0
     fi
 
+    # Settings panel open: pretend the stream stopped, which takes the player
+    # down through the ordinary path below and reveals Chromium underneath.
+    #
+    # Forcing have_stream rather than just calling stop_player is deliberate and
+    # necessary: udp_datagrams() counts NoPorts too (see its comment), so the RTP
+    # the headset is still sending keeps last_rtp_at fresh with nothing bound to
+    # :5004 — have_stream would stay 1 and the retry path would put the video
+    # straight back over the panel on the very next poll.
+    panel_open=0
+    if [ "$panel" = "true" ]; then
+        panel_open=1
+        have_stream=0
+    fi
+
     # Gated ONLY on frames actually arriving - deliberately not on the controller's
     # `mode`. `mode` depends on the headset appearing in `iw station dump` and
     # answering an HTTP probe, and a single missed poll used to tear the player
@@ -219,7 +238,9 @@ while true; do
         fi
     else
         if running "$player_pid"; then
-            if [ "$have_stream" = "0" ]; then
+            if [ "$panel_open" = "1" ]; then
+                log "settings panel opened - suspending the video"
+            else
                 log "no RTP for ${STREAM_TIMEOUT_SEC}s - returning to the waiting screen"
             fi
             stop_player

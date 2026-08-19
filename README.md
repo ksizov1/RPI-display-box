@@ -74,20 +74,38 @@ a headset is casting. (If a `cage` build won't stack them, set
 
 ### Keys on the box
 
-A USB keyboard is the only on-box control. Every key works on the waiting screen;
-none of them do anything while a headset is casting, because the video surface
-covers the page completely.
+A USB keyboard plugged into the box is **the headset's keyboard**. Adiona-G
+already accepts a keyboard paired to the Quest over Bluetooth, so the operator
+used to need two; now the box relays its keystrokes over the LAN and one does
+both jobs. Everything the game's key table lists works from here — see
+[LAN keyboard](#lan-keyboard) for how it travels.
+
+**F12 is the one key the box keeps for itself**, and it never reaches the
+headset. It opens the settings panel, which now holds both setup screens as tabs.
 
 | Key | Does |
 |---|---|
-| **W** | Wi-Fi uplink setup — scan, join, and the radio band plan switch |
-| **C** | Wheel calibration — assign axes and rotation range for an unrecognised wheel |
+| **F12** | Open/close the settings panel. Works while a headset is casting: the video is suspended for as long as the panel is up, and returns on its own |
+| **← →** | Switch tab — *Internet Wi-Fi* (scan, join, band plan) and *Steering wheel* (axis assignment, range, centring) |
+| **Tab**, arrows, **Enter** | Move around inside a tab, exactly as they did in the old overlays |
+| **S** | Save the wheel mapping, on the wheel tab |
+| **Esc** | Close the panel |
 | **Y** / **N** | Answer the software-update prompt, when one is up |
-| **Esc** | Close an overlay; dismiss the screensaver |
-| *any key* | Dismiss the screensaver and restart its idle countdown |
+| *everything else* | Goes to the headset |
 
-The update prompt is drawn **above** the Wi-Fi and wheel overlays and takes the
-keyboard while it is up, so its Y/N can never be swallowed by a dialog underneath.
+The update prompt is drawn **above** the settings panel and takes the keyboard
+while it is up, so its Y/N can never be swallowed by a dialog underneath.
+
+> **The keyboard is held exclusively while it is forwarding.** That is what stops
+> **Ctrl+W** and **Ctrl+R** — the game's siren and reverse — from closing and
+> reloading the kiosk browser. Two consequences worth knowing:
+>
+> * `Ctrl+Alt+F2` does not reach the compositor while the grab is held. The grab
+>   is only taken while a headset is **subscribed**, so an idle box behaves
+>   exactly as it always did, and stopping `adiona-wheel` releases the keyboard
+>   immediately (the grab belongs to the open file descriptor, so even a kill
+>   frees it).
+> * Set `KEYS_ENABLED="0"` in `box.conf` to switch the bridge off entirely.
 
 ### Display rules
 
@@ -184,7 +202,7 @@ rotation range, and streams. A G920 or G29 works with no setup at all.
 
 `adiona-wheel.py` reads the wheel from `/dev/input/event*` (raw evdev via `ioctl`,
 stdlib only), maps its axes to steering/gas/brake, and sends the headset a fixed
-**28-byte packet at 120 Hz on UDP 5010**:
+**48-byte packet at 90 Hz on UDP 5010**:
 
 - **The headset subscribes, the box streams.** The headset sends an 8-byte `ASUB`
   keepalive to `<gateway>:5010` every 500 ms; the box streams back to whatever
@@ -192,9 +210,11 @@ stdlib only), maps its axes to steering/gas/brake, and sends the headset a fixed
   handshake, no session state a dropped packet could corrupt — the same premise as
   the video path, where the box is always the AP's gateway.
 - **Every packet is a complete snapshot, sent at a fixed rate** whether or not the
-  wheel moved. A lost packet therefore costs 8 ms of staleness instead of sticking
+  wheel moved. A lost packet therefore costs 11 ms of staleness instead of sticking
   a stale value until the next physical movement. There is no retransmission and
   no benefit to adding one.
+- **It carries the keyboard too** — the last four keystrokes from a USB keyboard
+  plugged into the box ride in the same packet. See [LAN keyboard](#lan-keyboard).
 - **The box owns all device knowledge.** The headset carries no per-device table:
   it is told the configured rotation range in a 2 Hz `INFO` packet and derives its
   own full-lock angle as half of it (900° → ±450°, about 2.5 turns lock to lock).
@@ -205,16 +225,23 @@ Latency budget, wheel to game physics: ~10–25 ms typical (USB HID poll 1–10,
 interval 0–8, Wi-Fi 1–3, headset frame 0–17).
 
 Three packet **sizes** share port 5010 and are the dispatch key on the headset:
-**28** (wheel state, 120 Hz), **56** (device info, 2 Hz) and **64** (box identity,
-1 Hz — see [Software updates](#what-the-headset-is-told)). Any future message must
-avoid all three.
+**48** (wheel state + keystrokes, 90 Hz), **56** (device info, 2 Hz) and **64**
+(box identity, 1 Hz — see [Software updates](#what-the-headset-is-told)). Any
+future message must avoid all three.
+
+> The state packet was 28 bytes (`AW01`) up to v1.6.16 and is 48 (`AW02`) from
+> v1.7.0. Both the size and the magic changed, so an older APK ignores the new
+> packet rather than misreading it — **the box and the app must be updated
+> together.** `LanWheelManager.MIN_BOX_VERSION` reports the mismatch as "box too
+> old" on the headset's status line instead of failing silently.
 
 ## Setting up an unrecognised wheel
 
 Anything not in `WHEEL_PROFILES` needs its axes identified once. Do it from the
 box's own screen — you are standing there with the wheel in your hands:
 
-1. Press **C** on a keyboard attached to the box (waiting screen, not mid-stream).
+1. Press **F12** on a keyboard attached to the box and select the **Steering
+   wheel** tab with **→**. This works mid-stream too — the video steps aside.
 2. Pick a control with **↑ ↓**, press **Enter**, move that control through its full
    travel, press **Enter** again to assign the axis that moved most.
 3. Set **Range** to 900° or 270° on the last row.
@@ -247,6 +274,73 @@ driver has combined the pedals and they cannot be separated here.
 Settings → **Controller Type → Wheel over LAN**. Nothing changes for any other
 controller type until that is selected. **Settings → Steering Wheel (LAN) Setup**
 shows the link status and the sensitivity/curve sliders.
+
+---
+
+# LAN keyboard
+
+Adiona-G takes its commands from a keyboard — F1 for help, F2 for options, Space
+to reset, Ctrl+S to re-centre the wheel, Shift/Alt+arrows for the mirrors — and on
+the Quest that meant pairing a second keyboard over Bluetooth. The box already has
+one plugged into it for its own setup screens, so it forwards that one instead.
+
+**Nothing to configure.** Plug a keyboard into any USB port. If a headset is
+subscribed, its keys go to the headset; if none is, the box behaves as it always
+did. Both is impossible by construction — see the grab, below.
+
+## How it works
+
+`adiona_keys.py` reads every keyboard under `/dev/input/event*` (the same raw
+evdev approach as the wheel) and keeps a ring of the **last four keystrokes**,
+which `adiona-wheel.py` packs into every wheel packet. There is no send
+scheduling, no burst and no retransmit anywhere:
+
+- A keystroke stays in the ring until four newer ones push it out, so it is
+  **transmitted ~90 times** before it could be lost. Losing one costs a missed
+  command and nothing else — there is no held-key state on the wire to go stale,
+  and therefore no key that can stick down.
+- It also survives the headset's receive loop keeping only the **newest** packet
+  of each drain: a keystroke that lived in one packet alone would be discarded
+  there.
+- Each keystroke is `(key, modifiers, down/repeat/up)`. **Ctrl, Alt and Shift are
+  never sent as keystrokes** — they ride as flags on the key they modify, which is
+  the only form the game ever looks at. Auto-repeat is throttled to
+  `KEYS_REPEAT_HZ` (the kernel's own ~33 Hz is far too fast for a key that steps a
+  mirror).
+- The wire carries **Godot keycodes**, not evdev ones. Same principle as the
+  wheel's axes: the box owns the device knowledge and the headset carries no
+  translation table.
+
+## The grab
+
+While it is forwarding, the bridge holds the keyboard **exclusively**
+(`EVIOCGRAB`), so cage and Chromium see nothing at all. That is required rather
+than tidy — the game binds `Ctrl+R`, `Ctrl+W`, `Ctrl+P` and `Ctrl+C`, which to a
+kiosk browser mean reload, close-window, print and copy.
+
+It grabs only when **all** of these hold:
+
+| Condition | Why |
+|---|---|
+| A keyboard is present | — |
+| A headset is subscribed | With nowhere to send, grabbing costs the `Ctrl+Alt+F2` shell and buys nothing |
+| The settings panel is closed | The panel is Chromium's, and it needs real keys to type an SSID password |
+| The updater is not asking | Its Y/N is answered by Chromium too |
+
+Transitions are deferred until **no key is physically held**, so the side about to
+lose the device always sees the release of whatever was down — otherwise the F12
+that opens the panel would stay latched forever in the compositor.
+
+If this process dies, the kernel releases the grab with the file descriptor, so a
+crash or a `systemctl stop adiona-wheel` hands the keyboard straight back.
+
+## Checking it
+
+```bash
+curl -s localhost:8090/ui | python3 -m json.tool   # devices, forwarding, F12 count
+cat /run/adiona/keys.json                          # the same, straight from the service
+journalctl -u adiona-wheel -f                      # 'keyboard ... grabbed / released'
+```
 
 ---
 
@@ -407,6 +501,7 @@ system/
                        adiona-player.sh  → GStreamer RTP receiver (+ --probe)
   controller/          controller unit
   wheel/               adiona-wheel.py — USB racing wheel → headset (+ unit)
+                       adiona_keys.py  — USB keyboard → headset, in the same packet
   updater/             adiona-updater.py — checks, offers and stages releases
                        apply-update.sh   — the only thing that switches releases
                        update-key.pub    — verifies the signed release manifest
@@ -418,7 +513,7 @@ tools/
   verify-signing.sh    prove the server signs with the pair of update-key.pub
   test-apply-update.sh sandbox test for the update/rollback machinery (Linux/WSL)
   test-update-e2e.sh   end-to-end check of check → download → apply (Linux/WSL)
-  wheel-sim.py         fake LAN wheel, for testing the game without a Pi
+  wheel-sim.py         fake LAN wheel + keyboard, for testing the game without a Pi
 image/
   pi-gen/              custom pi-gen stage + build config
   assemble-stage.sh    stage the repo files into the pi-gen payload
