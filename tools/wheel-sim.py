@@ -33,21 +33,43 @@ import struct
 import sys
 import time
 
-# Mirrors the wire format in system/wheel/adiona-wheel.py. PACKET SIZES 48
-# (STATE), 56 (INFO) and 64 (BOX) ARE TAKEN — the headset dispatches on size
-# first, so any new message must avoid all three. Change this file and the
-# service together, or the sim stops being a valid stand-in.
+# Mirrors the wire format in system/wheel/adiona-wheel.py — change this file and
+# the service together, or the sim stops being a valid stand-in. The headset
+# dispatches on MAGIC with a per-type minimum length and ignores trailing bytes,
+# so sizes here are documentation rather than a constraint.
 KEY_SLOTS = 4
-STATE_FMT = struct.Struct("<4sIHHfHHIiHBB" + "HBB" * KEY_SLOTS)
-INFO_FMT = struct.Struct("<4sHH48s")
-BOX_FMT = struct.Struct("<4sHHBBBBHHI20s24s")
-SUB_FMT = struct.Struct("<4sI")
-STATE_MAGIC, INFO_MAGIC, BOX_MAGIC, SUB_MAGIC = b"AW02", b"AI01", b"AB01", b"ASUB"
+STATE_FMT = struct.Struct("<4sIHHfHHIiHBB" + "HBB" * KEY_SLOTS)   # 48
+INFO_FMT = struct.Struct("<4sBBHQHH48s")                          # 68
+BOX_FMT = struct.Struct("<4sHHBBBBHHIQ20s24s")                    # 72
+SUB_FMT = struct.Struct("<4sI")                                   # 8 minimum
+SUB_FLAGS_FMT = struct.Struct("<Q")
+SUB_FLAGS_OFFSET = 8
+SUB_FLAGS_SIZE = SUB_FLAGS_OFFSET + SUB_FLAGS_FMT.size            # 16
+STATE_MAGIC, INFO_MAGIC, BOX_MAGIC, SUB_MAGIC = b"AW02", b"AI02", b"AB02", b"ASUB"
 
 FLAG_WHEEL_PRESENT = 1 << 0
 FLAG_PEDALS_MAPPED = 1 << 1
 FLAG_RANGE_APPLIED = 1 << 2
 FLAG_KEYBOARD_PRESENT = 1 << 4
+
+DEVICE_TYPE_WHEEL = 1
+DEVICE_TYPE_SENSORS = 16
+
+# Device capabilities, for --caps. See adiona-wheel.py for the full list.
+CAP_STEERING = 1 << 0
+CAP_PEDALS = 1 << 1
+CAP_BUTTONS = 1 << 5
+CAP_FORCE_FEEDBACK = 1 << 6
+CAP_RANGE_SETTABLE = 1 << 7
+CAP_RANGE_270 = 1 << 8
+CAP_RANGE_900 = 1 << 9
+CAPS_DEFAULT = (CAP_STEERING | CAP_PEDALS | CAP_BUTTONS | CAP_FORCE_FEEDBACK
+                | CAP_RANGE_SETTABLE | CAP_RANGE_270 | CAP_RANGE_900)
+
+BOXCAP_WHEEL = 1 << 0
+BOXCAP_KEYBOARD = 1 << 1
+BOXCAP_CASTING = 1 << 4
+BOXCAPS_DEFAULT = BOXCAP_WHEEL | BOXCAP_KEYBOARD | BOXCAP_CASTING
 
 # Keystrokes, as adiona_keys.py encodes them: a printable key is its uppercase
 # ASCII value, anything else is 0x8000 | the ordinal Godot gives it past
@@ -110,15 +132,24 @@ def main():
                     help="report the box as alive but with no wheel plugged in")
     ap.add_argument("--name", default="Logitech G920 Driving Force Racing Wheel")
     ap.add_argument("--app-version", default="1.5.0", dest="app_version",
-                    help="version the box reports in the 1 Hz AB01 packet")
+                    help="version the box reports in the 1 Hz AB02 packet")
     ap.add_argument("--os-string", default="Debian 13 (trixie)",
-                    dest="os_string", help="OS string reported in AB01 (24 bytes max)")
+                    dest="os_string", help="OS string reported in AB02 (24 bytes max)")
     ap.add_argument("--os-version", default="13", dest="os_version",
-                    help="numeric OS version reported in AB01, e.g. 13 or 12.5")
+                    help="numeric OS version reported in AB02, e.g. 13 or 12.5")
     ap.add_argument("--box-id", default="A3F1", dest="box_id",
                     help="4 hex chars, as adiona-firstboot.sh derives from the MAC")
     ap.add_argument("--no-box-report", action="store_true",
-                    help="omit AB01 entirely, to test a headset against an old box")
+                    help="omit AB02 entirely, to test a headset against an old box")
+    ap.add_argument("--caps", default=None,
+                    help="device capability word, e.g. 0x3E3 — what the fake "
+                         "device claims it can do. Default: a G920-like wheel.")
+    ap.add_argument("--box-caps", default=None, dest="box_caps",
+                    help="box capability word, e.g. 0x17")
+    ap.add_argument("--device-type", type=int, default=DEVICE_TYPE_WHEEL,
+                    dest="device_type",
+                    help="1 = wheel (default), 16 = vehicle sensor pack. Lets a "
+                         "headset be tested against hardware that does not exist yet.")
     ap.add_argument("--keys", default="",
                     help="comma-separated keystrokes to send on a loop, e.g. "
                          "'F1,TAB,CTRL+S,SHIFT+LEFT'")
@@ -127,6 +158,8 @@ def main():
     args = ap.parse_args()
 
     combos = parse_keys(args.keys)
+    caps = CAPS_DEFAULT if args.caps is None else int(args.caps, 0)
+    box_caps = BOXCAPS_DEFAULT if args.box_caps is None else int(args.box_caps, 0)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -140,6 +173,8 @@ def main():
     print("wheel-sim on UDP %d — %d Hz, range %d deg%s" %
           (args.port, args.hz, args.range_deg,
            ", NO WHEEL" if args.no_wheel else ""))
+    print("device: type %d, caps 0x%X — box caps 0x%X" %
+          (args.device_type, caps, box_caps))
     print("box report: v%s on %s%s" %
           (args.app_version, args.os_string,
            " (SUPPRESSED)" if args.no_box_report else ""))
@@ -188,9 +223,17 @@ def main():
                 # carry on rather than dying on a peer that simply went away.
                 sub = None
                 break
+            # Minimum length, not exact — the same rule the real service uses, so
+            # an older APK that sends a bare 8-byte keepalive still subscribes.
             if len(data) >= SUB_FMT.size and data[:4] == SUB_MAGIC:
+                licence = None
+                if len(data) >= SUB_FLAGS_SIZE:
+                    licence = SUB_FLAGS_FMT.unpack_from(data, SUB_FLAGS_OFFSET)[0]
                 if sub != addr:
-                    print("subscriber %s:%d" % addr)
+                    print("subscriber %s:%d  licence %s" %
+                          (addr[0], addr[1],
+                           "not reported (older APK)" if licence is None
+                           else "0x%X" % licence))
                 sub = addr
                 sub_seen = time.monotonic()
 
@@ -249,14 +292,16 @@ def main():
         try:
             sock.sendto(STATE_FMT.pack(STATE_MAGIC, seq, flags, 0, steer,
                                        throttle, brake, 0, t_us, *key_fields), sub)
-            if tick % info_every == 0:
-                name = b"" if args.no_wheel else args.name.encode("utf-8")[:48]
-                sock.sendto(INFO_FMT.pack(INFO_MAGIC, args.range_deg, flags, name), sub)
-            # Offset by one tick so BOX never shares a tick with INFO.
+            # One DEVICE descriptor per attached device — here, the one we fake.
+            if tick % info_every == 0 and not args.no_wheel:
+                sock.sendto(INFO_FMT.pack(
+                    INFO_MAGIC, args.device_type, 0, flags, caps,
+                    args.range_deg, 0, args.name.encode("utf-8")[:48]), sub)
+            # Offset by one tick so BOX never shares a tick with DEVICE.
             if not args.no_box_report and tick % args.hz == 1:
                 sock.sendto(BOX_FMT.pack(
                     BOX_MAGIC, 0, box_id, app_num[0], app_num[1], app_num[2],
-                    2, os_major, os_minor, int(now - t_boot),
+                    2, os_major, os_minor, int(now - t_boot), box_caps,
                     args.app_version.encode("utf-8")[:20],
                     args.os_string.encode("utf-8")[:24]), sub)
         except OSError:

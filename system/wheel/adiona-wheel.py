@@ -17,10 +17,11 @@ Design notes, in the order they matter:
      new wheel model is a 30-second `deploy.ps1` to one box, not an APK rebuild
      and a sideload to every headset.
 
-  2. THE HEADSET SUBSCRIBES, THE BOX STREAMS. The headset sends an 8-byte ASUB
-     keepalive to <gateway>:5010 every 500 ms; we stream to whatever source
-     address that arrived from. No discovery, no handshake, no session state
-     that a dropped packet could corrupt.
+  2. THE HEADSET SUBSCRIBES, THE BOX STREAMS. The headset sends an ASUB
+     keepalive (8 bytes from an older APK, 16 with its licence mask) to
+     <gateway>:5010 every 500 ms; we stream to whatever source address that
+     arrived from. No discovery, no handshake, no session state that a dropped
+     packet could corrupt.
 
   3. FIXED-RATE ABSOLUTE SNAPSHOTS. We send the latest complete state every
      11 ms whether or not the wheel moved. A lost packet therefore costs 11 ms
@@ -113,6 +114,8 @@ KEYS_CMD_PATH = os.path.join(RUN_DIR, "keys-cmd.json")
 # Written by adiona-updater.py. Read-only here, and entirely optional: a box with
 # no updater service just reports zero flags.
 UPDATE_STATUS_PATH = os.path.join(RUN_DIR, "update.json")
+# Existence-checked only, to report BOXCAP_CASTING. Never executed from here.
+PLAYER_PATH = os.environ.get("ADIONA_PLAYER", "/opt/adiona/kiosk/adiona-player.sh")
 
 # The keyboard bridge is imported defensively. It is a convenience; the wheel is
 # not. A syntax error or a missing file here must cost the keyboard and leave the
@@ -129,7 +132,26 @@ except Exception as e:                             # deliberately broad
     KEYS_IMPORT_ERROR = str(e) or e.__class__.__name__
 
 # ── Wire format ──────────────────────────────────────────────────────────────
-# STATE, 48 bytes, little-endian. A `reserved` u16 sits after `flags` purely so
+# Everything on UDP 5010, little-endian. Finalised in v1.7.0, before the first
+# box shipped — after that, changing a field means updating a fleet.
+#
+# DISPATCH: read the 4-byte MAGIC, require the per-type minimum length below,
+# decode the fields you know and IGNORE ANY TRAILING BYTES. Deliberately not
+# dispatch-on-size, which is what this used to do: that made packet sizes a
+# scarce resource ("48, 56 and 64 are taken") and turned every added field into a
+# new message type AND a coordinated release.
+#
+# Two invariants make that work. They are the whole reason this format is final
+# rather than frozen, so do not trade them away for a few bytes:
+#
+#   APPEND ONLY. Never reorder, resize or repurpose an existing field. A new one
+#   goes on the END; a retired one becomes `reserved` and is still sent. A reader
+#   that stops where its knowledge ends keeps working against a newer sender.
+#
+#   RESERVED MEANS ZERO. Senders write zero, readers ignore. That is what lets a
+#   reserved field become real later with no version negotiation.
+#
+# STATE, minimum 48 bytes. A `reserved` u16 sits after `flags` purely so
 # steer_deg lands on a 4-byte boundary; it is not optional padding, it is part
 # of the format and must stay zero.
 #   magic 'AW02' | seq u32 | flags u16 | reserved u16
@@ -150,34 +172,61 @@ KEY_SLOTS = 4
 STATE_FMT = struct.Struct("<4sIHHfHHIiHBB" + "HBB" * KEY_SLOTS)
 STATE_MAGIC = b"AW02"
 
-# INFO, 56 bytes, ~2 Hz. Tells the headset the configured hardware range so it
-# can derive its own full-lock angle (range / 2) without a device table.
-#   magic 'AI01' | range_deg u16 | flags u16 | name 48s (NUL-padded)
-# 48 bytes because "Logitech G920 Driving Force Racing Wheel" is 39 and a
+# DEVICE, minimum 68 bytes, ~2 Hz PER ATTACHED DEVICE. One of these describes
+# one thing plugged into the box: what it is, what it is called, and what it can
+# do. The headset holds no per-device table of its own — same principle as the
+# axis mapping, and the reason supporting new hardware is a deploy to one box.
+#   magic 'AI02' | device_type u8 | device_index u8 | flags u16
+#   capabilities u64 | range_deg u16 | reserved u16 | name 48s (NUL-padded)
+#
+# 48 bytes of name because "Logitech G920 Driving Force Racing Wheel" is 39 and a
 # truncated name on the XR status line looks like a fault.
+#
+# flags vs capabilities is a distinction worth keeping: FLAGS ARE STATE THAT
+# CHANGES WHILE RUNNING, CAPABILITIES ARE FACTS ABOUT THE HARDWARE. A capability
+# answers "could this ever work", a flag answers "is it working now". Blur them
+# and the capability word decays into a second status field.
 NAME_LEN = 48
-INFO_FMT = struct.Struct("<4sHH%ds" % NAME_LEN)
-INFO_MAGIC = b"AI01"
+INFO_FMT = struct.Struct("<4sBBHQHH%ds" % NAME_LEN)
+INFO_MAGIC = b"AI02"
 
-# BOX, 64 bytes, 1 Hz. What this box is running, so the headset can decide
-# whether the wheel stream is usable and how to interpret it. Deliberately NOT
-# folded into INFO: INFO's 56-byte layout is already parsed by shipped APKs, and
-# widening it would be a breaking change needing a coordinated headset release.
-#   magic 'AB01' | flags u16 | box_id u16
+# Device type. Ranges are reserved so a new class of hardware never renumbers an
+# old one; 1-15 are driving controls, 16-31 vehicle sensors.
+DEVICE_TYPE_UNKNOWN = 0
+DEVICE_TYPE_WHEEL = 1
+DEVICE_TYPE_PEDALS = 2               # only when they enumerate separately
+DEVICE_TYPE_SHIFTER = 3
+DEVICE_TYPE_SENSORS = 16             # USB vehicle sensor pack
+
+# Device capabilities. Bits 10-31 are reserved for further input capabilities,
+# 32-47 for vehicle-sensor ones (defined when that hardware lands), 48-63 spare.
+CAP_STEERING = 1 << 0
+CAP_PEDALS = 1 << 1
+CAP_CLUTCH = 1 << 2
+CAP_HANDBRAKE = 1 << 3
+CAP_SHIFTER = 1 << 4
+CAP_BUTTONS = 1 << 5
+CAP_FORCE_FEEDBACK = 1 << 6          # accepts FF_AUTOCENTER
+CAP_RANGE_SETTABLE = 1 << 7          # the sysfs `range` attribute exists
+# Which rotation ranges the device supports, as opposed to range_deg, which is
+# the one currently applied. Lets the headset offer only settings that will work.
+CAP_RANGE_270 = 1 << 8
+CAP_RANGE_900 = 1 << 9
+
+# BOX, minimum 72 bytes, 1 Hz. What this box IS and what it CAN DO, so the
+# headset can decide whether a feature is available without comparing version
+# numbers — which is the thing that ages worst across a fleet on mixed releases.
+#   magic 'AB02' | flags u16 | box_id u16
 #   app_major u8 | app_minor u8 | app_patch u8 | os_id u8
-#   os_major u16 | os_minor u16 | uptime_s u32
+#   os_major u16 | os_minor u16 | uptime_s u32 | box_caps u64
 #   app_str 20s (NUL-padded) | os_str 24s (NUL-padded)
 #
-# The version lives in the magic, as with AW02/AI01 — there is no separate wire
-# version field. The headset dispatches on SIZE first, so any field added here
-# changes the size and is already a new dispatch case.
-#
-# PACKET SIZES 48 (STATE), 56 (INFO) and 64 (BOX) ARE TAKEN. Any future message
-# must avoid all three, or the headset's size-then-magic dispatch will confuse it.
+# Deliberately NOT folded into the device descriptor: one is about the box, the
+# other about a thing plugged into it, and there can be several of the latter.
 BOX_APP_LEN = 20
 BOX_OS_LEN = 24
-BOX_FMT = struct.Struct("<4sHHBBBBHHI%ds%ds" % (BOX_APP_LEN, BOX_OS_LEN))
-BOX_MAGIC = b"AB01"
+BOX_FMT = struct.Struct("<4sHHBBBBHHIQ%ds%ds" % (BOX_APP_LEN, BOX_OS_LEN))
+BOX_MAGIC = b"AB02"
 
 BOX_FLAG_UPDATE_AVAILABLE = 1 << 0
 BOX_FLAG_UPDATE_IN_PROGRESS = 1 << 1
@@ -185,13 +234,36 @@ BOX_FLAG_JUST_UPDATED = 1 << 2       # applied within the last 10 minutes
 BOX_FLAG_UPDATER_PRESENT = 1 << 3
 BOX_FLAG_INTERNET_OK = 1 << 4
 
+# Box capabilities — what this build can do at all, regardless of what is
+# currently plugged in or running. Bits 5-63 reserved.
+BOXCAP_WHEEL = 1 << 0                # this service, so always set
+BOXCAP_KEYBOARD = 1 << 1             # the USB keyboard bridge is present
+BOXCAP_SENSORS = 1 << 2              # USB vehicle sensor support is present
+BOXCAP_UPDATER = 1 << 3
+BOXCAP_CASTING = 1 << 4              # RTP video receiver
+
 BOX_OS_UNKNOWN = 0
 BOX_OS_RASPBIAN = 1
 BOX_OS_DEBIAN = 2
 
-# Subscribe keepalive from the headset.
+# Subscribe keepalive from the headset, minimum 8 bytes:
+#   magic 'ASUB' | nonce u32 | feature_flags u64
+#
+# feature_flags is the headset's ENTIRE licence mask, verbatim — never one bit,
+# never a derived boolean. Bit 2 (in-vehicle sensors) is only its first consumer;
+# carrying the whole word means a future capability is already on the wire the
+# day the licence grants it, with no protocol change here.
+#
+# SUB_FMT DELIBERATELY DESCRIBES ONLY THE FIRST 8 BYTES. It is used as the
+# minimum length in receiver_thread, so widening it to include the flags would
+# silently start rejecting the 8-byte keepalive an older APK sends — the headset
+# would never become a subscriber and the wheel stream would never start at all.
+# Read the tail conditionally instead; see SUB_FLAGS_SIZE.
 SUB_FMT = struct.Struct("<4sI")
 SUB_MAGIC = b"ASUB"
+SUB_FLAGS_FMT = struct.Struct("<Q")
+SUB_FLAGS_OFFSET = 8
+SUB_FLAGS_SIZE = SUB_FLAGS_OFFSET + SUB_FLAGS_FMT.size    # 16
 
 FLAG_WHEEL_PRESENT = 1 << 0
 FLAG_PEDALS_MAPPED = 1 << 1
@@ -418,7 +490,7 @@ def log(msg):
     print("[adiona-wheel] %s" % msg, flush=True)
 
 
-# ── Box report (AB01) ────────────────────────────────────────────────────────
+# ── Box report (AB02) ────────────────────────────────────────────────────────
 # Everything here is cheap and local. It lives in the wheel service rather than
 # in a service of its own because the headset's socket is CONNECTED to
 # <box>:5010 — datagrams from any other source port are dropped by its OS — and
@@ -536,8 +608,25 @@ def read_box_info():
                     box_id=read_box_id(), version_mtime=mtime)
 
 
+def box_capabilities():
+    """What this box CAN do, as opposed to what it is doing right now.
+
+    Derived from what is actually installed rather than inferred from a version
+    number: the headset asks "does this box have a keyboard bridge", not "is it
+    newer than 1.7.0". Version comparisons are the thing that ages worst across a
+    fleet running mixed releases."""
+    caps = BOXCAP_WHEEL                       # this service is the wheel
+    if adiona_keys is not None and KEYS_ENABLED:
+        caps |= BOXCAP_KEYBOARD
+    if os.path.exists(UPDATE_STATUS_PATH):
+        caps |= BOXCAP_UPDATER
+    if os.path.isfile(PLAYER_PATH):
+        caps |= BOXCAP_CASTING
+    return caps
+
+
 def refresh_box_flags():
-    """Fold adiona-updater.py's status file into the AB01 flag bits. An absent or
+    """Fold adiona-updater.py's status file into the AB02 flag bits. An absent or
     unparseable file means zero flags — the updater is optional."""
     try:
         with open(UPDATE_STATUS_PATH) as fh:
@@ -573,7 +662,7 @@ def box_packet():
         BOX_MAGIC, BOX_FLAGS[0] & 0xFFFF, BOX_INFO["box_id"],
         BOX_INFO["app_num"][0], BOX_INFO["app_num"][1], BOX_INFO["app_num"][2],
         BOX_INFO["os_id"], BOX_INFO["os_major"], BOX_INFO["os_minor"],
-        uptime_seconds(),
+        uptime_seconds(), box_capabilities(),
         utf8_fit(BOX_INFO["app_str"], BOX_APP_LEN),
         utf8_fit(BOX_INFO["os_str"], BOX_OS_LEN))
 
@@ -600,11 +689,23 @@ STATE = {
     "steer_raw": None,        # live raw steering, so the UI can show the offset
     "autocenter": DEFAULT_AUTOCENTER_PCT,   # spring-to-centre strength, 0-100%
     "ff_available": False,    # False when the device could not be opened O_RDWR
+    "caps": 0,                # CAP_* word for the attached device, 0 when none
     "axes": {},               # code -> {"value": norm, "excursion": float, "raw": int}
     "subscriber": None,
     "tx_hz": TX_HZ,
     "seq": 0,
     "keyboard": False,        # a USB keyboard is plugged into the box
+    # The headset's ENTIRE licence mask, exactly as it sent it — one integer,
+    # never decomposed into per-feature booleans here or anywhere downstream.
+    # Each consumer tests the bit it cares about; that is what makes the NEXT
+    # licensed feature a one-line change instead of a two-repo one.
+    #
+    # None, not 0: null means "no headset has ever told us", which 0 cannot
+    # express — and a fully-licensed older APK, which sends no mask at all,
+    # would otherwise read as "licensed nothing" and have its options hidden.
+    # Never cleared once set, so the value survives a headset disconnecting
+    # mid-event; freshness, when something needs it, is STATE["subscriber"].
+    "feature_flags": None,
 }
 
 RUNNING = True
@@ -699,6 +800,30 @@ class Wheel:
         self.centre = (mapping or {}).get("centre")
         self.autocenter_pct = int((mapping or {}).get("autocenter", DEFAULT_AUTOCENTER_PCT))
         self.ff_available = writable
+        # Resolved once, here, rather than per packet: sysfs_range_path() walks
+        # the device tree, and the answer cannot change while the device is open.
+        self.range_settable = sysfs_range_path(event_name) is not None
+
+    def capabilities(self):
+        """The device's CAP_* word — what this hardware can do.
+
+        Recomputed rather than cached because the role and button maps change
+        while somebody is setting the wheel up on the box's screen, and the
+        headset should see that as it happens."""
+        caps = 0
+        if self.role_code("steer") is not None:
+            caps |= CAP_STEERING
+        if self.role_code("gas") is not None and self.role_code("brake") is not None:
+            caps |= CAP_PEDALS
+        if self.button_map:
+            caps |= CAP_BUTTONS
+        if self.ff_available:
+            caps |= CAP_FORCE_FEEDBACK
+        if self.range_settable:
+            # Both are offered by the setup UI and validated by the controller;
+            # without a writable range attribute neither can actually be applied.
+            caps |= CAP_RANGE_SETTABLE | CAP_RANGE_270 | CAP_RANGE_900
+        return caps
 
     def close(self):
         try:
@@ -952,6 +1077,32 @@ def read_command(last_seq, path=CMD_PATH):
     return seq, cmd
 
 
+def device_packets():
+    """One AI02 descriptor per device attached to the box.
+
+    CALLER MUST HOLD LOCK. A list rather than a single packet because the USB
+    vehicle sensors will append their own entry here; today it is the wheel or
+    nothing at all.
+
+    The `flags` here describe the DEVICE, not the stream — deliberately narrower
+    than STATE's flags, which also carry the keyboard. Capabilities say what the
+    hardware could ever do; flags say what it is doing now.
+    """
+    if not STATE["present"]:
+        return ()
+    flags = 0
+    if STATE["mapped"]:
+        flags |= FLAG_PEDALS_MAPPED
+    if STATE["range_applied"]:
+        flags |= FLAG_RANGE_APPLIED
+    if STATE["button_map"]:
+        flags |= FLAG_BUTTONS_MAPPED
+    flags |= FLAG_WHEEL_PRESENT
+    return (INFO_FMT.pack(INFO_MAGIC, DEVICE_TYPE_WHEEL, 0, flags,
+                          STATE["caps"], STATE["range_deg"], 0,
+                          utf8_fit(STATE["name"], NAME_LEN)),)
+
+
 # ── Threads ──────────────────────────────────────────────────────────────────
 def receiver_thread(sock):
     """Record the headset's address from its ASUB keepalives."""
@@ -964,12 +1115,23 @@ def receiver_thread(sock):
         except OSError:
             time.sleep(0.2)
             continue
+        # Minimum length, NOT exact: an older APK sends 8 bytes and must still be
+        # able to subscribe, and a newer one may append fields we do not know.
         if len(data) < SUB_FMT.size or data[:4] != SUB_MAGIC:
             continue
+        flags = None
+        if len(data) >= SUB_FLAGS_SIZE:
+            flags = SUB_FLAGS_FMT.unpack_from(data, SUB_FLAGS_OFFSET)[0]
         with LOCK:
             if STATE["subscriber"] != addr[0]:
-                log("subscriber %s" % addr[0])
+                log("subscriber %s%s" %
+                    (addr[0], "" if flags is None
+                     else " (licence 0x%X)" % flags))
             STATE["subscriber"] = addr[0]
+            # Only ever overwritten by a headset that actually sent one, so an
+            # older APK cannot erase what a newer one told us.
+            if flags is not None:
+                STATE["feature_flags"] = flags
         SUBSCRIBER["addr"] = addr
         SUBSCRIBER["seen"] = time.monotonic()
 
@@ -978,8 +1140,8 @@ SUBSCRIBER = {"addr": None, "seen": 0.0}
 
 
 def sender_thread(sock):
-    """Fixed-rate STATE at TX_HZ, INFO at ~2 Hz, BOX at 1 Hz. Never blocks on the
-    wheel.
+    """Fixed-rate STATE at TX_HZ, a DEVICE descriptor per attached device at
+    ~2 Hz, BOX at 1 Hz. Never blocks on the wheel.
 
     `tick` only advances while a subscriber is live (see the `continue` below), so
     every sub-rate cadence here is "per second of streaming", independent of
@@ -1024,9 +1186,11 @@ def sender_thread(sock):
             throttle = int(round(STATE["throttle"] * 65535))
             brake = int(round(STATE["brake"] * 65535))
             buttons = STATE["buttons"]
-            range_deg = STATE["range_deg"]
-            name = STATE["name"]
             STATE["seq"] = seq
+            # Built under the same lock rather than re-read later, so a device
+            # unplugged mid-tick cannot be described half from one state and half
+            # from the next.
+            descriptors = device_packets() if tick % INFO_EVERY == 0 else ()
 
         t_us = int(time.monotonic_ns() // 1000) & 0x7FFFFFFF
         # Read the keystroke ring here, not under the lock above: it has its own,
@@ -1035,12 +1199,13 @@ def sender_thread(sock):
                              throttle, brake, buttons, t_us, *keys_fields())
         try:
             sock.sendto(pkt, addr)
-            if tick % INFO_EVERY == 0:
-                sock.sendto(INFO_FMT.pack(INFO_MAGIC, range_deg, flags,
-                                          name.encode("utf-8")[:NAME_LEN]), addr)
-            # Offset by one tick so this never lands on the same tick as INFO
-            # (INFO_EVERY divides TX_HZ), which would put three datagrams
-            # back to back once a second.
+            # One descriptor per attached device. Today that is the wheel or
+            # nothing; the vehicle sensors will simply add entries.
+            for descriptor in descriptors:
+                sock.sendto(descriptor, addr)
+            # Offset by one tick so this never lands on the same tick as a
+            # DEVICE descriptor (INFO_EVERY divides TX_HZ), which would put
+            # three or more datagrams back to back once a second.
             if tick % TX_HZ == 1:
                 sock.sendto(box_packet(), addr)
         except OSError:
@@ -1125,6 +1290,7 @@ def publish_wheel(wheel):
             STATE["brake"] = 0.0
             STATE["buttons"] = 0
             STATE["axes"] = {}
+            STATE["caps"] = 0
         return
 
     steer, throttle, brake = wheel.read_roles()
@@ -1160,6 +1326,7 @@ def publish_wheel(wheel):
         STATE["steer_raw"] = steer_raw
         STATE["autocenter"] = wheel.autocenter_pct
         STATE["ff_available"] = wheel.ff_available
+        STATE["caps"] = wheel.capabilities()
 
 
 def main():

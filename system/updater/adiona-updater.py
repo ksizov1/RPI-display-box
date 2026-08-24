@@ -204,7 +204,7 @@ def set_state(**kw):
 
 def write_status():
     # Only the long-running service owns /run/adiona/update.json. The wheel
-    # service reads it once a second for the AB01 flags and the controller relays
+    # service reads it once a second for the AB02 flags and the controller relays
     # it into /state, so a one-shot CLI run publishing its own view over it would
     # briefly blank whatever the operator is reading on the TV — including a live
     # update prompt. Every CLI subcommand clears this; main() sets it back before
@@ -1343,7 +1343,7 @@ def main():
         up = Updater()
         up.check(force=True)
         # Deliberately NOT write_status(). /run/adiona/update.json belongs to the
-        # running service: the wheel service reads it for the AB01 flags and the
+        # running service: the wheel service reads it for the AB02 flags and the
         # controller relays it into /state, so publishing this one-shot process's
         # view over it would briefly blank a prompt the operator is reading. Print
         # what this run found instead.

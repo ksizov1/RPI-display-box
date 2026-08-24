@@ -792,6 +792,14 @@
   var whlSel = 0, whlArmed = false, whlTimer = 0;
   var whl = { present: false, axes: {}, map: {}, range_deg: 900 };
 
+  // WARNING before you make any of these rows conditional — which is what
+  // hiding an unlicensed device on this screen will need. The row numbers below
+  // are computed ONCE from WHL_ROLES.length, and whlEnter() dispatches on them
+  // while whlSel indexes WHL_ROLES directly. Hide a row and Range/Centre/Centring
+  // silently shift up by one while the constants still point at the old offsets,
+  // so Enter fires the wrong action with nothing on screen to suggest why.
+  // Derive the indices from the VISIBLE row list first; see /wheel's
+  // `feature_flags` for the licence mask the box is told.
   var WHL_ROLES = [
     { key: "steer", label: "Steering" },
     { key: "gas",   label: "Gas" },

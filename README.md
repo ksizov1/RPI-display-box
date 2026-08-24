@@ -182,7 +182,7 @@ SSID and password are shown on the box's waiting screen so a customer can point
 the Quest at the right network.
 
 Those same four hex digits are the box's **fleet id**, reported to the headset in
-the `AB01` packet and to the licence server on every update check — so a box can
+the `AB02` packet and to the licence server on every update check — so a box can
 be identified from either end without SSH.
 
 ---
@@ -216,24 +216,70 @@ stdlib only), maps its axes to steering/gas/brake, and sends the headset a fixed
 - **It carries the keyboard too** — the last four keystrokes from a USB keyboard
   plugged into the box ride in the same packet. See [LAN keyboard](#lan-keyboard).
 - **The box owns all device knowledge.** The headset carries no per-device table:
-  it is told the configured rotation range in a 2 Hz `INFO` packet and derives its
-  own full-lock angle as half of it (900° → ±450°, about 2.5 turns lock to lock).
-  Supporting a new wheel is a 30-second `deploy.ps1` to one box, not an APK rebuild
-  and a sideload to every headset.
+  it is told what is attached, what it is called and what it can do in a 2 Hz
+  `DEVICE` packet, and derives its own full-lock angle as half the reported range
+  (900° → ±450°, about 2.5 turns lock to lock). Supporting a new wheel is a
+  30-second `deploy.ps1` to one box, not an APK rebuild and a sideload to every
+  headset.
 
 Latency budget, wheel to game physics: ~10–25 ms typical (USB HID poll 1–10, send
 interval 0–8, Wi-Fi 1–3, headset frame 0–17).
 
-Three packet **sizes** share port 5010 and are the dispatch key on the headset:
-**48** (wheel state + keystrokes, 90 Hz), **56** (device info, 2 Hz) and **64**
-(box identity, 1 Hz — see [Software updates](#what-the-headset-is-told)). Any
-future message must avoid all three.
+## The protocol
 
-> The state packet was 28 bytes (`AW01`) up to v1.6.16 and is 48 (`AW02`) from
-> v1.7.0. Both the size and the magic changed, so an older APK ignores the new
-> packet rather than misreading it — **the box and the app must be updated
-> together.** `LanWheelManager.MIN_BOX_VERSION` reports the mismatch as "box too
-> old" on the headset's status line instead of failing silently.
+Four messages share UDP 5010, all little-endian. **Finalised in v1.7.0, before the
+first box shipped** — after that, changing a field means updating a fleet.
+
+| Magic | Direction | Min size | Rate | Carries |
+|---|---|---|---|---|
+| `ASUB` | headset → box | 8 | 2 Hz | subscribe keepalive + the headset's licence mask |
+| `AW02` | box → headset | 48 | 90 Hz | wheel state + the last four keystrokes |
+| `AI02` | box → headset | 68 | 2 Hz *per device* | one attached device: type, name, capabilities, range |
+| `AB02` | box → headset | 72 | 1 Hz | box identity, version and capabilities |
+
+### Extending it safely
+
+**Dispatch on the magic, require the minimum length, and ignore trailing bytes.**
+Both ends do this, and it is what makes the format final rather than frozen: a
+newer box can append a field to any packet and headsets already in the field keep
+working, because they stop reading where their knowledge ends. Two rules keep that
+true, and neither is worth trading for a few bytes:
+
+- **Append only.** Never reorder, resize or repurpose an existing field. A new one
+  goes on the end; a retired one becomes `reserved` and is still sent.
+- **Reserved means zero.** Senders write zero, readers ignore — which is what lets
+  a reserved field become real later with no version negotiation.
+
+This replaced dispatch-on-exact-size, which made packet sizes a scarce resource
+("48, 56 and 64 are taken") and turned every added field into a new message type
+*and* a coordinated release.
+
+### Flags versus capabilities
+
+Both `AI02` and `AB02` carry each. The distinction is worth keeping: **flags are
+state that changes while running; capabilities are facts about the hardware or the
+build.** A capability answers "could this ever work", a flag answers "is it working
+now". So the headset asks *does this box have a keyboard bridge* rather than *is it
+newer than 1.7.0* — version comparisons are the thing that ages worst across a
+fleet on mixed releases. `AI02.capabilities` reserves bits 32–47 for the vehicle
+sensors; `range_deg` reports the range currently applied while `CAP_RANGE_270` /
+`CAP_RANGE_900` say which are supported at all.
+
+### The licence mask
+
+`ASUB` carries the headset's **entire** `feature_flags` word, verbatim — never one
+bit, never a derived boolean. The box uses it only to avoid *offering* hardware the
+licence does not cover; the headset enforces, as it always has, and the box never
+contacts the licence server. Carrying the whole word means a future capability is
+already on the wire the day the licence grants it, so it costs a consumer rather
+than a protocol change. It appears on `/wheel` as `feature_flags`, and is `null`
+until a headset reports one.
+
+> **Older APKs still subscribe.** The box's `ASUB` minimum is 8 bytes, so a headset
+> from before this change registers normally and simply reports no mask. What it
+> cannot do is decode `AW02`/`AI02`/`AB02` — the LAN wheel needs the matching app
+> build, and `LanWheelManager.MIN_BOX_VERSION` reports the reverse mismatch as
+> "box too old" on the headset's status line rather than failing silently.
 
 ## Setting up an unrecognised wheel
 
@@ -348,9 +394,9 @@ journalctl -u adiona-wheel -f                      # 'keyboard ... grabbed / rel
 
 ## What the headset is told
 
-Once a second, on the same UDP socket the wheel already uses, the box sends a
-64-byte `AB01` packet carrying its software version, its OS version, the box's
-fleet id and a few status flags. The headset uses it to decide whether the wheel
+Once a second, on the same UDP socket the wheel already uses, the box sends an
+`AB02` packet carrying its software version, its OS version, the box's fleet id,
+a few status flags and its capability word. The headset uses it to decide whether the wheel
 stream is one it can interpret, and shows it on the LAN wheel settings screen — so
 "which version is that box on?" is answerable from inside the headset rather than
 over SSH.
