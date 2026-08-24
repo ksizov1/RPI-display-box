@@ -99,6 +99,14 @@ DEFAULT_AUTOCENTER_PCT = int(CONF.get("WHEEL_AUTOCENTER_PCT", "50"))
 KEYS_ENABLED = CONF.get("KEYS_ENABLED", "1") not in ("0", "false", "no")
 KEYS_REPEAT_HZ = int(CONF.get("KEYS_REPEAT_HZ", "10"))
 
+# Range assumed for a wheel whose rotation range CANNOT be set — no sysfs
+# `range` attribute, so nothing is being instructed and the figure is pure
+# description. Narrow because that is what such wheels are: the ones with a
+# settable range are the 900-degree Logitechs, and everything else is a small
+# wheel that reaches full lock in about a third of a turn. Deliberately not
+# DEFAULT_RANGE_DEG, which is an instruction to hardware that can obey it.
+UNSETTABLE_RANGE_DEG = 270
+
 TX_INTERVAL = 1.0 / TX_HZ
 INFO_EVERY = max(1, TX_HZ // 2)          # INFO at ~2 Hz
 SUBSCRIBER_TIMEOUT = 3.0                 # drop the subscriber after this silence
@@ -320,6 +328,7 @@ EV_MAX = 0x1F
 EV_FF = 0x15
 FF_GAIN = 0x60
 FF_AUTOCENTER = 0x61
+FF_MAX = 0x7F
 ABS_MAX = 0x3F
 ABS_MT_SLOT = 0x2F                        # presence => touchscreen, not a wheel
 
@@ -351,6 +360,28 @@ def dev_name(fd):
     except OSError:
         return ""
     return buf.split(b"\x00", 1)[0].decode("utf-8", "replace")
+
+
+def dev_has_ff(fd):
+    """True if the device actually implements force feedback.
+
+    Opening the node O_RDWR proves nothing about the hardware — a wheel derived
+    from a gamepad board opens exactly the same way and supports no effects at
+    all. Without this check the box tells the headset that such a wheel
+    self-centres, and reports an autocentre percentage it never applied.
+
+    Deliberately gated on EV_FF rather than on the FF_AUTOCENTER bit
+    specifically: the tighter test cannot be verified here against a G920, and
+    getting it wrong would disable centring on the one wheel that is known to
+    work. A device that advertises EV_FF without autocentring still fails
+    harmlessly at the write, which apply_autocenter already handles.
+    """
+    ev_mask = bytearray(EV_MAX // 8 + 1)
+    try:
+        fcntl.ioctl(fd, EVIOCGBIT(0, len(ev_mask)), ev_mask)
+    except OSError:
+        return False
+    return _bitmask_has(ev_mask, EV_FF)
 
 
 def dev_abs_axes(fd):
@@ -446,22 +477,79 @@ WHEEL_PROFILES = [
         "brake": {"code": "ABS_Z", "invert": True},
         "hw_range_deg": 900,
     },
+    # Doyo L820 — the wheel that ships with many headsets, where it normally
+    # pairs to the Quest over Bluetooth. Plugged into the box over USB instead it
+    # runs at a fraction of the latency, which is the whole reason for this entry.
+    #
+    # IT DOES NOT SAY DOYO ANYWHERE. The board is ShanWan's (USB 2563:0526) and
+    # it enumerates as "shanwan Android GamePad", so `name_match` has to be the
+    # component vendor rather than anything printed on the product. Matching the
+    # vendor alone would also catch a genuine ShanWan gamepad, which is harmless:
+    # such a device already qualifies as a wheel candidate (it has ABS_X and no
+    # touch slots), and this mapping is the sensible one for it anyway. If that
+    # ever needs disambiguating, the vendor:product pair above is the ground truth.
+    #
+    # MEASURED on the attached device, from /proc/bus/input/devices and the box's
+    # own /wheel dump — not guessed:
+    #   steer  ABS_X      8-bit, 0..255, rests at 128 (dead centre, no offset)
+    #   gas    ABS_GAS    rests at 0 and rises when pressed  -> NOT inverted
+    #   brake  ABS_BRAKE  rests at 0 and rises when pressed  -> NOT inverted
+    #
+    # Unlike the G920 this device names its pedal axes semantically, and the
+    # three unused stick axes (ABS_Y/ABS_Z/ABS_RZ) rest at 128 while exactly the
+    # two pedal axes rest at 0 — so the assignment is corroborated from two
+    # directions rather than resting on the excursion test alone.
+    #
+    # NO FORCE FEEDBACK: EV=1b in /proc/bus/input/devices carries no EV_FF bit,
+    # so there is no autocentre to set. The wheel is sprung mechanically.
+    #
+    # NO SETTABLE RANGE either — this is not a hid-logitech-hidpp device and has
+    # no sysfs `range` attribute. hw_range_deg therefore only scales the degrees
+    # reported to the headset, which divides by the very same figure, so it is
+    # display truth rather than feel. 270 is this wheel's physical travel.
+    #
+    # PADDLES, also measured — pressed one at a time while watching event codes:
+    #   left  0x136 BTN_TL   right 0x137 BTN_TR
+    # Corroborated twice over: the evdev names are the shoulder buttons, and the
+    # game's own Doyo entry (Global.HID_DEVICE_ALLOWLIST) reaches the same two
+    # through Godot's joypad buttons 9 and 10, which are the shoulders. Confirm
+    # and cancel share them with drive and reverse, per the convention in
+    # BUTTON_ROLE_BITS: the same paddle means Drive while driving and OK in a menu.
+    {
+        "name_match": "shanwan",
+        "steer": {"code": "ABS_X", "invert": False},
+        "gas": {"code": "ABS_GAS", "invert": False},
+        "brake": {"code": "ABS_BRAKE", "invert": False},
+        "hw_range_deg": 270,
+        "buttons": {
+            "reverse": 0x136, "cancel": 0x136,     # left paddle
+            "drive": 0x137, "confirm": 0x137,      # right paddle
+        },
+    },
     # No G29 entry on purpose. It is the same driver family, but its pedal axis
     # order has not been measured, and a WRONG profile is far worse than none:
     # an unknown wheel falls through to the on-TV mapping UI (press F12 on the
     # box), whereas a wrong one silently puts the throttle on the brake pedal.
-    # Add it here only after confirming it the same way this one was.
+    # Add it here only after confirming it the same way these two were.
 ]
 
 ROLES = ("steer", "gas", "brake")
 
 
 def profile_for(name):
+    """The built-in mapping for a device name, in the same shape as a saved user
+    map — so a profiled wheel and a hand-mapped one take identical paths from
+    here on. `buttons` is carried through when a profile declares it: a wheel
+    whose paddles are known should arrive with its gears working, not just its
+    axes."""
     lowered = name.lower()
     for prof in WHEEL_PROFILES:
         if prof["name_match"] in lowered:
-            return {r: dict(prof[r]) for r in ROLES} | {
-                "hw_range_deg": prof.get("hw_range_deg", DEFAULT_RANGE_DEG)}
+            entry = {r: dict(prof[r]) for r in ROLES}
+            entry["hw_range_deg"] = prof.get("hw_range_deg", DEFAULT_RANGE_DEG)
+            if prof.get("buttons"):
+                entry["buttons"] = dict(prof["buttons"])
+            return entry
     return None
 
 
@@ -794,15 +882,35 @@ class Wheel:
         # role -> EV_KEY code. Populated from the profile/map; empty means the
         # wheel's buttons are unmapped and no roles are ever reported.
         self.button_map = dict((mapping or {}).get("buttons", {}))
-        self.range_deg = (mapping or {}).get("hw_range_deg", DEFAULT_RANGE_DEG)
         self.range_applied = False
         # Raw steering value treated as dead ahead. None = use the axis midpoint.
         self.centre = (mapping or {}).get("centre")
         self.autocenter_pct = int((mapping or {}).get("autocenter", DEFAULT_AUTOCENTER_PCT))
-        self.ff_available = writable
+        # Both halves are required: the node has to be writable AND the device
+        # has to implement force feedback. Writability alone was reported as
+        # "autocentre available" until a Doyo/ShanWan wheel — which opens
+        # perfectly well and supports no effects whatever — showed the claim up.
+        self.ff_available = writable and dev_has_ff(fd)
         # Resolved once, here, rather than per packet: sysfs_range_path() walks
         # the device tree, and the answer cannot change while the device is open.
         self.range_settable = sysfs_range_path(event_name) is not None
+
+        # Rotation range. A profile or a saved map states it outright; otherwise
+        # it depends on whether the range can be SET at all:
+        #
+        #   settable    -> DEFAULT_RANGE_DEG is a real instruction. We write it to
+        #                  the device and the hardware then travels that far.
+        #   not settable-> the number describes the wheel, and nothing more. A
+        #                  small wheel described as 900 deg is simply a false
+        #                  statement: it appears on the headset's status line, in
+        #                  every log, and in the setup screen. Assume the narrow
+        #                  end instead, which is what a wheel without a range
+        #                  attribute almost always is.
+        requested = (mapping or {}).get("hw_range_deg")
+        if requested is None:
+            requested = (DEFAULT_RANGE_DEG if self.range_settable
+                         else UNSETTABLE_RANGE_DEG)
+        self.range_deg = requested
 
     def capabilities(self):
         """The device's CAP_* word — what this hardware can do.
@@ -863,7 +971,8 @@ class Wheel:
         if pct is not None:
             self.autocenter_pct = max(0, min(100, int(pct)))
         if not self.ff_available:
-            log("no write access to %s — autocenter unavailable" % self.path)
+            log("%s has no force feedback — autocenter unavailable "
+                "(the wheel centres mechanically or not at all)" % self.name)
             return False
         try:
             # Full gain first, so the autocenter percentage is absolute rather
@@ -1468,7 +1577,9 @@ def dump():
         print("\n%s  '%s'" % (path, name))
         print("  sysfs range: %s" % (rng or "(none — range not settable)"))
         print("  force feedback (autocenter): %s"
-              % ("available" if writable else "NO — device not writable"))
+              % ("available" if writable and dev_has_ff(fd)
+                 else ("NO — device reports no EV_FF" if writable
+                       else "NO — device not writable")))
         print("  profile:     %s" % (profile_for(name) or "(no built-in match)"))
         for code in sorted(axes):
             a = axes[code]

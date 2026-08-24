@@ -192,11 +192,22 @@ be identified from either end without SSH.
 Good steering wheels — Logitech G920, Fanatec, Thrustmaster — are **USB only**, and
 the Quest cannot take USB peripherals in the field. So the wheel plugs into *this
 box*, which is already the access point at every event, and its readings are
-streamed back to the headset over the same Wi-Fi that carries the video. That
-replaces the Bluetooth Doyo wheel, at roughly an order of magnitude less latency.
+streamed back to the headset over the same Wi-Fi that carries the video, at
+roughly an order of magnitude less latency than Bluetooth.
+
+That includes the **Doyo L820** that ships with many headsets. It pairs to the
+Quest over Bluetooth perfectly well, but plugged into the box over USB instead it
+is the same wheel on a much shorter leash.
 
 **Plug the wheel into any USB port.** `adiona-wheel.service` finds it, applies the
-rotation range, and streams. A G920 or G29 works with no setup at all.
+rotation range where the device supports one, and streams.
+
+| Wheel | Setup needed |
+|---|---|
+| Logitech **G920** | none — built-in profile, 900°, force-feedback centring |
+| **Doyo L820** | none — built-in profile, 270°. Enumerates as `shanwan Android GamePad` (its board is ShanWan's, USB `2563:0526`), so do not look for "Doyo" anywhere on the box |
+| Logitech **G29** | axes must be mapped once, on screen — same driver family as the G920, but its pedal axis order has never been measured here and a wrong profile is worse than none |
+| anything else | axes mapped once, on screen (below), then saved and recognised automatically |
 
 ## How it works
 
