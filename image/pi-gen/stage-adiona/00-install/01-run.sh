@@ -68,6 +68,9 @@ install -m 0644 files/payload/system/networkmanager/10-adiona-wifi.conf \
 # udev: ignore pointer devices so no mouse cursor is ever drawn.
 install -m 0644 files/payload/system/udev/99-adiona-no-pointer.rules \
         "${ROOTFS_DIR}/etc/udev/rules.d/99-adiona-no-pointer.rules"
+# udev: keep modem/MTP probers off the Drive Square sensor boxes' serial ports.
+install -m 0644 files/payload/system/udev/99-adiona-sensors.rules \
+        "${ROOTFS_DIR}/etc/udev/rules.d/99-adiona-sensors.rules"
 
 # Chromium managed policy: suppress the (undismissable in kiosk) save-password bubble.
 install -d "${ROOTFS_DIR}/etc/chromium/policies/managed"

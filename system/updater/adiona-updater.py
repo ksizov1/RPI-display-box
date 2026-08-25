@@ -227,14 +227,18 @@ def write_status():
 
 
 def read_command(last_seq):
-    """Return (seq, command dict) if a newer command is waiting, else (last_seq, None)."""
+    """Return (seq, command dict) if a NEW command is waiting, else (last_seq, None).
+
+    New means the sequence CHANGED, not that it went up — see the same function
+    in adiona-wheel.py for why. Here the command being lost is the operator's Y
+    or N to an update prompt, answered once and never repeated."""
     try:
         with open(CMD_PATH) as fh:
             cmd = json.load(fh)
     except (OSError, ValueError):
         return last_seq, None
     seq = int(cmd.get("seq", 0))
-    if seq <= last_seq:
+    if seq == last_seq:
         return last_seq, None
     return seq, cmd
 

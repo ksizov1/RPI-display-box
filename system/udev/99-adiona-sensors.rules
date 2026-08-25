@@ -1,0 +1,21 @@
+# Adiona-TV: keep modem probers away from the Drive Square USB sensor boxes.
+#
+# They enumerate as USB CDC-ACM, which is exactly what ModemManager goes looking
+# for: on a fresh /dev/ttyACM* it opens the port and writes AT commands at it for
+# several seconds to decide whether it is a modem. On these boxes that lands in
+# the middle of a quaternion stream and produces a burst of truncated lines right
+# when the calibration UI is most likely to be open.
+#
+# ModemManager is NOT installed on this image today, so this rule currently does
+# nothing at all. It is here because it is a NetworkManager recommendation and
+# these boxes join customer venue Wi-Fi — one `apt install` that pulls it in as a
+# dependency would otherwise turn into an intermittent, hard-to-place fault in
+# the one subsystem with no error to show for it. The same applies to the MTP
+# prober, which probes far less but costs nothing to exclude.
+#
+# 1b4f is the vendor id measured on the hardware (9d2f Steering, 9d3f Gas,
+# 9d4f Brake). Matched on the VENDOR only, deliberately: a new box — the EVO
+# one — will carry a new product id and must be covered the day it arrives, not
+# the day someone remembers this file.
+ACTION=="add|change", SUBSYSTEM=="usb", ATTRS{idVendor}=="1b4f", ENV{ID_MM_DEVICE_IGNORE}="1"
+ACTION=="add|change", SUBSYSTEM=="tty", ATTRS{idVendor}=="1b4f", ENV{ID_MM_DEVICE_IGNORE}="1", ENV{MTP_NO_PROBE}="1"

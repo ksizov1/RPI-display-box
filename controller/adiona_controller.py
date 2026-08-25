@@ -112,6 +112,15 @@ KEYS_STATUS_PATH = os.path.join(RUN_DIR, "keys.json")
 KEYS_CMD_PATH = os.path.join(RUN_DIR, "keys-cmd.json")
 KEYS_CMD_SEQ = [0]
 
+# ── USB vehicle sensor bridge ────────────────────────────────────────────────
+# And once more for adiona_sensors.py, also inside the wheel service: the Drive
+# Square Steering/Gas/Brake boxes, which arrive as USB serial ports rather than
+# as a HID device. The calibration UI polls the status file while its tab is up
+# and posts one command per keypress, exactly as the wheel tab does.
+SENSORS_STATUS_PATH = os.path.join(RUN_DIR, "sensors.json")
+SENSORS_CMD_PATH = os.path.join(RUN_DIR, "sensors-cmd.json")
+SENSORS_CMD_SEQ = [0]
+
 # ── Software update bridge ───────────────────────────────────────────────────
 # Identical arrangement to the wheel bridge above, and for the same reason: the
 # updater must be able to restart — which applying an update forces it to do —
@@ -147,6 +156,11 @@ STATE = {
     # to a summary here; the full axis dump lives behind /wheel so the /state
     # poll every kiosk page runs stays small.
     "wheel": {"present": False},
+    # Likewise for the Drive Square USB sensor rig. Enough for the waiting screen
+    # and for deciding whether the calibration tab exists at all; the live
+    # quaternions live behind /sensors.
+    "sensors": {"attached": 0, "present": False, "active": False,
+                "licensed": False},
     # True while the settings panel is open on the kiosk page. kiosk-session.sh
     # watches this and takes the video player down for the duration: the player's
     # Wayland surface is mapped ON TOP of Chromium, so nothing the page draws is
@@ -241,6 +255,61 @@ def wheel_command(data):
     return {"ok": True, "message": action}
 
 
+def sensors_status():
+    """Read the sensor bridge's status file. Absent service == no sensors."""
+    try:
+        with open(SENSORS_STATUS_PATH) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {"enabled": False, "present": False, "attached": 0,
+                "licensed": False, "active": False, "calibrating": None,
+                "sensors": []}
+
+
+def sensors_summary(status):
+    """The few fields the waiting screen and the tab-visibility test need."""
+    return {
+        "attached": int(status.get("attached", 0) or 0),
+        "present": bool(status.get("present")),
+        "active": bool(status.get("active")),
+        "licensed": bool(status.get("licensed")),
+    }
+
+
+def sensor_command(data):
+    """
+    Hand one calibration command to adiona_sensors.py, via the wheel service.
+
+    Whitelisted here rather than passed through, for the same reason the wheel's
+    commands are: a malformed kiosk-page request must not reach the device layer
+    as something unexpected. The role is checked here too, so an unknown one is
+    rejected at the edge instead of being carried to a dict lookup.
+    """
+    action = str(data.get("action", ""))
+    if action not in ("calibrate", "next", "cancel", "recentre", "clear",
+                      "save"):
+        return {"ok": False, "message": "unknown action"}
+
+    cmd = {"action": action}
+    if action in ("calibrate", "clear"):
+        role = str(data.get("role", ""))
+        if role not in ("steer", "gas", "brake"):
+            return {"ok": False, "message": "bad role"}
+        cmd["role"] = role
+
+    SENSORS_CMD_SEQ[0] += 1
+    cmd["seq"] = SENSORS_CMD_SEQ[0]
+    tmp = SENSORS_CMD_PATH + ".tmp"
+    try:
+        os.makedirs(RUN_DIR, exist_ok=True)
+        with open(tmp, "w") as fh:
+            json.dump(cmd, fh)
+        os.replace(tmp, SENSORS_CMD_PATH)
+    except OSError as e:
+        return {"ok": False, "message": "wheel service unreachable: %s" % e}
+    return {"ok": True, "message": action}
+
+
 def keys_status():
     """Read the keyboard bridge's status file. Absent service == no keyboard."""
     try:
@@ -259,7 +328,7 @@ def keys_panel_report(data):
     knows when to take the keyboard back."""
     is_open = bool(data.get("open"))
     tab = str(data.get("tab", "wifi"))
-    if tab not in ("wifi", "wheel"):
+    if tab not in ("wifi", "wheel", "sensors"):
         tab = "wifi"
     with LOCK:
         PANEL["open"] = is_open
@@ -268,6 +337,19 @@ def keys_panel_report(data):
         PAGE_SEEN[0] = PANEL["at"]          # a POST is proof the page is alive
         STATE["panel"] = is_open
 
+    return keys_push_panel(is_open, tab)
+
+
+def keys_push_panel(is_open, tab):
+    """Tell the keyboard bridge what the panel is doing. Never holds LOCK.
+
+    Split out of keys_panel_report() because the page is not the only thing that
+    can close a panel: it can also DISAPPEAR with one open — a kiosk restart, or
+    an OTA applied while somebody was mid-way through Wi-Fi setup. The reader
+    would then still believe the panel was up, never take the keyboard back, and
+    the headset would receive no keystrokes at all until a human opened and
+    closed the panel by hand. See the PANEL_TTL branch in do_GET.
+    """
     KEYS_CMD_SEQ[0] += 1
     cmd = {"open": is_open, "tab": tab, "seq": KEYS_CMD_SEQ[0]}
     tmp = KEYS_CMD_PATH + ".tmp"
@@ -895,6 +977,7 @@ def selection_loop():
             STATE["version"] = read_version()
             STATE["uplink"] = uplink_status()
             STATE["wheel"] = wheel_summary(wheel_status())
+            STATE["sensors"] = sensors_summary(sensors_status())
 
         time.sleep(SCAN_INTERVAL)
 
@@ -966,6 +1049,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/state":
             now = time.monotonic()
             seen_ago = (now - UI_SEEN[0]) if UI_SEEN[0] else None
+            panel_lapsed = False
             UI_SEEN[0] = now
             with LOCK:
                 # ?ui=1 marks a fetch by the kiosk PAGE rather than by
@@ -978,7 +1062,13 @@ class Handler(BaseHTTPRequestHandler):
                 if STATE["panel"] and (now - PAGE_SEEN[0]) > PANEL_TTL:
                     STATE["panel"] = False
                     PANEL["open"] = False
+                    panel_lapsed = True
                 snapshot = dict(STATE)
+            # Outside the lock: the keyboard bridge has to be told too, or it
+            # goes on believing the panel is up and never takes the keyboard
+            # back — which costs the headset every keystroke, silently.
+            if panel_lapsed:
+                keys_push_panel(False, "wifi")
             # Built per request, not in selection_loop: SCAN_INTERVAL is 2 s but
             # the page polls at 1 Hz, so an update countdown assembled in the loop
             # would tick 60, 60, 58, 58 instead of counting down smoothly.
@@ -993,6 +1083,12 @@ class Handler(BaseHTTPRequestHandler):
             # Full status including the live axis dump — this is what the setup
             # overlay polls at 10 Hz while the operator is mapping the wheel.
             self._send(200, json.dumps(wheel_status()).encode("utf-8"),
+                       "application/json")
+            return
+        if path == "/sensors":
+            # Full status including every box's live quaternion — what the
+            # calibration tab polls at 10 Hz while the operator is sweeping.
+            self._send(200, json.dumps(sensors_status()).encode("utf-8"),
                        "application/json")
             return
         if path == "/ui":
@@ -1015,7 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path not in ("/wifi", "/wheel", "/update", "/ui"):
+        if path not in ("/wifi", "/wheel", "/sensors", "/update", "/ui"):
             self._send(404, b"not found", "text/plain")
             return
         try:
@@ -1026,6 +1122,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/wheel":
             self._send(200, json.dumps(wheel_command(data)).encode("utf-8"),
+                       "application/json")
+            return
+        if path == "/sensors":
+            self._send(200, json.dumps(sensor_command(data)).encode("utf-8"),
                        "application/json")
             return
         if path == "/update":
@@ -1059,6 +1159,34 @@ def main():
         pin_all_uplink_profiles()
     except Exception as e:                                  # never fatal
         print("[adiona-controller] uplink profile pin skipped: %s" % e)
+
+    # Pick the command counters up where the last run left them. Every command
+    # file carries a monotonically increasing `seq` and the wheel service acts
+    # only on a HIGHER one — which is what makes a command idempotent. But this
+    # process is the only thing that counts, and restarting it (a deploy, an OTA)
+    # sends the counter back to zero while the wheel service, which did not
+    # restart, still remembers the old value. Every command up to that value is
+    # then silently swallowed: the first few keypresses on the wheel or sensor
+    # tab do nothing at all, with no error anywhere to explain it.
+    for path, holder in ((WHEEL_CMD_PATH, WHEEL_CMD_SEQ),
+                         (KEYS_CMD_PATH, KEYS_CMD_SEQ),
+                         (SENSORS_CMD_PATH, SENSORS_CMD_SEQ),
+                         (UPDATE_CMD_PATH, UPDATE_CMD_SEQ)):
+        try:
+            with open(path) as fh:
+                holder[0] = max(holder[0], int(json.load(fh).get("seq", 0)))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass                        # no file yet, or nothing readable in it
+
+    # Resync the keyboard bridge. We are starting, so no page has told us its
+    # panel is open, and PANEL says closed — but the bridge outlives us (it is
+    # the wheel service) and may still be holding a stale "open" from before a
+    # restart. It would then never take the keyboard back and the headset would
+    # get no keystrokes at all, with nothing on screen to explain why.
+    try:
+        keys_push_panel(False, "wifi")
+    except Exception as e:                                  # never fatal
+        print("[adiona-controller] panel resync skipped: %s" % e)
 
     threading.Thread(target=selection_loop, daemon=True).start()
     server = ThreadingHTTPServer(("127.0.0.1", CONTROLLER_PORT), Handler)

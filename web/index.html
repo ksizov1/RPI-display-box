@@ -170,6 +170,36 @@
   .whl-axis .an { width: 15ch; }
   .whl-axis .ex { width: 8ch; color: #999; font-size: 1.6vmin; text-align: right; }
 
+  /* Drive Square USB sensors — the third tab. Reuses .whl-row / .bar so the two
+     device screens read the same; only what is genuinely different is new here.
+     The prompt banner IS the difference: mapping a wheel is one glance at a list,
+     while calibrating a sensor is a sequence someone follows with their hands
+     full, from across a room. */
+  .sns-prompt { margin-bottom: 2vmin; padding: 1.6vmin 2vmin; border-radius: 1vmin;
+                background: #e8f0fe; border: 2px solid #1a73e8;
+                font-size: 2.4vmin; font-weight: 600; color: #174ea6;
+                text-align: center; line-height: 1.35; }
+  .sns-prompt .step { display: block; font-size: 1.7vmin; font-weight: 500;
+                      color: #5f6368; margin-bottom: 0.6vmin; }
+  .sns-row .st { width: 13ch; font-size: 1.9vmin; }
+  .sns-row .st.no { color: #c1121f; font-weight: 600; }
+  .sns-row .st.yes { color: #1a7f37; font-weight: 600; }
+  /* Narrower than the wheel tab's bar: these rows carry a status word AND a
+     measurement, and at 26vmin the measurement wrapped onto five lines. */
+  .sns-row .bar { width: 16vmin; }
+  .sns-row .det { flex: 1; color: #777; font-size: 1.7vmin; text-align: right;
+                  font-variant-numeric: tabular-nums; }
+  .sns-live { margin-top: 2vmin; border-top: 1px solid #e0e0e0; padding-top: 1.5vmin; }
+  .sns-q { display: flex; align-items: center; gap: 1.5vmin; font-size: 1.8vmin;
+           padding: 0.4vmin 1.6vmin; color: #444; font-variant-numeric: tabular-nums; }
+  .sns-q .qn { width: 10ch; font-weight: 600; }
+  .sns-q .qv { width: 34ch; color: #666; font-size: 1.6vmin; }
+  .sns-q .hz { width: 8ch; color: #999; font-size: 1.6vmin; text-align: right; }
+  .sns-q.stale { color: #c1121f; }
+  .sns-warn { text-align: center; font-size: 2.1vmin; color: #a15c00;
+              background: #fff4e5; border-radius: 1vmin; padding: 1.6vmin 2vmin;
+              line-height: 1.4; }
+
   /* Software update prompt. Same shell as the two setup overlays, but above them
      (z-index 20): it can appear while somebody is mid-way through Wi-Fi or wheel
      setup, and half a dialog behind another is worse than either. */
@@ -232,6 +262,12 @@
               aria-controls="paneWifi">Internet Wi-Fi</button>
       <button id="tabWheel" class="set-tab" role="tab" aria-selected="false"
               aria-controls="paneWheel">Steering wheel</button>
+      <!-- Hidden until a Drive Square sensor box is actually plugged in: this is
+           specialist hardware and most boxes never see one, so an always-present
+           third tab would be one more thing between an operator and the Wi-Fi
+           screen. setTab()/cycleTab() skip it while it is hidden. -->
+      <button id="tabSensors" class="set-tab" role="tab" aria-selected="false"
+              aria-controls="paneSensors" style="display:none">Vehicle sensors</button>
       <span class="set-hint">← → switch tab &nbsp;·&nbsp; Esc close</span>
     </div>
 
@@ -277,6 +313,20 @@
         <button id="whlClose">Close (Esc)</button>
       </div>
       <div id="whlMsg" class="wifi-msg"></div>
+    </div>
+
+    <div id="paneSensors" class="set-pane pane-hidden" role="tabpanel"
+         aria-labelledby="tabSensors">
+      <div id="snsDev" class="whl-dev"></div>
+      <div id="snsPrompt"></div>
+      <div id="snsRows" class="whl-rows" tabindex="0" role="listbox"
+           aria-label="Vehicle sensor calibration"></div>
+      <div id="snsLive" class="sns-live"></div>
+      <div class="wifi-btns">
+        <button id="snsSave">Save (S)</button>
+        <button id="snsClose">Close (Esc)</button>
+      </div>
+      <div id="snsMsg" class="wifi-msg"></div>
     </div>
   </div>
 </div>
@@ -356,7 +406,19 @@
         (wh.range_deg ? (" &nbsp;·&nbsp; " + wh.range_deg + "°") : "") +
         (wh.mapped ? "" : " &nbsp;·&nbsp; not mapped");
     }
-    elUplink.innerHTML = line + hint + wline;
+    // Same reasoning as the wheel line, and the same three failures it has to
+    // separate at an event: a box that did not enumerate, a rig that is attached
+    // but never calibrated, and one the headset's licence does not cover.
+    var sn = state.sensors || {};
+    var sline = "";
+    if (sn.attached) {
+      sline = "<br>" + dot(!!sn.active) + "Sensors: <b>" + sn.attached +
+        (sn.attached === 1 ? " box" : " boxes") + "</b>" +
+        (!sn.licensed ? " &nbsp;·&nbsp; not licensed"
+         : !sn.present ? " &nbsp;·&nbsp; needs Steering and Gas"
+         : !sn.active ? " &nbsp;·&nbsp; not calibrated (F12)" : "");
+    }
+    elUplink.innerHTML = line + hint + wline + sline;
   }
 
   function esc(s) { return String(s).replace(/[&<>"]/g, function (c) {
@@ -554,6 +616,8 @@
         var up = s.uplink || {};
         var wh = s.wheel || {};
         var ud = s.update || {};
+        var sn = s.sensors || {};
+        setSensorTabVisible(sn.attached || 0);
         var sig = [s.mode, s.target, s.target_name, s.ssid, s.passphrase, s.version,
                    s.casting, up.internet, up.via, up.wifi_ssid, up.ethernet,
                    up.wifi_present,
@@ -561,6 +625,9 @@
                    // keep the idle countdown permanently reset — the very case
                    // the screensaver exists for.
                    wh.present, wh.name, wh.range_deg, wh.mapped,
+                   // Likewise summary only: the sensors' live quaternions move
+                   // every packet and belong to /sensors, not here.
+                   sn.attached, sn.present, sn.active, sn.licensed,
                    // Update state, but NOT progress or the countdown: those move
                    // every poll and would defeat the idle detection entirely.
                    ud.state, ud.available].join("|");
@@ -1012,6 +1079,229 @@
   document.getElementById("whlSave").addEventListener("click", whlSave);
   document.getElementById("whlClose").addEventListener("click", function () { settingsShow(false); });
 
+  // ── Drive Square USB sensor tab (keyboard-only: arrows/Enter/S) ────────────
+  // Calibrates the Steering, Gas and Brake boxes. Unlike the wheel tab, which
+  // assigns axes that already exist, this one MEASURES: the operator sweeps each
+  // control and the box works out the axis it turns about and how far it goes.
+  // So the prompts, the sequence and the maths all live in adiona_sensors.py —
+  // this pane renders what the box says to do and posts Enter back. Adding a
+  // fourth box (EVO) is then a change on the box and nothing here.
+  var snsRowsEl = document.getElementById("snsRows");
+  var snsLiveEl = document.getElementById("snsLive");
+  var snsDevEl = document.getElementById("snsDev");
+  var snsPromptEl = document.getElementById("snsPrompt");
+  var snsMsgEl = document.getElementById("snsMsg");
+  var snsSel = 0, snsTimer = 0;
+  var sns = { present: false, sensors: [], calibrating: null };
+  // The rows AS RENDERED, rebuilt every frame. Deliberately not index constants
+  // like the wheel tab's WHL_*_ROW: the rows here are conditional (a brake box
+  // is optional, EVO is licensed separately), and that is exactly the trap the
+  // warning above WHL_ROLES describes — a hidden row shifts every constant below
+  // it while Enter still dispatches on the old number. Dispatching on
+  // snsRowList[snsSel].kind cannot drift, because the list and the selection are
+  // the same list.
+  var snsRowList = [];
+  var SNS_LABEL = { steer: "Steering", gas: "Gas", brake: "Brake", evo: "EVO" };
+
+  function snsPost(p) {
+    return fetch("/sensors", { method: "POST", body: JSON.stringify(p) })
+      .then(function (r) { return r.json(); });
+  }
+  function snsMsg(text, color) {
+    snsMsgEl.style.color = color || "#555";
+    snsMsgEl.textContent = text;
+  }
+
+  function snsBuildRows() {
+    var rows = [];
+    (sns.sensors || []).forEach(function (s) {
+      // EVO has no calibration procedure yet — the hardware does not exist. It
+      // is listed below with the live readouts so a plugged-in one is visible,
+      // but it gets no row until there is something to do to it.
+      if (s.role === "evo") return;
+      rows.push({ kind: "cal", role: s.role, sensor: s });
+    });
+    if (rows.some(function (r) { return r.role === "steer"; })) {
+      rows.push({ kind: "recentre" });
+    }
+    return rows;
+  }
+
+  function snsRenderRow(row) {
+    if (row.kind === "recentre") {
+      return '<span class="role">Recentre</span>' +
+             '<span class="st">steering</span>' +
+             '<span class="det">Enter — zero the turn count (also Ctrl+S)</span>';
+    }
+    var s = row.sensor, det = "";
+    if (!s.fresh) {
+      det = "no data — check the cable";
+    } else if (!s.calibrated) {
+      det = "Enter to calibrate";
+    } else if (s.role === "steer") {
+      det = s.range_deg + "°  ·  " + s.left_deg + " / +" + s.right_deg;
+    } else {
+      det = "travel " + s.full_deg + "°";
+    }
+    var live = "";
+    if (s.calibrated && s.fresh) {
+      live = (s.role === "steer")
+        ? bar(s.range_deg ? (s.value / (s.range_deg / 2)) : 0, true)
+        : bar(s.value, false);
+    }
+    return '<span class="role">' + SNS_LABEL[s.role] + '</span>' +
+           '<span class="st ' + (s.calibrated ? "yes" : "no") + '">' +
+             (s.calibrated ? "calibrated" : "NOT calibrated") + '</span>' +
+           live +
+           '<span class="det">' + esc(det) + '</span>';
+  }
+
+  function renderSensors() {
+    // Three different "nothing here", and they need three different answers:
+    // no support in this build, no boxes plugged in, and boxes the licence does
+    // not cover. Collapsing them would leave an operator at an event unable to
+    // tell a dead cable from a licence problem.
+    if (!sns.enabled) {
+      snsDevEl.innerHTML = "<b>Vehicle sensor support is not running on this box.</b>" +
+        (sns.message ? "<br>" + esc(sns.message) : "");
+      snsPromptEl.innerHTML = ""; snsRowsEl.innerHTML = ""; snsLiveEl.innerHTML = "";
+      snsRowList = [];
+      return;
+    }
+    var n = sns.attached || 0;
+    snsDevEl.innerHTML = "<b>Drive Square USB sensors</b> &nbsp;·&nbsp; " +
+      n + (n === 1 ? " box" : " boxes") +
+      (sns.active ? " &nbsp;·&nbsp; <b>driving the headset</b>" : "");
+
+    if (!sns.licensed) {
+      snsPromptEl.innerHTML = '<div class="sns-warn">These sensors are not covered ' +
+        "by the connected headset's licence, so the box will not stream them.<br>" +
+        "Everything else on this box is unaffected.</div>";
+      snsRowsEl.innerHTML = ""; snsLiveEl.innerHTML = "";
+      snsRowList = [];
+      return;
+    }
+
+    var job = sns.calibrating;
+    snsPromptEl.innerHTML = job
+      ? '<div class="sns-prompt"><span class="step">' +
+          esc(SNS_LABEL[job.role] || job.role) + " — step " + (job.index + 1) +
+          " of " + job.steps + '</span>' + esc(job.prompt) +
+          '<span class="step" style="margin:0.6vmin 0 0">Esc to cancel</span></div>'
+      : "";
+
+    snsRowList = snsBuildRows();
+    if (snsSel >= snsRowList.length) snsSel = Math.max(0, snsRowList.length - 1);
+    if (!snsRowList.length) {
+      snsRowsEl.innerHTML = '<div class="wifi-empty">No sensor boxes detected. ' +
+        'Plug Steering, Gas and Brake into this box.</div>';
+    } else {
+      snsRowsEl.innerHTML = snsRowList.map(function (row, i) {
+        return '<div class="whl-row sns-row' + (i === snsSel ? " sel" : "") + '">' +
+               snsRenderRow(row) + '</div>';
+      }).join("");
+    }
+
+    // Every box's raw quaternion, live, exactly as the wheel tab lists every
+    // axis: a calibration that came out wrong is visible here before it is
+    // saved, and a box that has stopped reporting is obvious at a glance.
+    snsLiveEl.innerHTML = (sns.sensors || []).map(function (s) {
+      var q = s.q ? s.q.map(function (v) {
+        return (v < 0 ? "" : "+") + v.toFixed(3); }).join("  ") : "no data";
+      var val = (s.value === null || s.value === undefined) ? ""
+              : (s.role === "steer" ? (s.value.toFixed(0) + "°")
+                                    : (Math.round(s.value * 100) + "%"));
+      return '<div class="sns-q' + (s.fresh ? "" : " stale") + '">' +
+             '<span class="qn">' + SNS_LABEL[s.role] + '</span>' +
+             '<span class="qv">' + esc(q) + '</span>' +
+             '<span class="hz">' + (s.fresh ? s.hz.toFixed(0) + " Hz" : "SILENT") +
+             '</span><span class="det">' + esc(val) + '</span></div>';
+    }).join("");
+  }
+
+  function loadSensors() {
+    return fetch("/sensors", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (s) {
+        // The box owns the message while a calibration is running or has just
+        // finished — it is the only thing that knows whether the sweep measured
+        // anything. Left alone otherwise so a local "Saved." is not wiped out.
+        if (s.message && s.message !== sns.message) snsMsg(s.message);
+        sns = s;
+        renderSensors();
+      })
+      .catch(function () {});
+  }
+
+  // 10 Hz, and only while this tab is the one on screen — same rule as the wheel
+  // tab, for the same reason: this box spends hours on its waiting screen and
+  // has no business generating traffic then.
+  function sensorsPolling(on) {
+    if (snsTimer) { clearInterval(snsTimer); snsTimer = 0; }
+    if (on) snsTimer = setInterval(loadSensors, 100);
+  }
+
+  function openSensors() {
+    snsSel = 0;
+    snsMsg("Select a sensor with ↑ ↓ and press Enter to calibrate it.");
+    loadSensors();
+    setTimeout(function () { snsRowsEl.focus(); }, 50);
+  }
+
+  function snsEnter() {
+    // Mid-calibration, Enter always means "this step is done" — never "start
+    // something else". The selection is frozen for the duration on screen too.
+    if (sns.calibrating) {
+      snsPost({ action: "next" }).then(loadSensors);
+      return;
+    }
+    var row = snsRowList[snsSel];
+    if (!row) return;
+    if (row.kind === "recentre") {
+      snsPost({ action: "recentre" }).then(function (res) {
+        snsMsg(res.ok ? "Steering recentred — this position is now dead ahead."
+                      : ("Failed: " + (res.message || "")),
+               res.ok ? "#1a7f37" : "#c1121f");
+        loadSensors();
+      });
+      return;
+    }
+    snsPost({ action: "calibrate", role: row.role }).then(loadSensors);
+  }
+
+  function snsSave() {
+    snsPost({ action: "save" }).then(function (res) {
+      snsMsg(res.ok ? "Saved. These boxes are recognised automatically from now on."
+                    : ("Save failed: " + (res.message || "")),
+             res.ok ? "#1a7f37" : "#c1121f");
+      loadSensors();
+    });
+  }
+
+  snsRowsEl.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") { snsEnter(); e.preventDefault(); }
+    else if (e.key === "Escape" && sns.calibrating) {
+      // Cancel the calibration, do NOT close the panel. preventDefault is load
+      // bearing: the document handler below gives a pane first refusal on Esc
+      // for exactly this.
+      snsPost({ action: "cancel" }).then(loadSensors);
+      e.preventDefault();
+    }
+    else if (sns.calibrating) { return; }     // the sweep owns the keyboard
+    else if (e.key === "ArrowDown") {
+      snsSel = Math.min(Math.max(0, snsRowList.length - 1), snsSel + 1);
+      renderSensors(); e.preventDefault();
+    } else if (e.key === "ArrowUp") {
+      snsSel = Math.max(0, snsSel - 1); renderSensors(); e.preventDefault();
+    } else if ((e.key === "c" || e.key === "C") &&
+               snsRowList[snsSel] && snsRowList[snsSel].kind === "cal") {
+      snsPost({ action: "clear", role: snsRowList[snsSel].role }).then(loadSensors);
+      e.preventDefault();
+    }
+  });
+  document.getElementById("snsSave").addEventListener("click", snsSave);
+  document.getElementById("snsClose").addEventListener("click", function () { settingsShow(false); });
+
   // ── The settings panel itself (F12) ───────────────────────────────────────
   // F12 does NOT arrive here as a keypress. While a headset is subscribed the
   // wheel service holds the keyboard exclusively — that is exactly what lets
@@ -1022,12 +1312,32 @@
   // keyboard is NOT grabbed (no headset, panel already open, update prompt up)
   // Chromium receives the very same F12, and a flag would be toggled twice.
   var settingsEl = document.getElementById("settings");
-  var TABS = ["wifi", "wheel"];
+  var TABS = ["wifi", "wheel", "sensors"];
   var paneEls = { wifi: document.getElementById("paneWifi"),
-                  wheel: document.getElementById("paneWheel") };
+                  wheel: document.getElementById("paneWheel"),
+                  sensors: document.getElementById("paneSensors") };
   var tabEls = { wifi: document.getElementById("tabWifi"),
-                 wheel: document.getElementById("tabWheel") };
+                 wheel: document.getElementById("tabWheel"),
+                 sensors: document.getElementById("tabSensors") };
   var settingsOpen = false, settingsTab = "wifi";
+
+  // Which tabs exist right now. Only the sensor tab is conditional, and it is
+  // conditional on hardware rather than on a setting: most boxes never see a
+  // Drive Square rig, and a permanently empty third tab in front of the Wi-Fi
+  // screen is worse than no tab at all. Everything below routes through this, so
+  // there is one answer to "does this tab exist" and not three.
+  var snsAttached = 0;
+  function tabExists(t) { return t !== "sensors" || snsAttached > 0; }
+  function visibleTabs() { return TABS.filter(tabExists); }
+
+  function setSensorTabVisible(attached) {
+    if (attached === snsAttached) return;
+    snsAttached = attached;
+    tabEls.sensors.style.display = attached > 0 ? "" : "none";
+    // The rig was unplugged while its own tab was on screen. Do not leave the
+    // panel showing a pane that no longer has a tab.
+    if (!tabExists(settingsTab)) setTab("wifi");
+  }
 
   // Tell the box what the panel is doing. The reader cannot see Esc or a mouse
   // click once it has let go of the keyboard, so this is the only way it learns
@@ -1040,7 +1350,7 @@
   }
 
   function setTab(tab) {
-    if (TABS.indexOf(tab) < 0) tab = "wifi";
+    if (TABS.indexOf(tab) < 0 || !tabExists(tab)) tab = "wifi";
     settingsTab = tab;
     TABS.forEach(function (t) {
       paneEls[t].classList.toggle("pane-hidden", t !== tab);
@@ -1048,8 +1358,11 @@
       tabEls[t].setAttribute("aria-selected", t === tab ? "true" : "false");
     });
     wheelPolling(settingsOpen && tab === "wheel");
+    sensorsPolling(settingsOpen && tab === "sensors");
     if (!settingsOpen) return;
-    if (tab === "wifi") openWifi(); else openWheel();
+    if (tab === "wifi") openWifi();
+    else if (tab === "wheel") openWheel();
+    else openSensors();
     uiReport();
   }
 
@@ -1060,17 +1373,23 @@
       setTab(tab || settingsTab);            // reports on our behalf
     } else {
       wheelPolling(false);
+      sensorsPolling(false);
       uiReport();
     }
   }
 
   function cycleTab(dir) {
-    var i = TABS.indexOf(settingsTab);
-    setTab(TABS[(i + dir + TABS.length) % TABS.length]);
+    // Over the VISIBLE tabs, so the arrows never land on a hidden one and the
+    // panel never looks like it has stopped responding.
+    var vis = visibleTabs();
+    var i = vis.indexOf(settingsTab);
+    if (i < 0) i = 0;
+    setTab(vis[(i + dir + vis.length) % vis.length]);
   }
 
   tabEls.wifi.addEventListener("click", function () { setTab("wifi"); });
   tabEls.wheel.addEventListener("click", function () { setTab("wheel"); });
+  tabEls.sensors.addEventListener("click", function () { setTab("sensors"); });
 
   // Long poll. Deliberately not a fast repeating one: this box sits on its
   // waiting screen for hours and has no business generating traffic then, which
@@ -1281,9 +1600,16 @@
       return;
     }
     if (settingsOpen) {
-      if (e.key === "Escape") { settingsShow(false); e.preventDefault(); }
+      // defaultPrevented on Escape for the same reason the arrows have it: a
+      // pane gets first refusal. The sensor tab uses it to cancel a calibration
+      // in progress without also closing the panel out from under the operator.
+      if (e.key === "Escape" && !e.defaultPrevented) {
+        settingsShow(false); e.preventDefault();
+      }
       else if ((e.key === "s" || e.key === "S") && settingsTab === "wheel") {
         whlSave(); e.preventDefault();
+      } else if ((e.key === "s" || e.key === "S") && settingsTab === "sensors") {
+        snsSave(); e.preventDefault();
       } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") &&
                  !e.defaultPrevented && !isTextField(e.target)) {
         // Tab switching is on the arrows, NOT on Tab: Tab is the only way to

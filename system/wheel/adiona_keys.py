@@ -38,6 +38,10 @@ Design notes, in the order they matter:
      the ring, so there is exactly one place that can get it wrong. It toggles
      the on-TV settings panel instead.
 
+     Ctrl+S is the one key the box acts on WITHOUT keeping: it re-centres the USB
+     sensor rig's steering here and is still forwarded, because the headset has
+     its own centring to do. Two keys, two behaviours, both in _on_key().
+
   5. THE WIRE CARRIES GODOT KEYCODES, NOT EVDEV CODES. Same principle as the
      wheel's axis mapping: this box owns the device knowledge and the headset
      carries no translation table. See GODOT_KEYS below for the 16-bit encoding.
@@ -111,7 +115,7 @@ KEY_LEFT, KEY_RIGHT = 105, 106
 KEY_END, KEY_DOWN, KEY_PAGEDOWN = 107, 108, 109
 KEY_INSERT, KEY_DELETE = 110, 111
 KEY_LEFTMETA, KEY_RIGHTMETA = 125, 126
-KEY_A, KEY_Z = 30, 44
+KEY_A, KEY_S, KEY_Z = 30, 31, 44
 
 # ── The wire's key encoding ──────────────────────────────────────────────────
 # Godot's Key enum is two disjoint ranges: printable keys ARE their uppercase
@@ -278,9 +282,11 @@ class KeyReader(object):
     """
 
     def __init__(self, log, repeat_hz=10, enabled=True, update_status_path=None,
-                 subscriber_live=None):
+                 subscriber_live=None, on_recentre=None):
         self._log = log
         self._enabled = enabled
+        # Ctrl+S, tapped in passing. See _on_key().
+        self._on_recentre = on_recentre or (lambda: None)
         # Kernel auto-repeat is ~33 Hz, which is far too fast for keys that step
         # a value: a held Shift+Left would slew a mirror across its whole travel
         # in a blink, and a held Tab would toggle the game's debug display 33
@@ -338,7 +344,7 @@ class KeyReader(object):
         once we have released the grab."""
         with self._lock:
             self._panel_open = bool(is_open)
-            if tab in ("wifi", "wheel"):
+            if tab in ("wifi", "wheel", "sensors"):
                 self._panel_tab = tab
 
     # ── Main loop ────────────────────────────────────────────────────────────
@@ -514,6 +520,25 @@ class KeyReader(object):
             if value == KEY_DOWN_VALUE:
                 self._toggle_panel()
             return                              # never reaches the headset
+
+        # Ctrl+S: re-centre the steering. THE ONE NON-CONSUMING TAP IN THIS FILE,
+        # and the difference from F12 above is the whole point — F12 returns, so
+        # the headset never sees it, while this falls through and is forwarded as
+        # usual. Both ends act on it: the box zeroes the USB sensor rig's turn
+        # count at the source (a racing wheel has none to lose, so the callback
+        # is a no-op then), and the headset re-captures its steering centre as it
+        # always has. They cannot disagree, because read_roles() and the
+        # keystroke ring are packed from the same snapshot: the reset and the
+        # keystroke that caused it ride in the SAME packet, so the headset sees a
+        # steer_deg already at zero and captures an offset of ~0.
+        #
+        # Down only. On auto-repeat a held Ctrl+S would re-zero the wheel
+        # KEYS_REPEAT_HZ times a second, under the driver's hands.
+        if code == KEY_S and value == KEY_DOWN_VALUE and (self._mods & MOD_CTRL):
+            try:
+                self._on_recentre()
+            except Exception as e:              # never cost anyone a keystroke
+                self._log("recentre: %s" % e)
 
         if not self._forwarding:
             return

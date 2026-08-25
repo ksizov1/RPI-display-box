@@ -854,6 +854,7 @@ sudo systemctl enable adiona-updater.service >/dev/null 2>&1 || true
 sudo systemctl enable adiona-rollback.service >/dev/null 2>&1 || true
 sudo install -m 0644 "$SRC/system/network/99-adiona-forward.conf" /etc/sysctl.d/
 sudo install -m 0644 "$SRC/system/udev/99-adiona-no-pointer.rules" /etc/udev/rules.d/
+sudo install -m 0644 "$SRC/system/udev/99-adiona-sensors.rules" /etc/udev/rules.d/
 sudo install -d /etc/NetworkManager/conf.d
 sudo install -m 0644 "$SRC/system/networkmanager/10-adiona-wifi.conf" /etc/NetworkManager/conf.d/
 sudo install -d /etc/chromium/policies/managed

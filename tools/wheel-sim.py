@@ -13,6 +13,7 @@ Usage
     python3 tools/wheel-sim.py --range 270     # pretend it is a 270 deg wheel
     python3 tools/wheel-sim.py --static 90     # hold 90 deg right, no sweep
     python3 tools/wheel-sim.py --no-wheel      # box alive, nothing plugged in
+    python3 tools/wheel-sim.py --sensors       # a Drive Square USB sensor rig
     python3 tools/wheel-sim.py --app-version 1.6.0   # what the box claims to run
     python3 tools/wheel-sim.py --keys F1,TAB,CTRL+S  # send these keystrokes on a loop
 
@@ -66,8 +67,26 @@ CAP_RANGE_900 = 1 << 9
 CAPS_DEFAULT = (CAP_STEERING | CAP_PEDALS | CAP_BUTTONS | CAP_FORCE_FEEDBACK
                 | CAP_RANGE_SETTABLE | CAP_RANGE_270 | CAP_RANGE_900)
 
+# Vehicle sensors, in the range reserved for them (bits 32-47).
+CAP_SENSOR_STEERING = 1 << 32
+CAP_SENSOR_GAS = 1 << 33
+CAP_SENSOR_BRAKE = 1 << 34
+# What a full Drive Square rig claims: it steers and it has pedals, but it has no
+# buttons, no force feedback and no settable range — a box clamped to a real
+# steering wheel cannot be told to turn 270 degrees instead of 900.
+CAPS_SENSORS = (CAP_STEERING | CAP_PEDALS | CAP_SENSOR_STEERING
+                | CAP_SENSOR_GAS | CAP_SENSOR_BRAKE)
+
+# AI02 flags: which sensors are calibrated. State, not capability.
+FLAG_SENSOR_STEER_CAL = 1 << 5
+FLAG_SENSOR_GAS_CAL = 1 << 6
+FLAG_SENSOR_BRAKE_CAL = 1 << 7
+FLAGS_SENSORS_CAL = (FLAG_SENSOR_STEER_CAL | FLAG_SENSOR_GAS_CAL
+                     | FLAG_SENSOR_BRAKE_CAL)
+
 BOXCAP_WHEEL = 1 << 0
 BOXCAP_KEYBOARD = 1 << 1
+BOXCAP_SENSORS = 1 << 2
 BOXCAP_CASTING = 1 << 4
 BOXCAPS_DEFAULT = BOXCAP_WHEEL | BOXCAP_KEYBOARD | BOXCAP_CASTING
 
@@ -150,6 +169,10 @@ def main():
                     dest="device_type",
                     help="1 = wheel (default), 16 = vehicle sensor pack. Lets a "
                          "headset be tested against hardware that does not exist yet.")
+    ap.add_argument("--sensors", action="store_true",
+                    help="pretend a Drive Square USB sensor rig is attached "
+                         "instead of a racing wheel: sensor name and caps, and "
+                         "the SECOND descriptor the real box sends for it")
     ap.add_argument("--keys", default="",
                     help="comma-separated keystrokes to send on a loop, e.g. "
                          "'F1,TAB,CTRL+S,SHIFT+LEFT'")
@@ -158,6 +181,15 @@ def main():
     args = ap.parse_args()
 
     combos = parse_keys(args.keys)
+    # --sensors is a shorthand for a set of the flags above, so every one of them
+    # can still be overridden individually afterwards.
+    if args.sensors:
+        if args.caps is None:
+            args.caps = "0x%X" % CAPS_SENSORS
+        if args.box_caps is None:
+            args.box_caps = "0x%X" % (BOXCAPS_DEFAULT | BOXCAP_SENSORS)
+        if args.name == ap.get_default("name"):
+            args.name = "Drive Square USB sensors (3)"
     caps = CAPS_DEFAULT if args.caps is None else int(args.caps, 0)
     box_caps = BOXCAPS_DEFAULT if args.box_caps is None else int(args.box_caps, 0)
 
@@ -297,6 +329,18 @@ def main():
                 sock.sendto(INFO_FMT.pack(
                     INFO_MAGIC, args.device_type, 0, flags, caps,
                     args.range_deg, 0, args.name.encode("utf-8")[:48]), sub)
+                # The real box describes a sensor rig TWICE, and the headset has
+                # to cope with both: once as the wheel above (it is what drives
+                # the steering, and the wheel entry is where the headset reads
+                # the name and the full-lock range from) and once as the sensor
+                # pack itself, which is what says how many boxes are attached and
+                # which of them are calibrated. See device_packets() in
+                # adiona-wheel.py.
+                if args.sensors:
+                    sock.sendto(INFO_FMT.pack(
+                        INFO_MAGIC, DEVICE_TYPE_SENSORS, 0, FLAGS_SENSORS_CAL,
+                        caps, args.range_deg, 0,
+                        args.name.encode("utf-8")[:48]), sub)
             # Offset by one tick so BOX never shares a tick with DEVICE.
             if not args.no_box_report and tick % args.hz == 1:
                 sock.sendto(BOX_FMT.pack(

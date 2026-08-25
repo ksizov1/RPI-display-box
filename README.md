@@ -86,9 +86,10 @@ headset. It opens the settings panel, which now holds both setup screens as tabs
 | Key | Does |
 |---|---|
 | **F12** | Open/close the settings panel. Works while a headset is casting: the video is suspended for as long as the panel is up, and returns on its own |
-| **← →** | Switch tab — *Internet Wi-Fi* (scan, join, band plan) and *Steering wheel* (axis assignment, range, centring) |
+| **← →** | Switch tab — *Internet Wi-Fi* (scan, join, band plan), *Steering wheel* (axis assignment, range, centring) and, when a rig is plugged in, *Vehicle sensors* (calibration) |
 | **Tab**, arrows, **Enter** | Move around inside a tab, exactly as they did in the old overlays |
-| **S** | Save the wheel mapping, on the wheel tab |
+| **S** | Save the wheel mapping or the sensor calibration, on those tabs |
+| **Ctrl+S** | Re-centre the steering. The one key the box acts on **and still forwards**: it zeroes the USB sensor rig's turn count here, and the headset re-centres as it always has. See [USB vehicle sensors](#usb-vehicle-sensors-drive-square-steering--gas--brake) |
 | **Esc** | Close the panel |
 | **Y** / **N** | Answer the software-update prompt, when one is up |
 | *everything else* | Goes to the headset |
@@ -272,9 +273,24 @@ state that changes while running; capabilities are facts about the hardware or t
 build.** A capability answers "could this ever work", a flag answers "is it working
 now". So the headset asks *does this box have a keyboard bridge* rather than *is it
 newer than 1.7.0* — version comparisons are the thing that ages worst across a
-fleet on mixed releases. `AI02.capabilities` reserves bits 32–47 for the vehicle
+fleet on mixed releases. `AI02.capabilities` uses bits 32–47 for the vehicle
 sensors; `range_deg` reports the range currently applied while `CAP_RANGE_270` /
 `CAP_RANGE_900` say which are supported at all.
+
+### Exactly one wheel descriptor, and it is whatever drives the stream
+
+The headset reads the steering name and the full-lock range off the
+`DEVICE_TYPE_WHEEL` entry and off nothing else, and the range is not cosmetic:
+the box scales `steer_deg` by `range/2` and the headset divides by exactly the
+same figure, so the two must agree or full lock lands somewhere the control
+cannot reach. So a USB sensor rig that is driving the stream is announced **as
+the wheel** — which is what it is, functionally — and separately as
+`DEVICE_TYPE_SENSORS`, which is what says how many boxes are attached and which
+of them are calibrated. Two descriptors, because they answer two questions.
+
+The consequence is worth knowing: an idle racing wheel is **not** announced while
+a rig is driving, because a second wheel entry would break the invariant and
+there is nowhere else to put it.
 
 ### The licence mask
 
@@ -331,6 +347,127 @@ driver has combined the pedals and they cannot be separated here.
 Settings → **Controller Type → Wheel over LAN**. Nothing changes for any other
 controller type until that is selected. **Settings → Steering Wheel (LAN) Setup**
 shows the link status and the sensitivity/curve sliders.
+
+---
+
+# USB vehicle sensors (Drive Square Steering / Gas / Brake)
+
+A Drive Square sensor rig clamps onto a **real car's** steering wheel and pedals
+and turns the actual controls into sim inputs. Adiona-G has supported the
+Bluetooth version of these boxes for a long time; this is the USB generation,
+which the Quest cannot take directly — so, exactly like the racing wheel, they
+plug into this box and it streams them.
+
+**Plug them into any USB port, hub or not.** They enumerate as three USB serial
+devices whose names carry their role:
+
+```
+1b4f:9d2f Drive Square D2 Steering Sensor
+1b4f:9d3f Drive Square D2 Gas Sensor
+1b4f:9d4f Drive Square D2 Brake Sensor
+```
+
+Nothing happens without at least **Steering and Gas** — a lone pedal is not a
+driving control. Brake is optional and reads zero when it is absent.
+
+**They need a licence.** The box streams them only when the connected headset's
+`feature_flags` has bit 2 (`INVEHICLE`) set. This is the first consumer of the
+licence mask the headset already sends in `ASUB`, and the box still never
+contacts the licence server: it uses the bit only to avoid *offering* hardware
+the customer has not paid for. A fourth **EVO** box, gated on bit 4, has its
+capability bit reserved and nothing else — that hardware does not exist yet.
+
+## Why they are calibrated and the BLE ones were not
+
+The BLE boxes sent a bare accelerometer reading, which can only be interpreted
+against an assumed mounting — so the steering box had to be **bolted in a
+pre-defined position** and only the pedals were ever calibrated.
+
+These send the full **Kalman-fused quaternion**, which carries enough
+information to *discover* the mounting instead of dictating it. So all three are
+calibrated, and steering properly: the operator turns the wheel left and right,
+and the box works out the axis it actually rotates about and how far it goes.
+
+## How it works
+
+`adiona_sensors.py` reads each box's `/dev/ttyACM*` — they are USB CDC-ACM, so
+`termios` is the whole driver and there is no `pyserial` on the image — and
+parses one line per sample:
+
+```
+17126192, 0.9993, -0.0017, -0.0263, 0.0265        t_ms, qw, qx, qy, qz
+```
+
+Rates differ per box and nothing assumes one: measured 67 Hz for steering, 33 Hz
+for each pedal.
+
+- **The rig IS a wheel, on the wire.** Its readings go out in the same 48-byte
+  `AW02` packet at 90 Hz, as steering degrees and 0–1 pedals. The headset needs
+  no new code path; it is told what the rig is in `AI02`.
+- **The angle is absolute, only the turn count is integrated.** Every sample's
+  angle is measured from the sensor's own attitude relative to the stored
+  centre, so the box adds no drift of its own. The turn count is what makes more
+  than 360° representable — and the only thing that can go wrong. See `Ctrl+S`.
+- **Every channel fails to neutral.** A box that goes quiet for
+  `SENSORS_STALE_SEC` reads zero rather than holding its last value: a pedal
+  knocked off its mount mid-drive must not leave the throttle open.
+- **Calibrations are keyed by each box's own serial number**, not by its role. A
+  spare gas box carries its calibration between rigs, a knocked-out cable costs
+  nothing when it goes back in, and a *different* box in the same role gets its
+  own calibration or none at all — never the previous one's.
+
+If a racing wheel is plugged in at the same time, **the rig wins** once it is
+calibrated and licensed. The wheel is still there and still works the moment the
+rig is unplugged.
+
+## Calibrating
+
+Press **F12** on a keyboard attached to the box and select **Vehicle sensors**
+with **→**. The tab only exists while a sensor box is actually plugged in.
+
+1. Pick a sensor with **↑ ↓** and press **Enter**.
+2. Follow the prompts. Steering is three steps — centre the wheel, turn fully
+   left, turn fully right — and each is confirmed with **Enter**. A pedal is
+   two: released, then fully pressed.
+3. Repeat for the other sensors, then press **S** to save.
+
+Every box's raw quaternion, rate and derived value are shown live underneath, so
+a calibration that came out wrong is visible **before** it is saved. **Esc**
+cancels a calibration in progress; a second **Esc** closes the panel. **C**
+clears the selected sensor's calibration.
+
+Saved to `/etc/adiona/sensor-cal.json` and picked up automatically from then on.
+
+### `Ctrl+S` — the steering reset
+
+Sharp erratic steering, which is exactly what a near-crash produces, can slip the
+turn count. **`Ctrl+S` zeroes it**, taking wherever the wheel currently stands as
+dead ahead. It is the same key the BLE boxes have always used for the same
+problem, and it works from the box's own keyboard because that keyboard is the
+headset's keyboard too.
+
+It does **not** touch the calibrated axis or range — a recovery must not cost a
+calibration — and it is a no-op unless the rig is the active steering source, so
+a racing wheel's behaviour is unchanged.
+
+There is also a **Recentre** row on the tab, for when no headset is connected.
+
+## Checking it
+
+```bash
+curl -s localhost:8090/sensors | python3 -m json.tool   # live, per box
+sudo python3 /opt/adiona/wheel/adiona-wheel.py --dump   # every port + rate + quaternion
+python3 tools/test-sensor-math.py                       # the maths, anywhere
+python3 tools/test-sensor-loopback.py                   # the whole path, Linux/WSL
+```
+
+The waiting screen carries a sensor line beside the wheel one, which separates
+the three failures that look identical at an event: a box that did not
+enumerate, a rig that was never calibrated, and one the licence does not cover.
+
+`tools/test-sensor-loopback.py` stands up three PTYs and drives a full
+calibration through them, so a successful 900° sweep can be tested with no rig on
+the desk — which no amount of staring at a still one will do.
 
 ---
 
@@ -527,6 +664,10 @@ Settings worth a deliberate decision per venue:
   stream stops before the splash returns. Default 30 s.
 - **`WHEEL_DEFAULT_RANGE_DEG`** — rotation range for a wheel with no profile and
   no saved map. 900° suits the common Logitech wheels.
+- **`SENSORS_ENABLED`** — set to `0` to ignore a Drive Square USB sensor rig
+  entirely. `SENSORS_STALE_SEC` is the safety floor that zeroes a channel whose
+  box goes quiet; `SENSORS_PEDAL_DEADZONE_DEG` stops a settled pedal box holding
+  the throttle slightly open.
 - **`UPDATE_ENABLED`** — set to `0` for a box that must never offer an update,
   such as one left with a customer between visits. `UPDATE_PROMPT_SECONDS`,
   `UPDATE_KEEP_RELEASES` and `UPDATE_ALLOW_PACKAGES` tune the rest.
@@ -557,8 +698,9 @@ system/
                        kiosk-session.sh  → Chromium + player supervision
                        adiona-player.sh  → GStreamer RTP receiver (+ --probe)
   controller/          controller unit
-  wheel/               adiona-wheel.py — USB racing wheel → headset (+ unit)
-                       adiona_keys.py  — USB keyboard → headset, in the same packet
+  wheel/               adiona-wheel.py   — USB racing wheel → headset (+ unit)
+                       adiona_keys.py    — USB keyboard → headset, in the same packet
+                       adiona_sensors.py — Drive Square USB sensors, same packet again
   updater/             adiona-updater.py — checks, offers and stages releases
                        apply-update.sh   — the only thing that switches releases
                        update-key.pub    — verifies the signed release manifest
@@ -571,6 +713,8 @@ tools/
   test-apply-update.sh sandbox test for the update/rollback machinery (Linux/WSL)
   test-update-e2e.sh   end-to-end check of check → download → apply (Linux/WSL)
   wheel-sim.py         fake LAN wheel + keyboard, for testing the game without a Pi
+  test-sensor-math.py  the vehicle sensors' quaternion maths (runs anywhere)
+  test-sensor-loopback.py  the whole sensor path over PTYs (Linux/WSL)
 image/
   pi-gen/              custom pi-gen stage + build config
   assemble-stage.sh    stage the repo files into the pi-gen payload
@@ -764,6 +908,7 @@ python3 tools/wheel-sim.py                # sweep lock to lock, 900°
 python3 tools/wheel-sim.py --range 270    # pretend it is a 270° wheel
 python3 tools/wheel-sim.py --static 90    # hold 90° right
 python3 tools/wheel-sim.py --no-wheel     # box alive, nothing plugged in
+python3 tools/wheel-sim.py --sensors      # a Drive Square USB sensor rig
 ```
 
 Then in Godot set `Global.lan_wheel.box_ip_override` to that machine's IP

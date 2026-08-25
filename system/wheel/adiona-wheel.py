@@ -63,6 +63,8 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONF_PATH = os.environ.get("ADIONA_CONF", "/etc/adiona/box.conf")
 MAP_PATH = os.environ.get("ADIONA_WHEEL_MAP", "/etc/adiona/wheel-map.json")
+SENSOR_CAL_PATH = os.environ.get("ADIONA_SENSOR_CAL",
+                                 "/etc/adiona/sensor-cal.json")
 RUN_DIR = os.environ.get("ADIONA_RUN_DIR", "/run/adiona")
 VERSION_FILE = os.environ.get("ADIONA_VERSION_FILE", "/opt/adiona/VERSION")
 SSID_FILE = os.environ.get("ADIONA_SSID_FILE", "/etc/adiona/ssid")
@@ -98,6 +100,10 @@ DEFAULT_RANGE_DEG = int(CONF.get("WHEEL_DEFAULT_RANGE_DEG", "900"))
 DEFAULT_AUTOCENTER_PCT = int(CONF.get("WHEEL_AUTOCENTER_PCT", "50"))
 KEYS_ENABLED = CONF.get("KEYS_ENABLED", "1") not in ("0", "false", "no")
 KEYS_REPEAT_HZ = int(CONF.get("KEYS_REPEAT_HZ", "10"))
+SENSORS_ENABLED = CONF.get("SENSORS_ENABLED", "1") not in ("0", "false", "no")
+SENSORS_STALE_SEC = float(CONF.get("SENSORS_STALE_SEC", "0.5"))
+SENSORS_DEADZONE_DEG = float(CONF.get("SENSORS_PEDAL_DEADZONE_DEG", "1.5"))
+SENSORS_RANGE_DEG = int(CONF.get("SENSORS_STEER_RANGE_DEG", "900"))
 
 # Range assumed for a wheel whose rotation range CANNOT be set — no sysfs
 # `range` attribute, so nothing is being instructed and the figure is pure
@@ -119,6 +125,11 @@ CMD_PATH = os.path.join(RUN_DIR, "wheel-cmd.json")
 # adiona_controller.py on behalf of the kiosk page.
 KEYS_STATUS_PATH = os.path.join(RUN_DIR, "keys.json")
 KEYS_CMD_PATH = os.path.join(RUN_DIR, "keys-cmd.json")
+# And again for the USB vehicle sensors. Three pairs rather than one shared file
+# because each is owned by one thing and read by one other; a single status file
+# would put the calibration UI's 10 Hz poll on the same document as the wheel's.
+SENSORS_STATUS_PATH = os.path.join(RUN_DIR, "sensors.json")
+SENSORS_CMD_PATH = os.path.join(RUN_DIR, "sensors-cmd.json")
 # Written by adiona-updater.py. Read-only here, and entirely optional: a box with
 # no updater service just reports zero flags.
 UPDATE_STATUS_PATH = os.path.join(RUN_DIR, "update.json")
@@ -138,6 +149,15 @@ except Exception as e:                             # deliberately broad
     # `as e` is unbound once the block ends, so the reason is copied out here.
     adiona_keys = None
     KEYS_IMPORT_ERROR = str(e) or e.__class__.__name__
+
+# The USB vehicle sensor bridge, on exactly the same terms. A fault in it must
+# cost the sensor rig and leave a racing wheel plugged into the same box working.
+SENSORS_IMPORT_ERROR = ""
+try:
+    import adiona_sensors
+except Exception as e:                             # deliberately broad
+    adiona_sensors = None
+    SENSORS_IMPORT_ERROR = str(e) or e.__class__.__name__
 
 # ── Wire format ──────────────────────────────────────────────────────────────
 # Everything on UDP 5010, little-endian. Finalised in v1.7.0, before the first
@@ -207,7 +227,8 @@ DEVICE_TYPE_SHIFTER = 3
 DEVICE_TYPE_SENSORS = 16             # USB vehicle sensor pack
 
 # Device capabilities. Bits 10-31 are reserved for further input capabilities,
-# 32-47 for vehicle-sensor ones (defined when that hardware lands), 48-63 spare.
+# 32-47 for vehicle-sensor ones (defined below, when that hardware landed),
+# 48-63 spare.
 CAP_STEERING = 1 << 0
 CAP_PEDALS = 1 << 1
 CAP_CLUTCH = 1 << 2
@@ -220,6 +241,23 @@ CAP_RANGE_SETTABLE = 1 << 7          # the sysfs `range` attribute exists
 # the one currently applied. Lets the headset offer only settings that will work.
 CAP_RANGE_270 = 1 << 8
 CAP_RANGE_900 = 1 << 9
+
+# Vehicle sensors, in the range reserved for them. WHICH BOXES ARE ATTACHED, not
+# which are calibrated: a box that is plugged in but not yet set up can do this
+# job, it just is not doing it yet, and that distinction is what FLAGS are for
+# (FLAG_SENSOR_*_CAL below). EVO is defined here so the bit is claimed before the
+# hardware exists; nothing sets it yet.
+CAP_SENSOR_STEERING = 1 << 32
+CAP_SENSOR_GAS = 1 << 33
+CAP_SENSOR_BRAKE = 1 << 34
+CAP_SENSOR_EVO = 1 << 35
+
+SENSOR_CAP_BITS = {
+    "steer": CAP_SENSOR_STEERING,
+    "gas": CAP_SENSOR_GAS,
+    "brake": CAP_SENSOR_BRAKE,
+    "evo": CAP_SENSOR_EVO,
+}
 
 # BOX, minimum 72 bytes, 1 Hz. What this box IS and what it CAN DO, so the
 # headset can decide whether a feature is available without comparing version
@@ -278,6 +316,25 @@ FLAG_PEDALS_MAPPED = 1 << 1
 FLAG_RANGE_APPLIED = 1 << 2
 FLAG_BUTTONS_MAPPED = 1 << 3   # at least one button role is bound on this wheel
 FLAG_KEYBOARD_PRESENT = 1 << 4  # a USB keyboard is plugged into the box
+# Vehicle sensors, on the AI02 descriptor only: which of them are CALIBRATED
+# right now. State, not capability — an operator can calibrate one mid-event and
+# these change under a headset that is already streaming.
+FLAG_SENSOR_STEER_CAL = 1 << 5
+FLAG_SENSOR_GAS_CAL = 1 << 6
+FLAG_SENSOR_BRAKE_CAL = 1 << 7
+
+SENSOR_CAL_FLAG_BITS = {
+    "steer": FLAG_SENSOR_STEER_CAL,
+    "gas": FLAG_SENSOR_GAS_CAL,
+    "brake": FLAG_SENSOR_BRAKE_CAL,
+}
+
+# ── The headset's licence mask ───────────────────────────────────────────────
+# Bit positions are Adiona-G's Global.FeatureFlag, and must not drift from it.
+# Only the bits this box actually consumes are named here; the rest of the word
+# is carried untouched, which is the whole point of sending it whole.
+FEATURE_INVEHICLE = 1 << 2      # Drive Square in-vehicle sensors
+FEATURE_EVO = 1 << 4            # the EVO box, when it exists
 
 # The `buttons` field carries SEMANTIC ROLES, not raw button bits. Same principle
 # as the axes: the box knows which physical button is the left paddle, the
@@ -706,6 +763,8 @@ def box_capabilities():
     caps = BOXCAP_WHEEL                       # this service is the wheel
     if adiona_keys is not None and KEYS_ENABLED:
         caps |= BOXCAP_KEYBOARD
+    if adiona_sensors is not None and SENSORS_ENABLED:
+        caps |= BOXCAP_SENSORS
     if os.path.exists(UPDATE_STATUS_PATH):
         caps |= BOXCAP_UPDATER
     if os.path.isfile(PLAYER_PATH):
@@ -794,6 +853,22 @@ STATE = {
     # Never cleared once set, so the value survives a headset disconnecting
     # mid-event; freshness, when something needs it, is STATE["subscriber"].
     "feature_flags": None,
+
+    # ── USB vehicle sensors ──────────────────────────────────────────────────
+    # Only what the sender needs to build a packet without calling into
+    # adiona_sensors while holding LOCK — that module has a lock of its own and
+    # holding both at once is the shape a deadlock grows from. The detail the UI
+    # wants lives in /run/adiona/sensors.json, written from the module's own
+    # status(), exactly as the keyboard's does.
+    "sensors_present": False,     # steering + gas attached
+    "sensors_active": False,      # ...and licensed, calibrated, driving AW02
+    "sensors_name": "",
+    "sensors_caps": 0,            # CAP_SENSOR_* word
+    "sensors_flags": 0,           # FLAG_SENSOR_*_CAL word
+    "sensors_range_deg": SENSORS_RANGE_DEG,
+    "sensors_steer_deg": 0.0,
+    "sensors_throttle": 0.0,
+    "sensors_brake": 0.0,
 }
 
 RUNNING = True
@@ -802,6 +877,28 @@ RUNNING = True
 # box, the module failed to import, or KEYS_ENABLED=0 — in all three cases every
 # keystroke field on the wire stays zero and the headset simply never sees a key.
 KEYS = [None]
+
+# The USB vehicle sensor set, once main() has started it. None means no support
+# on this box (module missing or SENSORS_ENABLED=0); an empty set means the
+# module is running and nothing is plugged in.
+SENSORS = [None]
+
+
+def sensors_licensed():
+    """Whether the subscribed headset's licence covers the USB sensor rig.
+
+    THE ONLY PLACE A LICENCE BIT IS TESTED. STATE["feature_flags"] stays the
+    headset's entire mask, verbatim, and each consumer tests the bit it cares
+    about — that is what keeps the next licensed feature a one-line change here
+    rather than a change at both ends of the wire.
+
+    None permits, deliberately: it means no headset has ever reported a mask,
+    which is what a fully-licensed older APK looks like (it sends the 8-byte
+    ASUB with no tail). Reading that as "licensed nothing" would take the rig
+    away from the customers most likely to be using one.
+    """
+    flags = STATE["feature_flags"]
+    return flags is None or bool(flags & FEATURE_INVEHICLE)
 
 
 def keys_fields():
@@ -1173,15 +1270,48 @@ def write_keys_status():
     write_json(KEYS_STATUS_PATH, json.dumps(status))
 
 
+def write_sensors_status():
+    """Publish the sensor rig's state for the kiosk page.
+
+    Written even with nothing attached, and even with the module missing, so the
+    page can tell "no sensors on this box" from "no sensor support in this
+    build" from "the wheel service is not running" — three different problems
+    that look identical from an empty file."""
+    sensors = SENSORS[0]
+    if sensors is None:
+        status = {
+            "enabled": False, "present": False, "attached": 0,
+            "licensed": False, "active": False, "dirty": False,
+            "message": SENSORS_IMPORT_ERROR, "calibrating": None, "sensors": [],
+        }
+    else:
+        with LOCK:
+            active = STATE["sensors_active"]
+        status = sensors.status(licensed=sensors_licensed(), active=active)
+    write_json(SENSORS_STATUS_PATH, json.dumps(status))
+
+
 def read_command(last_seq, path=CMD_PATH):
-    """Return (seq, command dict) if a newer command is waiting, else (last_seq, None)."""
+    """Return (seq, command dict) if a NEW command is waiting, else (last_seq, None).
+
+    New means the sequence CHANGED, not that it went up. There is exactly one
+    writer per command file and it only rewrites the file to issue a command, so
+    any change is a command — while "went up" quietly loses every command issued
+    after the controller restarts, because its counter starts again from zero
+    while this service, which did not restart, still remembers the old high-water
+    mark. The symptom is the worst kind: the first few keypresses on a setup tab
+    do nothing at all and there is no error anywhere to explain it.
+
+    The controller also seeds its counters from these files at startup, which
+    keeps the sequence monotonic in the normal case. This is what recovers a box
+    that is already out of step."""
     try:
         with open(path) as fh:
             cmd = json.load(fh)
     except (OSError, ValueError):
         return last_seq, None
     seq = int(cmd.get("seq", 0))
-    if seq <= last_seq:
+    if seq == last_seq:
         return last_seq, None
     return seq, cmd
 
@@ -1189,27 +1319,64 @@ def read_command(last_seq, path=CMD_PATH):
 def device_packets():
     """One AI02 descriptor per device attached to the box.
 
-    CALLER MUST HOLD LOCK. A list rather than a single packet because the USB
-    vehicle sensors will append their own entry here; today it is the wheel or
-    nothing at all.
+    CALLER MUST HOLD LOCK. A list rather than a single packet: a Drive Square
+    sensor rig is described twice, because two different questions are being
+    answered and they have different answers.
+
+    EXACTLY ONE DEVICE_TYPE_WHEEL DESCRIPTOR, AND IT IS ALWAYS WHAT DRIVES THE
+    STREAM. That is the invariant this function exists to hold. The headset reads
+    the steering name and full-lock range off the wheel entry and off nothing
+    else (LanWheelManager._apply_info), and the range matters: the box scales
+    steer_deg by range/2 and the headset divides by exactly the same figure, so
+    the two must agree or full lock lands somewhere the control cannot reach. A
+    sensor rig that is driving the stream therefore appears as the wheel — which
+    is what it is, functionally — carrying its own calibrated range.
+
+    The DEVICE_TYPE_SENSORS entry answers the other question: what vehicle
+    sensors are attached, which of them are calibrated, and what they are called.
+    A consequence worth knowing: an idle racing wheel is NOT announced while a
+    rig is driving, because announcing it would break the invariant above and
+    there is no second wheel slot to put it in.
 
     The `flags` here describe the DEVICE, not the stream — deliberately narrower
     than STATE's flags, which also carry the keyboard. Capabilities say what the
     hardware could ever do; flags say what it is doing now.
     """
-    if not STATE["present"]:
-        return ()
-    flags = 0
-    if STATE["mapped"]:
-        flags |= FLAG_PEDALS_MAPPED
-    if STATE["range_applied"]:
-        flags |= FLAG_RANGE_APPLIED
-    if STATE["button_map"]:
-        flags |= FLAG_BUTTONS_MAPPED
-    flags |= FLAG_WHEEL_PRESENT
-    return (INFO_FMT.pack(INFO_MAGIC, DEVICE_TYPE_WHEEL, 0, flags,
-                          STATE["caps"], STATE["range_deg"], 0,
-                          utf8_fit(STATE["name"], NAME_LEN)),)
+    out = []
+    if STATE["sensors_active"]:
+        # The rig, wearing the wheel's hat. No force feedback and no settable
+        # range: those are facts about a Logitech, not about a box clamped to a
+        # real steering wheel, and claiming them would have the headset offer
+        # settings that do nothing.
+        out.append(INFO_FMT.pack(
+            INFO_MAGIC, DEVICE_TYPE_WHEEL, 0,
+            FLAG_WHEEL_PRESENT | FLAG_PEDALS_MAPPED | STATE["sensors_flags"],
+            CAP_STEERING | CAP_PEDALS | STATE["sensors_caps"],
+            STATE["sensors_range_deg"], 0,
+            utf8_fit(STATE["sensors_name"], NAME_LEN)))
+    elif STATE["present"]:
+        flags = FLAG_WHEEL_PRESENT
+        if STATE["mapped"]:
+            flags |= FLAG_PEDALS_MAPPED
+        if STATE["range_applied"]:
+            flags |= FLAG_RANGE_APPLIED
+        if STATE["button_map"]:
+            flags |= FLAG_BUTTONS_MAPPED
+        out.append(INFO_FMT.pack(INFO_MAGIC, DEVICE_TYPE_WHEEL, 0, flags,
+                                 STATE["caps"], STATE["range_deg"], 0,
+                                 utf8_fit(STATE["name"], NAME_LEN)))
+
+    # Attached AND licensed, not merely driving: "sensors attached, steering not
+    # yet calibrated" is a thing the headset's status line should be able to say,
+    # and the CAL flags are how it knows. Unlicensed, nothing is sent at all —
+    # this box's only job with the licence is to avoid OFFERING hardware it does
+    # not cover.
+    if STATE["sensors_present"] and sensors_licensed():
+        out.append(INFO_FMT.pack(INFO_MAGIC, DEVICE_TYPE_SENSORS, 0,
+                                 STATE["sensors_flags"], STATE["sensors_caps"],
+                                 STATE["sensors_range_deg"], 0,
+                                 utf8_fit(STATE["sensors_name"], NAME_LEN)))
+    return tuple(out)
 
 
 # ── Threads ──────────────────────────────────────────────────────────────────
@@ -1279,22 +1446,39 @@ def sender_thread(sock):
 
         seq = (seq + 1) & 0xFFFFFFFF
         tick += 1
+        # Sampled here, outside the lock and at the full send rate. Not from
+        # STATE: publish_sensors() refreshes that at 20 Hz, which would alias the
+        # steering box's 67 Hz stream and add up to 50 ms to the one number
+        # latency is visible in. Same reason, and the same shape, as reading the
+        # keystroke ring outside the lock below.
+        use_sensors, s_steer, s_throttle, s_brake = sensors_sample()
         with LOCK:
             flags = 0
-            if STATE["present"]:
-                flags |= FLAG_WHEEL_PRESENT
-            if STATE["mapped"]:
-                flags |= FLAG_PEDALS_MAPPED
-            if STATE["range_applied"]:
-                flags |= FLAG_RANGE_APPLIED
-            if STATE["button_map"]:
-                flags |= FLAG_BUTTONS_MAPPED
+            if use_sensors:
+                # The rig is the source. FLAG_PEDALS_MAPPED is not decoration:
+                # LanWheelManager.is_wheel_ready() requires it, and setting it
+                # here is the whole reason the headset needs no new code path.
+                # The rig has no buttons, so no paddle roles are claimed.
+                flags |= FLAG_WHEEL_PRESENT | FLAG_PEDALS_MAPPED
+                steer = s_steer
+                throttle = int(round(s_throttle * 65535))
+                brake = int(round(s_brake * 65535))
+                buttons = 0
+            else:
+                if STATE["present"]:
+                    flags |= FLAG_WHEEL_PRESENT
+                if STATE["mapped"]:
+                    flags |= FLAG_PEDALS_MAPPED
+                if STATE["range_applied"]:
+                    flags |= FLAG_RANGE_APPLIED
+                if STATE["button_map"]:
+                    flags |= FLAG_BUTTONS_MAPPED
+                steer = STATE["steer_deg"]
+                throttle = int(round(STATE["throttle"] * 65535))
+                brake = int(round(STATE["brake"] * 65535))
+                buttons = STATE["buttons"]
             if STATE["keyboard"]:
                 flags |= FLAG_KEYBOARD_PRESENT
-            steer = STATE["steer_deg"]
-            throttle = int(round(STATE["throttle"] * 65535))
-            brake = int(round(STATE["brake"] * 65535))
-            buttons = STATE["buttons"]
             STATE["seq"] = seq
             # Built under the same lock rather than re-read later, so a device
             # unplugged mid-tick cannot be described half from one state and half
@@ -1321,10 +1505,11 @@ def sender_thread(sock):
             pass                                # drop-tolerant by design
 
 
-def housekeeping_thread(get_wheel, do_command):
+def housekeeping_thread(get_wheel, do_command, do_sensor_command):
     """Publish status and poll for setup commands from the controller."""
     last_seq = 0
     last_keys_seq = 0
+    last_sensors_seq = 0
     interval = 1.0 / HOUSEKEEP_HZ
     ticks = 0
     while RUNNING:
@@ -1332,8 +1517,13 @@ def housekeeping_thread(get_wheel, do_command):
         if reader is not None:
             with LOCK:
                 STATE["keyboard"] = reader.present()
+        # The sensor rig has its own reader thread, so this is only the copy into
+        # STATE. At HOUSEKEEP_HZ (20 Hz) it is well inside the 0.5 s staleness
+        # window, and it keeps every read of the module off the sender's path.
+        publish_sensors()
         write_status()
         write_keys_status()
+        write_sensors_status()
         # The updater's status file only needs reading at the rate we transmit
         # it, not at the 20 Hz this loop runs at.
         if ticks % HOUSEKEEP_HZ == 0:
@@ -1354,6 +1544,13 @@ def housekeeping_thread(get_wheel, do_command):
                 reader.set_panel(bool(keys_cmd.get("open")), keys_cmd.get("tab"))
             except Exception as e:
                 log("panel command failed: %s" % e)
+        last_sensors_seq, sensors_cmd = read_command(last_sensors_seq,
+                                                     SENSORS_CMD_PATH)
+        if sensors_cmd:
+            try:
+                do_sensor_command(sensors_cmd)
+            except Exception as e:          # a bad command must never kill us
+                log("sensor command failed: %s" % e)
         time.sleep(interval)
 
 
@@ -1378,10 +1575,94 @@ def start_keyboard():
         return
     reader = adiona_keys.KeyReader(
         log, repeat_hz=KEYS_REPEAT_HZ, enabled=True,
-        update_status_path=UPDATE_STATUS_PATH, subscriber_live=subscriber_live)
+        update_status_path=UPDATE_STATUS_PATH, subscriber_live=subscriber_live,
+        on_recentre=sensors_recentre)
     KEYS[0] = reader
     threading.Thread(target=reader.run, daemon=True).start()
     log("keyboard bridge started (repeat %d Hz)" % KEYS_REPEAT_HZ)
+
+
+def sensors_sample():
+    """(drives, steer_deg, throttle, brake) — the ONE rule for whether the rig
+    is the input source, evaluated against a single consistent snapshot.
+
+    `drives` means: licensed, attached, calibrated, fresh, and not mid-
+    calibration. Anything less and the rig does not reach a car — an unlicensed
+    rig must not be offered at all, and a half-finished calibration sweep is not
+    a driving input.
+
+    Called from the sender at TX_HZ and from publish_sensors() at HOUSEKEEP_HZ,
+    so the descriptor and the stream can never disagree about what is driving.
+    """
+    sensors = SENSORS[0]
+    if sensors is None:
+        return False, 0.0, 0.0, 0.0
+    ready, steer, throttle, brake = sensors.sample()
+    if not (ready and sensors_licensed()):
+        return False, 0.0, 0.0, 0.0
+    return True, steer, throttle, brake
+
+
+def publish_sensors():
+    """Copy the sensor rig's live values into STATE for the descriptors and UI.
+
+    Everything the module is asked for is read BEFORE the lock is taken. It has a
+    lock of its own, and holding both at once is the shape a deadlock grows from
+    — the same rule the keystroke ring is read under in sender_thread().
+
+    The sender does NOT take its steering from here. This runs at HOUSEKEEP_HZ,
+    which would alias the steering box's 67 Hz stream down to 20 Hz and put up to
+    50 ms of staleness into the one value latency is actually visible in.
+    """
+    sensors = SENSORS[0]
+    if sensors is None:
+        return
+    present = sensors.present()
+    active, steer, throttle, brake = sensors_sample()
+    caps = sensors.caps(SENSOR_CAP_BITS)
+    cal_flags = sensors.cal_flags(SENSOR_CAL_FLAG_BITS)
+    range_deg = sensors.range_deg(SENSORS_RANGE_DEG)
+    name = sensors.device_name()
+
+    with LOCK:
+        STATE["sensors_present"] = present
+        STATE["sensors_active"] = active
+        STATE["sensors_name"] = name
+        STATE["sensors_caps"] = caps
+        STATE["sensors_flags"] = cal_flags
+        STATE["sensors_range_deg"] = range_deg
+        STATE["sensors_steer_deg"] = round(steer, 3)
+        STATE["sensors_throttle"] = round(throttle, 4)
+        STATE["sensors_brake"] = round(brake, 4)
+
+
+def start_sensors():
+    """Bring up the USB vehicle sensor bridge, or explain in the log why not."""
+    if adiona_sensors is None:
+        log("vehicle sensors unavailable: %s" % SENSORS_IMPORT_ERROR)
+        return
+    if not SENSORS_ENABLED:
+        log("vehicle sensors disabled (SENSORS_ENABLED=0)")
+        return
+    sensors = adiona_sensors.SensorSet(
+        log, SENSOR_CAL_PATH, stale_sec=SENSORS_STALE_SEC,
+        pedal_deadzone_deg=SENSORS_DEADZONE_DEG, enabled=True)
+    SENSORS[0] = sensors
+    threading.Thread(target=sensors.run, daemon=True).start()
+    log("vehicle sensor bridge started (calibration %s)" % SENSOR_CAL_PATH)
+
+
+def sensors_recentre():
+    """Ctrl+S from the box's own keyboard: zero the steering turn count.
+
+    A no-op unless the rig is actually the steering source — a racing wheel is an
+    absolute encoder with no turn count to lose, and the headset's own Ctrl+S
+    handling is right for it and is left alone.
+    """
+    sensors = SENSORS[0]
+    if sensors is None or not STATE["sensors_active"]:
+        return
+    sensors.recentre()
 
 
 def publish_wheel(wheel):
@@ -1449,8 +1730,33 @@ def main():
     log("box report: v%s on %s (id %04X)" %
         (BOX_INFO["app_str"] or "?", BOX_INFO["os_str"] or "?", BOX_INFO["box_id"]))
     start_keyboard()
+    start_sensors()
 
     current = {"wheel": None}
+
+    def do_sensor_command(cmd):
+        """Handle one calibration command from the on-TV UI (via the controller).
+
+        Every branch is a one-liner into adiona_sensors: the state machine, the
+        prompts and the maths all live there, because that is where the device
+        knowledge belongs and this file already has enough of it."""
+        sensors = SENSORS[0]
+        if sensors is None:
+            return
+        action = cmd.get("action")
+        role = cmd.get("role")
+        if action == "calibrate":
+            sensors.begin(role)
+        elif action == "next":
+            sensors.advance()
+        elif action == "cancel":
+            sensors.cancel()
+        elif action == "recentre":
+            sensors.recentre()
+        elif action == "clear":
+            sensors.clear(role)
+        elif action == "save":
+            sensors.save()
 
     def do_command(cmd):
         """Handle one setup command from the on-TV UI (via the controller)."""
@@ -1521,7 +1827,8 @@ def main():
     threading.Thread(target=receiver_thread, args=(sock,), daemon=True).start()
     threading.Thread(target=sender_thread, args=(sock,), daemon=True).start()
     threading.Thread(target=housekeeping_thread,
-                     args=(lambda: current["wheel"], do_command),
+                     args=(lambda: current["wheel"], do_command,
+                           do_sensor_command),
                      daemon=True).start()
 
     last_scan = 0.0
@@ -1556,9 +1863,63 @@ def main():
         RUNNING = False
         if current["wheel"]:
             current["wheel"].close()
+        if SENSORS[0]:
+            SENSORS[0].close()
 
 
 # ── --dump ───────────────────────────────────────────────────────────────────
+def dump_sensors():
+    """Print every Drive Square sensor box, its role, its rate and its live
+    quaternion. The first thing to run when a rig behaves oddly: it separates
+    "the box is not enumerating" from "the box is silent" from "the calibration
+    is wrong", which look identical from the TV."""
+    if adiona_sensors is None:
+        print("vehicle sensor support unavailable: %s" % SENSORS_IMPORT_ERROR)
+        return
+    try:
+        links = sorted(os.listdir(adiona_sensors.BY_ID_DIR))
+    except OSError:
+        links = []
+    found = [n for n in links if adiona_sensors.parse_by_id(n)]
+    if not found:
+        others = [n for n in links if not adiona_sensors.parse_by_id(n)]
+        print("no Drive Square sensor boxes under %s" % adiona_sensors.BY_ID_DIR)
+        if others:
+            print("  (%d other serial device(s) there: %s)"
+                  % (len(others), ", ".join(others[:3])))
+        print()
+        return
+
+    sensors = adiona_sensors.SensorSet(log, SENSOR_CAL_PATH,
+                                       stale_sec=SENSORS_STALE_SEC,
+                                       pedal_deadzone_deg=SENSORS_DEADZONE_DEG)
+    threading.Thread(target=sensors.run, daemon=True).start()
+    time.sleep(2.0)                       # let it scan, open and measure a rate
+    st = sensors.status()
+    print("\nDrive Square USB sensors — %d attached, rig %s"
+          % (st["attached"], "complete" if st["present"] else "INCOMPLETE "
+             "(needs at least Steering and Gas)"))
+    for s in st["sensors"]:
+        print("\n  %-6s '%s'" % (s["role"], s["name"]))
+        print("    %s   serial %s" % (s["dev"], s["serial"]))
+        print("    %-8s %.1f Hz   q = %s"
+              % ("streaming" if s["fresh"] else "SILENT", s["hz"], s["q"]))
+        if s["calibrated"]:
+            axis = "(%+.3f, %+.3f, %+.3f)" % tuple(s["axis"])
+            if s["role"] == "steer":
+                print("    calibrated  axis %s  left %+.0f  right %+.0f  "
+                      "range %d deg" % (axis, s["left_deg"], s["right_deg"],
+                                        s["range_deg"]))
+            else:
+                print("    calibrated  axis %s  travel %.1f deg"
+                      % (axis, s["full_deg"]))
+            print("    live: %s" % s["value"])
+        else:
+            print("    NOT CALIBRATED — F12 on the box, Vehicle sensors tab")
+    print()
+    sensors.close()
+
+
 def dump():
     """
     Print every input device with absolute axes, then stream live axis values.
@@ -1568,6 +1929,7 @@ def dump():
     Watch that gas and brake move *different* axes — if one axis moves for both,
     hid-logitech-hidpp has combined the pedals and they cannot be separated here.
     """
+    dump_sensors()
     devs = list(candidate_devices())
     if not devs:
         print("no devices with absolute axes found under /dev/input")
