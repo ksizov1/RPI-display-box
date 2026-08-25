@@ -1646,7 +1646,8 @@ def start_sensors():
         return
     sensors = adiona_sensors.SensorSet(
         log, SENSOR_CAL_PATH, stale_sec=SENSORS_STALE_SEC,
-        pedal_deadzone_deg=SENSORS_DEADZONE_DEG, enabled=True)
+        pedal_deadzone_deg=SENSORS_DEADZONE_DEG,
+        steer_range_deg=SENSORS_RANGE_DEG, enabled=True)
     SENSORS[0] = sensors
     threading.Thread(target=sensors.run, daemon=True).start()
     log("vehicle sensor bridge started (calibration %s)" % SENSOR_CAL_PATH)
@@ -1892,7 +1893,8 @@ def dump_sensors():
 
     sensors = adiona_sensors.SensorSet(log, SENSOR_CAL_PATH,
                                        stale_sec=SENSORS_STALE_SEC,
-                                       pedal_deadzone_deg=SENSORS_DEADZONE_DEG)
+                                       pedal_deadzone_deg=SENSORS_DEADZONE_DEG,
+                                       steer_range_deg=SENSORS_RANGE_DEG)
     threading.Thread(target=sensors.run, daemon=True).start()
     time.sleep(2.0)                       # let it scan, open and measure a rate
     st = sensors.status()
@@ -1907,9 +1909,9 @@ def dump_sensors():
         if s["calibrated"]:
             axis = "(%+.3f, %+.3f, %+.3f)" % tuple(s["axis"])
             if s["role"] == "steer":
-                print("    calibrated  axis %s  left %+.0f  right %+.0f  "
-                      "range %d deg" % (axis, s["left_deg"], s["right_deg"],
-                                        s["range_deg"]))
+                print("    calibrated  axis %s  from %.0f deg of sweep  "
+                      "(hardware range %d deg)"
+                      % (axis, s.get("sweep_deg", 0), s["range_deg"]))
             else:
                 print("    calibrated  axis %s  travel %.1f deg"
                       % (axis, s["full_deg"]))

@@ -385,8 +385,29 @@ pre-defined position** and only the pedals were ever calibrated.
 
 These send the full **Kalman-fused quaternion**, which carries enough
 information to *discover* the mounting instead of dictating it. So all three are
-calibrated, and steering properly: the operator turns the wheel left and right,
-and the box works out the axis it actually rotates about and how far it goes.
+calibrated: the operator turns each control, and the box works out the axis it
+actually rotates about.
+
+**Only the axis, and which way it moves first.** No limit is measured anywhere. A
+quaternion gives every angle outright, so there is nothing to learn by having
+someone haul a wheel against its stops — a step that is awkward to perform, easy
+to undershoot, and silently wrong when undershot: the sim would reach full lock
+early, for the rest of the event, with nothing on screen to suggest why. The
+rig's steering travel is declared once in `box.conf` instead
+(`SENSORS_STEER_RANGE_DEG`, default 900), and a pedal's is an envelope that grows
+as it is pressed.
+
+## Degrees, not a fraction
+
+`AW02.steer_deg` carries **degrees from centre** — 640° right is 640, not
+"almost full lock". That is the whole reason the same rig can drive a car, a
+tractor, a forklift or the rear steer of a tiller truck: how far the road wheels
+turn for a given angle at the hand wheel is a property of the *vehicle*, and only
+the vehicle model knows it.
+
+The box's job stops at reporting the angle honestly. `range_deg` in `AI02` says
+what the hardware can do, and the only thing the box does with it is clamp — so a
+slipped turn count cannot send a car to a lock the wheel could never reach.
 
 ## How it works
 
@@ -425,11 +446,36 @@ rig is unplugged.
 Press **F12** on a keyboard attached to the box and select **Vehicle sensors**
 with **→**. The tab only exists while a sensor box is actually plugged in.
 
-1. Pick a sensor with **↑ ↓** and press **Enter**.
-2. Follow the prompts. Steering is three steps — centre the wheel, turn fully
-   left, turn fully right — and each is confirmed with **Enter**. A pedal is
-   two: released, then fully pressed.
-3. Repeat for the other sensors, then press **S** to save.
+**One calibration for the whole rig, and two keypresses.**
+
+1. **Enter** on *Calibrate all sensors*.
+2. *"Take your feet off both pedals and centre the steering wheel"* — do it and
+   press **Enter**. That is the zero pose for all three at once.
+3. Now just use the controls, in any order and with no keypresses at all:
+   **turn the wheel right first**, then left as far as it goes; **press the gas
+   and brake all the way down**. Each row says `measuring…` and then
+   `calibrated` as it gets what it needs, and the banner turns green when
+   everything has.
+4. **Enter** (or **S**) to confirm. It saves itself — there is no separate save
+   step, and both keys mean the same thing while a calibration is running.
+
+Watch the bars as you go. They are live from the moment each sensor has its
+axis, *before* anything is committed, so turning the wheel right and seeing the
+bar go right is the check that it is not about to be calibrated backwards.
+
+Nothing has to be done "properly" the first time. **A pedal's travel is an
+envelope that only ever grows** while the calibration is open, so a first
+half-hearted press is not a mistake to undo — pressing further just extends it.
+The steering axis keeps being refined from every degree you turn.
+
+**Turn right first.** It is the only thing that tells the box which way right
+is, and it settles within the first 10° of the sweep. If the steering ends up
+inverted, clear it with **C** and calibrate again, turning right first this time.
+
+**About 30° of movement is enough** for any control's axis — a quaternion pins a
+hinge down quickly. That matters for hardware that cannot do a full turn:
+motorcycle bars, a kart wheel, a forklift tiller. Turn further if you can, since
+a longer sweep gives a better axis, but nothing *requires* it.
 
 Every box's raw quaternion, rate and derived value are shown live underneath, so
 a calibration that came out wrong is visible **before** it is saved. **Esc**
@@ -437,6 +483,22 @@ cancels a calibration in progress; a second **Esc** closes the panel. **C**
 clears the selected sensor's calibration.
 
 Saved to `/etc/adiona/sensor-cal.json` and picked up automatically from then on.
+
+### When a row will not go green
+
+| It says | It means |
+|---|---|
+| `move it — 4° of 30°` | It has not been moved enough yet to find its axis |
+| `moving every which way — is it fixed to the pedal?` | Plenty of movement, but not about one axis. Almost always a box being waved rather than turning on its mount |
+| `press it all the way down` | It has an axis but has not yet moved far enough from its zero, or it moved less than 5° in total |
+
+**A pedal that reads backwards** — full at rest, zero when pressed — means its
+zero pose was captured while it was already down. Redo the calibration with both
+feet off the pedals at step 1. The direction is taken from the first way each
+control moves away from its zero, so the zero has to be genuine.
+
+Watch the bars rather than trusting the words: they are live from the moment a
+sensor has its axis, which is well before it is committed.
 
 ### `Ctrl+S` — the steering reset
 
@@ -668,6 +730,9 @@ Settings worth a deliberate decision per venue:
   entirely. `SENSORS_STALE_SEC` is the safety floor that zeroes a channel whose
   box goes quiet; `SENSORS_PEDAL_DEADZONE_DEG` stops a settled pedal box holding
   the throttle slightly open.
+- **`SENSORS_STEER_RANGE_DEG`** — the rig's full lock-to-lock travel, **declared
+  rather than measured** (default 900, a car). It bounds what goes on the wire;
+  it does not scale the steering. Change it for a bus, tractor or kart wheel.
 - **`UPDATE_ENABLED`** — set to `0` for a box that must never offer an update,
   such as one left with a customer between visits. `UPDATE_PROMPT_SECONDS`,
   `UPDATE_KEEP_RELEASES` and `UPDATE_ALLOW_PACKAGES` tune the rest.

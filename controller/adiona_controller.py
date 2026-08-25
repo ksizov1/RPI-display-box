@@ -291,7 +291,10 @@ def sensor_command(data):
         return {"ok": False, "message": "unknown action"}
 
     cmd = {"action": action}
-    if action in ("calibrate", "clear"):
+    # Only `clear` names a sensor. Calibration is one procedure covering the
+    # whole rig — everything is zeroed in one pose and swept together — so a
+    # role here would be a promise the box does not keep.
+    if action == "clear":
         role = str(data.get("role", ""))
         if role not in ("steer", "gas", "brake"):
             return {"ok": False, "message": "bad role"}

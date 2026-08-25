@@ -181,6 +181,10 @@
                 text-align: center; line-height: 1.35; }
   .sns-prompt .step { display: block; font-size: 1.7vmin; font-weight: 500;
                       color: #5f6368; margin-bottom: 0.6vmin; }
+  /* Goes green the moment every attached sensor has what it needs. That colour
+     IS the "you can stop now" signal, for someone who is looking at the screen
+     from a car seat with both hands on a wheel. */
+  .sns-prompt.done { background: #e6f4ea; border-color: #1a7f37; color: #0d652d; }
   .sns-row .st { width: 13ch; font-size: 1.9vmin; }
   .sns-row .st.no { color: #c1121f; font-weight: 600; }
   .sns-row .st.yes { color: #1a7f37; font-weight: 600; }
@@ -1113,7 +1117,7 @@
   }
 
   function snsBuildRows() {
-    var rows = [];
+    var rows = [{ kind: "calibrate" }];
     (sns.sensors || []).forEach(function (s) {
       // EVO has no calibration procedure yet — the hardware does not exist. It
       // is listed below with the live readouts so a plugged-in one is visible,
@@ -1128,30 +1132,68 @@
   }
 
   function snsRenderRow(row) {
+    if (row.kind === "calibrate") {
+      return '<span class="role">Calibrate</span>' +
+             '<span class="st">all sensors</span>' +
+             '<span class="det">Enter — zero everything, then sweep it</span>';
+    }
     if (row.kind === "recentre") {
       return '<span class="role">Recentre</span>' +
              '<span class="st">steering</span>' +
              '<span class="det">Enter — zero the turn count (also Ctrl+S)</span>';
     }
-    var s = row.sensor, det = "";
-    if (!s.fresh) {
-      det = "no data — check the cable";
-    } else if (!s.calibrated) {
-      det = "Enter to calibrate";
-    } else if (s.role === "steer") {
-      det = s.range_deg + "°  ·  " + s.left_deg + " / +" + s.right_deg;
+    var s = row.sensor, det = "", st, cls;
+    // Mid-sweep, the row reports what this sensor has SO FAR. That readout is
+    // the entire interface for a step with no keypress in it: it is how someone
+    // turning a wheel knows whether to keep going.
+    var p = s.progress;
+    if (p) {
+      cls = p.state === "ready" ? "yes" : "no";
+      st = p.state === "ready" ? "calibrated"
+         : p.state === "measuring" ? "measuring…" : "waiting";
+      if (p.state === "ready") {
+        det = (s.role === "steer")
+          ? "axis from " + p.swept + "° swept"
+          : "travel " + p.travel + "°  ·  press further to extend";
+      } else if (p.swept < p.need) {
+        det = "move it — " + p.swept + "° of " + p.need + "°";
+      } else if (!p.one_axis) {
+        // It has moved plenty, but not about one axis. Almost always a box that
+        // is being waved rather than turning on a mount — and without saying so
+        // the row just sits on "measuring" for ever with no clue why.
+        det = "moving every which way — is it fixed to the pedal?";
+        cls = "no";
+      } else if (s.role === "steer") {
+        det = "turn RIGHT from centre";
+      } else {
+        det = "press it all the way down";
+      }
     } else {
-      det = "travel " + s.full_deg + "°";
+      cls = s.calibrated ? "yes" : "no";
+      st = s.calibrated ? "calibrated" : "NOT calibrated";
+      if (!s.fresh) {
+        det = "no data — check the cable";
+      } else if (!s.calibrated) {
+        det = "";
+      } else if (s.role === "steer") {
+        // The sweep says how well the axis is known, not how far the wheel
+        // goes — no limit is measured. range_deg is the declared travel.
+        det = "axis from " + s.sweep_deg + "° swept  ·  " + s.range_deg + "° wheel";
+      } else {
+        det = "travel " + s.full_deg + "°";
+      }
     }
+    // Show the bar throughout a calibration, not only once a sensor qualifies:
+    // watching it move is how you tell the wheel is being read at all, and which
+    // way round, while there is still time to do something about it.
     var live = "";
-    if (s.calibrated && s.fresh) {
+    if (s.fresh && (s.calibrated || p) && typeof s.value === "number") {
       live = (s.role === "steer")
         ? bar(s.range_deg ? (s.value / (s.range_deg / 2)) : 0, true)
         : bar(s.value, false);
     }
     return '<span class="role">' + SNS_LABEL[s.role] + '</span>' +
-           '<span class="st ' + (s.calibrated ? "yes" : "no") + '">' +
-             (s.calibrated ? "calibrated" : "NOT calibrated") + '</span>' +
+           '<span class="st ' + cls + '">' + st + '</span>' +
            live +
            '<span class="det">' + esc(det) + '</span>';
   }
@@ -1183,12 +1225,24 @@
     }
 
     var job = sns.calibrating;
-    snsPromptEl.innerHTML = job
-      ? '<div class="sns-prompt"><span class="step">' +
-          esc(SNS_LABEL[job.role] || job.role) + " — step " + (job.index + 1) +
-          " of " + job.steps + '</span>' + esc(job.prompt) +
-          '<span class="step" style="margin:0.6vmin 0 0">Esc to cancel</span></div>'
-      : "";
+    if (!job) {
+      snsPromptEl.innerHTML = "";
+    } else {
+      // The sweep step has no keypress in it — the rows below fill in as each
+      // control qualifies — so the footer says when there is a reason to stop
+      // rather than telling anyone to press something.
+      var foot = job.step === "collect"
+        ? (job.all_ready
+            ? "every sensor has what it needs — press Enter to save"
+            : "keep going, pressing further only extends a pedal · Esc cancels")
+        : "Esc to cancel";
+      snsPromptEl.innerHTML =
+        '<div class="sns-prompt' + (job.all_ready ? " done" : "") + '">' +
+          '<span class="step">Step ' + (job.index + 1) + " of " + job.steps +
+          '</span>' + esc(job.prompt) +
+          '<span class="step" style="margin:0.8vmin 0 0">' + esc(foot) +
+          '</span></div>';
+    }
 
     snsRowList = snsBuildRows();
     if (snsSel >= snsRowList.length) snsSel = Math.max(0, snsRowList.length - 1);
@@ -1266,7 +1320,11 @@
       });
       return;
     }
-    snsPost({ action: "calibrate", role: row.role }).then(loadSensors);
+    // Every other row starts the same thing: there is one calibration and it
+    // covers the whole rig. Selecting Gas and pressing Enter meaning "calibrate
+    // only the gas" would be a promise the box does not keep.
+    snsMsg("");
+    snsPost({ action: "calibrate" }).then(loadSensors);
   }
 
   function snsSave() {
@@ -1609,7 +1667,12 @@
       else if ((e.key === "s" || e.key === "S") && settingsTab === "wheel") {
         whlSave(); e.preventDefault();
       } else if ((e.key === "s" || e.key === "S") && settingsTab === "sensors") {
-        snsSave(); e.preventDefault();
+        // Mid-calibration S means the same as Enter: confirm. The card shows a
+        // "Save (S)" button the whole time, so S is what a hand reaches for at
+        // the end of a sweep, and it must not mean "write the nothing that has
+        // been committed so far".
+        if (sns.calibrating) snsEnter(); else snsSave();
+        e.preventDefault();
       } else if ((e.key === "ArrowLeft" || e.key === "ArrowRight") &&
                  !e.defaultPrevented && !isTextField(e.target)) {
         // Tab switching is on the arrows, NOT on Tab: Tab is the only way to

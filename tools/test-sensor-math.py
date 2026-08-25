@@ -69,12 +69,16 @@ def ramp(lo, hi, step):
     return [lo + (hi - lo) * i / float(n) for i in range(n + 1)]
 
 
-def steer_sign(qs, q0, left_end):
-    """Replay a steering sweep with the calibration's own sign convention:
-    positive is right, so the left sweep must end negative."""
+def steer_sign(qs, q0, right_end):
+    """Replay a steering sweep with the calibration's own sign convention.
+
+    Mirrors _finish_steer_locked(): the operator turns RIGHT first, so the
+    furthest the wheel got from centre during that first phase must come out
+    positive. `right_end` is the sample index where that phase stopped.
+    """
     axis = S.discover_axis(qs)
     thetas, _, _ = S.replay(qs, q0, axis)
-    if thetas[left_end] > 0.0:
+    if max(thetas[:right_end], key=abs) < 0.0:
         axis = tuple(-c for c in axis)
         thetas, _, _ = S.replay(qs, q0, axis)
     return axis, thetas
@@ -99,25 +103,31 @@ qs = sweep(mount, hinge, ramp(0, 450, 3.0), noise=1e-3, rng=rng)
 err = axis_error_deg(S.discover_axis(qs), hinge)
 check("axis within 2 deg at 1e-3 per component", err < 2.0, "err %.4f deg" % err)
 
-print("\n3. multi-turn unwrap: a 900 degree wheel, lock to lock")
+print("\n3. multi-turn unwrap: right a turn and a quarter, then left across")
 mount = q_axis_angle(norm3((1, 2, 3)), 63.0)
 hinge = norm3((0.1, 0.2, 0.97))
-left = ramp(0, -450, 2.0)
-angles = left + ramp(-450, 450, 2.0)
+right = ramp(0, 450, 2.0)                 # the RIGHT phase, as the flow asks
+angles = right + ramp(450, -450, 2.0)
 qs = sweep(mount, hinge, angles)
-axis, thetas = steer_sign(qs, qs[0], len(left) - 1)
+axis, thetas = steer_sign(qs, qs[0], len(right))
 maxerr = max(abs(t - a) for t, a in zip(thetas, angles))
 check("tracks past +-360 with no jump", maxerr < 0.5, "max err %.4f deg" % maxerr)
-check("left stop lands on -450", abs(min(thetas) + 450) < 0.5, "%.2f" % min(thetas))
-check("right stop lands on +450", abs(max(thetas) - 450) < 0.5, "%.2f" % max(thetas))
-cal = S.Calibration("steer", axis, qs[0], min(thetas), max(thetas))
-check("reported range_deg is 900", cal.range_deg() == 900, str(cal.range_deg()))
+check("right lands on +450", abs(max(thetas) - 450) < 0.5, "%.2f" % max(thetas))
+check("left lands on -450", abs(min(thetas) + 450) < 0.5, "%.2f" % min(thetas))
+check("the sign came out right-positive", thetas[len(right) - 1] > 0,
+      "%.1f at the end of the right phase" % thetas[len(right) - 1])
+
+print("\n3b. the same sweep run the other way still resolves right as positive")
+qs_rev = sweep(mount, tuple(-c for c in hinge), angles)
+_, thetas_rev = steer_sign(qs_rev, qs_rev[0], len(right))
+check("mirrored hinge, same convention", thetas_rev[len(right) - 1] > 0,
+      "%.1f" % thetas_rev[len(right) - 1])
 
 print("\n4. multi-turn unwrap: four full turns")
-left = ramp(0, -720, 2.0)
-angles = left + ramp(-720, 720, 2.0)
+right = ramp(0, 720, 2.0)
+angles = right + ramp(720, -720, 2.0)
 qs = sweep(mount, hinge, angles)
-_, thetas = steer_sign(qs, qs[0], len(left) - 1)
+_, thetas = steer_sign(qs, qs[0], len(right))
 maxerr = max(abs(t - a) for t, a in zip(thetas, angles))
 check("tracks past +-720", maxerr < 0.5, "max err %.4f deg" % maxerr)
 
@@ -174,6 +184,118 @@ check("round trip", back is not None
       and abs(back.full_deg - cal.full_deg) < 1e-2)
 check("a truncated entry is rejected, not half-loaded",
       S.Calibration.from_json({"role": "gas", "axis": [1, 0]}) is None)
+# A steering entry written before the limits stopped being measured must load,
+# and must NOT bring its stale left_deg/right_deg along as if they meant
+# something — a box in the field will have one of these after an update.
+old = S.Calibration.from_json({"role": "steer", "axis": [0, 0, 1],
+                               "ref_q": [1, 0, 0, 0],
+                               "left_deg": -451.0, "right_deg": 449.0})
+check("a pre-1.8.1 steering entry still loads", old is not None)
+check("...and carries no measured limit with it",
+      old is not None and not hasattr(old, "left_deg"))
+
+print("\n9b. the incremental Collector agrees with the batch reference")
+# The box does not store samples: Collector accumulates the axis as a running
+# vector sum and the travel as a running maximum. discover_axis()/replay() are
+# the readable statement of the same maths, and this is what stops the two
+# drifting apart.
+mount = q_axis_angle(norm3((1, 2, 3)), 63.0)
+hinge = norm3((0.1, 0.2, 0.97))
+right = ramp(0, 260, 2.0)
+angles = right + ramp(260, -260, 2.0) + ramp(-260, 0, 2.0)
+qs = sweep(mount, hinge, angles)
+
+col = S.Collector("steer", qs[0])
+for i, q in enumerate(qs):
+    col.feed(q, i * 0.015)              # 67 Hz, as the steering box reports
+check("collector settled on an axis", col.axis is not None)
+check("collector resolved the sign", col.sign_locked)
+batch_axis, batch_thetas = steer_sign(qs, qs[0], len(right))
+err = axis_error_deg(col.axis, batch_axis)
+check("same axis as the batch version", err < 0.5, "%.4f deg apart" % err)
+check("same sign as the batch version",
+      sum(a * b for a, b in zip(col.axis, batch_axis)) > 0)
+check("tracks the true angle to the end",
+      abs(col.track.total - angles[-1]) < 2.0,
+      "%.2f vs %.2f" % (col.track.total, angles[-1]))
+check("30 degrees of motion was enough to start",
+      col.sweep > 900, "swept %.0f deg in total" % col.sweep)
+
+print("\n9c. a pedal's travel is an ENVELOPE, not the first press")
+col = S.Collector("gas", qs[0])
+clock = [0.0]
+
+
+def press(to):
+    """Push the pedal down to `to` degrees and let it back up."""
+    for a in ramp(0, to, 0.8) + ramp(to, 0, 0.8):
+        clock[0] += 0.03
+        col.feed(S.q_mul(mount, q_axis_angle(hinge, a)), clock[0])
+
+
+press(-42.0)                                      # a proper press, as prompted
+check("a full press is measured", abs(col.travel - 42) < 1.5,
+      "%.1f" % col.travel)
+press(-20.0)                                      # then a half-hearted one
+check("a weaker press does NOT shrink it", abs(col.travel - 42) < 1.5,
+      "%.1f" % col.travel)
+press(-55.0)                                      # then a deeper one
+check("a deeper press EXTENDS it", abs(col.travel - 55) < 1.5,
+      "%.1f" % col.travel)
+check("collector reports ready", col.ready())
+cal = col.result()
+check("and hands back a usable calibration",
+      cal is not None and abs(cal.full_deg - 55) < 1.5,
+      cal and "%.1f" % cal.full_deg)
+
+# The case that motivated the envelope: an incomplete first press, then a real
+# one. Note the first 20 degrees are largely spent satisfying
+# MIN_AXIS_SWEEP_DEG — there is no axis to measure against until then, so a
+# first press that short may barely register. It costs nothing, because the
+# next press is what sets the envelope.
+col = S.Collector("gas", qs[0])
+clock[0] = 0.0
+press(-20.0)
+press(-42.0)
+check("incomplete press then a full one lands on the full one",
+      abs(col.travel - 42) < 1.5, "%.1f" % col.travel)
+
+print("\n9c2. a pedal with only 8 degrees of travel still calibrates")
+# Measured on real hardware: a gas box swept 942 degrees of pumping and its
+# angle never reached the 10-degree sign threshold that suits a steering wheel,
+# so it never resolved which way "pressed" was and sat on "measuring" for ever.
+col = S.Collector("gas", qs[0])
+clock[0] = 0.0
+for _ in range(6):
+    press(-8.0)
+check("sign resolved on a short-travel pedal", col.sign_locked)
+check("travel measured", abs(col.travel - 8) < 1.0, "%.1f" % col.travel)
+check("reported ready", col.ready())
+check("motion reads as single-axis", col.coherence() > 0.95,
+      "coherence %.3f" % col.coherence())
+
+print("\n9c3. a box waved by hand is diagnosed, not silently stalled")
+col = S.Collector("gas", qs[0])
+rng2 = random.Random(11)
+t = 0.0
+q = qs[0]
+for _ in range(600):                              # tumbling about random axes
+    t += 0.03
+    ax = norm3((rng2.gauss(0, 1), rng2.gauss(0, 1), rng2.gauss(0, 1)))
+    q = S.q_mul(q, q_axis_angle(ax, rng2.uniform(1.0, 4.0)))
+    col.feed(q, t)
+check("plenty of movement was seen", col.sweep > 300, "%.0f deg" % col.sweep)
+check("but it is not about one axis", col.coherence() < S.MIN_COHERENCE,
+      "coherence %.3f" % col.coherence())
+
+print("\n9d. a control that only ever twitches is not called calibrated")
+col = S.Collector("gas", qs[0])
+t = 0.0
+for a in ramp(0, -3, 0.2) + ramp(-3, 0, 0.2):     # 6 degrees of wobble
+    t += 0.03
+    col.feed(S.q_mul(mount, q_axis_angle(hinge, a)), t)
+check("not ready", not col.ready(), "travel %.1f" % col.travel)
+check("no calibration handed back", col.result() is None)
 
 print("\n10. by-id parsing, against the real names from a box")
 for base, role, serial in (

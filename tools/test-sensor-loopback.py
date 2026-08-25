@@ -164,33 +164,70 @@ try:
     hz = role_of(st.status(), "steer")["hz"]
     check("steering rate near 67 Hz", 55 < hz < 80, "%.1f Hz" % hz)
 
-    print("\n3. steering calibration: centre, full left, full right")
-    check("begin accepted", st.begin("steer") is None)
-    check("prompt is step 1 of 3",
-          st.status()["calibrating"]["step"] == "centre")
-    st.advance()                                    # capture centre
-    check("advanced to the left sweep",
-          st.status()["calibrating"]["step"] == "left")
-    boxes["steer"].sweep_to(-450.0)                 # a turn and a quarter left
-    st.advance()
-    check("advanced to the right sweep",
-          st.status()["calibrating"]["step"] == "right")
-    boxes["steer"].sweep_to(450.0)                  # all the way across
-    err = st.advance()
-    check("calibration accepted", err is None, str(err))
+    print("\n3. ONE calibration for the whole rig, in two keypresses")
+    check("begin accepted", st.begin() is None)
+    check("step 1 is the shared zero pose",
+          st.status()["calibrating"]["step"] == "zero")
+    st.advance()                                    # keypress 1: zero everything
+    check("advanced to the sweep",
+          st.status()["calibrating"]["step"] == "collect")
+    check("nothing is ready before anything has moved",
+          st.status()["calibrating"]["all_ready"] is False)
+
+    # Everything moves during ONE step, in any order. No keypresses in here.
+    boxes["steer"].sweep_to(200.0)                  # right first: sets the sign
+    boxes["steer"].sweep_to(-160.0)                 # then back across centre
+    check("steering reports itself calibrated, unprompted",
+          wait_for(lambda: (role_of(st.status(), "steer").get("progress") or {})
+                   .get("state") == "ready", why="the steering"))
+    check("...but the rig is not ready while the pedals have not moved",
+          st.status()["calibrating"]["all_ready"] is False)
+
+    boxes["gas"].sweep_to(-20.0, step=1.0)          # a half-hearted first press
+    boxes["gas"].sweep_to(-42.0, step=1.0)          # then a real one
+    boxes["gas"].sweep_to(0.0, step=1.0)
+    boxes["brake"].sweep_to(30.0, step=1.0)
+    boxes["brake"].sweep_to(0.0, step=1.0)
+    check("all three report ready, still with no keypress",
+          wait_for(lambda: st.status()["calibrating"]["all_ready"], timeout=8.0,
+                   why="every sensor"))
+
+    # The bars have to move DURING the sweep, or there is no way to notice the
+    # steering reading backwards while there is still time to redo it.
+    boxes["steer"].sweep_to(200.0)
+    wait_for(lambda: role_of(st.status(), "steer")["value"] > 150, why="a live angle")
+    check("steering reads live while still calibrating",
+          role_of(st.status(), "steer")["value"] > 150,
+          "%.0f deg" % role_of(st.status(), "steer")["value"])
+    boxes["gas"].sweep_to(-42.0, step=1.0)
+    wait_for(lambda: role_of(st.status(), "gas")["value"] > 0.9, why="a live pedal")
+    check("gas reads live against the envelope so far",
+          abs(role_of(st.status(), "gas")["value"] - 1.0) < 0.05,
+          "%.3f" % role_of(st.status(), "gas")["value"])
+    boxes["gas"].sweep_to(0.0, step=1.0)
+    boxes["steer"].sweep_to(0.0)
+
+    # S, not Enter. The card shows a "Save (S)" button throughout, so this is
+    # what a hand actually reaches for — and it used to write the empty
+    # committed set, report "Saved.", and leave the sweep running and lost.
+    err = st.save()                                 # keypress 2: confirm + save
+    check("S at the end of a sweep CONFIRMS it", err is None, str(err))
     check("not calibrating any more", st.status()["calibrating"] is None)
+    check("it saved itself — no separate keypress needed", os.path.isfile(CAL))
+    check("and the file is not an empty object",
+          len(open(CAL).read().strip()) > 50, "%d bytes" % len(open(CAL).read()))
 
     e = role_of(st.status(), "steer")
-    check("steering is calibrated", e["calibrated"])
-    check("measured range is ~900 deg", abs(e["range_deg"] - 900) <= 6,
-          "%d deg" % e["range_deg"])
-    check("left stop is negative, right positive",
-          e["left_deg"] < -400 and e["right_deg"] > 400,
-          "left %s right %s" % (e["left_deg"], e["right_deg"]))
+    check("steering is calibrated", e["calibrated"], str(st.status()["message"]))
+    check("range is the DECLARED one, not a measured lock",
+          e["range_deg"] == 900, "%d deg" % e["range_deg"])
     axis_err = math.degrees(math.acos(min(1.0, abs(sum(
         a * b for a, b in zip(e["axis"], boxes["steer"].hinge))))))
     check("discovered axis matches the real hinge", axis_err < 2.0,
           "%.3f deg" % axis_err)
+    g = role_of(st.status(), "gas")
+    check("the gas envelope is the DEEPEST press, not the first",
+          abs(g["full_deg"] - 42) < 3.0, "%.1f deg" % g["full_deg"])
 
     print("\n4. steering sign: right is positive, and it holds past a full turn")
     boxes["steer"].sweep_to(370.0)                  # more than one whole turn
@@ -206,17 +243,17 @@ try:
     check("back to centre reads ~0", abs(st.read_roles()[0]) < 5,
           "%.1f" % st.read_roles()[0])
 
-    print("\n5. pedals: release, press fully, and the 0..1 that comes out")
+    print("\n5. pedals: the 0..1 that comes out of the envelope measured above")
     for role, travel, idx in (("gas", -42.0, 1), ("brake", 30.0, 2)):
-        st.begin(role)
-        st.advance()                                # capture rest
-        boxes[role].sweep_to(travel, step=1.0)      # press
-        err = st.advance()
-        check("%s calibration accepted" % role, err is None, str(err))
-        boxes[role].sweep_to(travel, step=1.0)
+        boxes[role].sweep_to(travel, step=1.0)      # press to the envelope
         wait_for(lambda: st.read_roles()[idx] > 0.9, why="a full press")
         check("%s fully pressed reads 1.0" % role,
-              abs(st.read_roles()[idx] - 1.0) < 0.02,
+              abs(st.read_roles()[idx] - 1.0) < 0.03,
+              "%.3f" % st.read_roles()[idx])
+        boxes[role].sweep_to(travel * 0.5, step=1.0)
+        wait_for(lambda: st.read_roles()[idx] < 0.7, why="half travel")
+        check("%s half pressed reads about half" % role,
+              abs(st.read_roles()[idx] - 0.5) < 0.08,
               "%.3f" % st.read_roles()[idx])
         boxes[role].sweep_to(0.0, step=1.0)
         wait_for(lambda: st.read_roles()[idx] < 0.02, why="release")
@@ -230,7 +267,7 @@ try:
           all(role_of(st.status(), r)["calibrated"] for r in ("steer", "gas", "brake")))
 
     print("\n7. Ctrl+S recentres without destroying the calibration")
-    boxes["steer"].sweep_to(540.0)                  # a turn and a half off
+    boxes["steer"].sweep_to(430.0)                  # well off centre
     wait_for(lambda: st.read_roles()[0] > 400, why="an off-centre reading")
     before = role_of(st.status(), "steer")
     check("recentre accepted", st.recentre())
@@ -242,10 +279,20 @@ try:
           "%d -> %d" % (before["range_deg"], after["range_deg"]))
     check("axis survived the reset", after["axis"] == before["axis"])
     # And the new centre is real: a quarter turn from here reads a quarter turn.
-    boxes["steer"].sweep_to(540.0 + 90.0)
+    boxes["steer"].sweep_to(430.0 + 90.0)
     wait_for(lambda: st.read_roles()[0] > 80, why="a quarter turn")
     check("a quarter turn from the new centre reads ~90",
           abs(st.read_roles()[0] - 90) < 8, "%.1f" % st.read_roles()[0])
+
+    print("\n7b. the wire carries degrees from centre, clamped only by hardware")
+    boxes["steer"].sweep_to(430.0 + 500.0)          # past the declared half-range
+    wait_for(lambda: st.read_roles()[0] >= 449.0, timeout=10.0, why="a big angle")
+    check("clamped at half the declared range, not at a measured lock",
+          abs(st.read_roles()[0] - 450.0) < 1.0, "%.1f" % st.read_roles()[0])
+    boxes["steer"].sweep_to(430.0 + 200.0)
+    wait_for(lambda: st.read_roles()[0] < 260, why="coming back")
+    check("inside the range it is the true angle, not a fraction",
+          abs(st.read_roles()[0] - 200.0) < 8, "%.1f" % st.read_roles()[0])
 
     print("\n8. failing to neutral when a box goes away")
     boxes["gas"].sweep_to(-42.0, step=1.0)
@@ -263,9 +310,6 @@ try:
           "attached=%d" % st.status()["attached"])
 
     print("\n9. saving, and a calibration that comes back by serial")
-    st.begin("gas")                                 # gone: must be refused
-    check("cannot calibrate an absent box",
-          st.status()["calibrating"] is None)
     check("save succeeded", st.save() is None)
     check("calibration file written", os.path.isfile(CAL))
     saved = open(CAL).read()

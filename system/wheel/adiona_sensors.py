@@ -21,8 +21,15 @@ Design notes, in the order they matter:
      interpreted against an assumed mounting: it read the gravity vector's angle
      in the box's X-Z plane and called that steering. These boxes send a full
      Kalman-fused quaternion, which carries enough information to DISCOVER the
-     axis a control turns about. So the operator turns the wheel left and right
-     and the box works out the rest. See discover_axis().
+     axis a control turns about, from about 30 degrees of any motion. So the
+     operator just moves the controls and the box works out the rest.
+
+  2a. NOTHING MEASURES A LIMIT. The angle comes out of the quaternion directly,
+     so there is nothing to learn from hauling a wheel against its stops — and
+     plenty to lose, since an operator who stops short sets a limit that is
+     silently too small for the rest of the event. Steering travel is declared
+     in box.conf; a pedal's is an ENVELOPE that only ever grows while the
+     calibration is open, so a first half-hearted press costs nothing.
 
   3. THE ANGLE IS ABSOLUTE, THE TURN COUNT IS NOT. Each sample's angle is derived
      from the sensor's own attitude relative to a stored centre, so we add no
@@ -111,16 +118,43 @@ NOISE_FLOOR_DEG = 0.05
 # sweep (a 900 degree wheel accumulates ~7.9).
 AXIS_MIN_NORM = 0.05
 
-# Sanity floors for a finished calibration.
-MIN_STEER_RANGE_DEG = 30.0
+# Sanity floor for a pedal: below this the "press" was not a press.
 MIN_PEDAL_TRAVEL_DEG = 5.0
+
+# How much turning is needed before an axis is believed. A quaternion makes this
+# small — 30 degrees of motion about a hinge pins the hinge down — and it must
+# stay small: a motorcycle's bars, a kart wheel or a forklift tiller may not
+# offer a full turn, and a calibration must never demand travel the vehicle does
+# not have. More sweep is still better, and AXIS_REFINE_SEC keeps using it.
+MIN_AXIS_SWEEP_DEG = 30.0
+
+# How far a control must get from its zero before the direction it moved in is
+# taken as the positive one — right for steering, pressed for a pedal.
+#
+# PER ROLE, and the difference is not cosmetic. A steering wheel is turned
+# deliberately through tens of degrees, so 10 is both unambiguous and reached
+# instantly. A PEDAL BOX MAY ONLY ROTATE 8-12 DEGREES IN TOTAL: measured on real
+# hardware, a gas box swept 942 degrees of pumping without its angle ever
+# reaching 10, so the sign never resolved, the travel envelope never opened, and
+# the row sat on "measuring" for ever with no clue why. Both figures are still
+# hundreds of times the sensors' ~0.02 degrees of rest noise.
+SIGN_DEG = {"steer": 10.0, "evo": 10.0, "gas": 3.0, "brake": 3.0}
+SIGN_DEG_DEFAULT = 3.0
+
+# Below this, the motion was not about ONE axis: the increments pointed all over
+# and their vector sum largely cancelled. In practice it means a box being waved
+# by hand rather than turning on a mount, and it is worth saying out loud —
+# without it a poorly-mounted sensor produces a plausible-looking axis that
+# nothing measured against will ever move.
+MIN_COHERENCE = 0.80
+
+# How often the axis is re-derived from everything seen so far while a sweep is
+# still running. Cheap (one normalise), and it is what lets a long sweep produce
+# a better axis than the 30 degrees that first satisfied MIN_AXIS_SWEEP_DEG.
+AXIS_REFINE_SEC = 0.5
 
 RESCAN_INTERVAL = 1.0        # look for a newly plugged sensor box
 SELECT_TIMEOUT = 0.05
-
-# Calibration sample cap. A 900 degree sweep at 67 Hz is a few hundred samples;
-# this is a bound on a careless operator leaving the step open, not a target.
-MAX_CAL_SAMPLES = 20000
 
 
 # ── Quaternion maths ─────────────────────────────────────────────────────────
@@ -151,6 +185,23 @@ def q_canon(q):
     return (-q[0], -q[1], -q[2], -q[3]) if q[0] < 0.0 else q
 
 
+def q_angle_deg(q):
+    """The rotation angle of q, 0..180 degrees, ignoring its axis."""
+    q = q_canon(q)
+    v = math.sqrt(q[1] * q[1] + q[2] * q[2] + q[3] * q[3])
+    return 2.0 * math.degrees(math.atan2(v, q[0]))
+
+
+def swept_deg(a, b):
+    """How far the sensor turned between two samples, whatever the direction.
+
+    Path length in rotation space. Deliberately UNSIGNED and axis-free: it is
+    what the calibration watches to decide the operator has moved enough, and at
+    that moment there is no axis yet to measure a signed angle against.
+    """
+    return q_angle_deg(q_mul(q_conj(a), b))
+
+
 def twist_deg(q0, q, axis):
     """
     Signed rotation of q relative to q0 about `axis`, in (-180, 180].
@@ -179,6 +230,12 @@ def wrap180(deg):
 def discover_axis(samples):
     """
     The axis a control turns about, in the SENSOR'S OWN frame, from a sweep.
+
+    THE REFERENCE IMPLEMENTATION, not the one that runs on the box: Collector
+    does this incrementally, over a stream, so a sweep can run as long as the
+    operator likes without storing a sample. This batch version states the maths
+    in one readable piece, and tools/test-sensor-math.py checks the two against
+    each other on the same data so they cannot drift apart.
 
     Between consecutive samples the relative rotation conj(q[i-1]) * q[i] has a
     vector part equal to sin(theta/2) * axis. For a control on a fixed hinge that
@@ -341,41 +398,43 @@ def open_port(link):
 # The guided flows. Held here rather than in the page because this box owns all
 # device knowledge — the same rule that makes supporting a new wheel a deploy
 # instead of an APK rebuild. Adding a role later is a change to this table.
-CAL_STEPS = {
-    "steer": (
-        ("centre", "Centre the steering wheel, then press Enter."),
-        ("left", "Turn fully LEFT to the stop, then press Enter."),
-        ("right", "Turn fully RIGHT to the stop, then press Enter."),
-    ),
-    "gas": (
-        ("rest", "Take your foot off the GAS pedal, then press Enter."),
-        ("press", "Press the GAS pedal fully down and hold, then press Enter."),
-    ),
-    "brake": (
-        ("rest", "Take your foot off the BRAKE pedal, then press Enter."),
-        ("press", "Press the BRAKE pedal fully down and hold, then press Enter."),
-    ),
-}
+# ONE CALIBRATION FOR THE WHOLE RIG, AND TWO KEYPRESSES.
+#
+# Not three separate procedures: everything is zeroed together in one pose, then
+# everything is swept together in one go, and the box says which sensors it has
+# enough on as they qualify. Someone sitting in a car seat can turn the wheel
+# with both hands and work the pedals with both feet without reaching for a
+# keyboard between each one.
+#
+# Nothing here measures a limit. The quaternion gives every angle outright, so
+# the sweep exists only to find each control's hinge — and the FIRST direction
+# each control moves in, which is what says right from left and pressed from
+# released.
+CAL_STEPS = (
+    ("zero", "Take your feet off both pedals and centre the steering wheel, "
+             "then press Enter."),
+    ("collect", "Turn the steering wheel RIGHT first, then left as far as it "
+                "goes. Press the gas and brake all the way down."),
+)
 
 
 class Calibration(object):
     """What one sensor's calibration consists of, and how to read it back."""
 
-    def __init__(self, role, axis, ref_q, left_deg=0.0, right_deg=0.0,
-                 full_deg=0.0):
+    def __init__(self, role, axis, ref_q, full_deg=0.0, sweep_deg=0.0):
         self.role = role
         self.axis = axis
         self.ref_q = ref_q            # centre (steer) or rest (pedal)
-        self.left_deg = left_deg      # steer only, negative
-        self.right_deg = right_deg    # steer only, positive
         self.full_deg = full_deg      # pedal only, signed travel at full press
+        # Diagnostics only, shown on the tab: how far the control was actually
+        # turned while its axis was being measured. Nothing reads it to compute
+        # anything — a big sweep just means a well-determined axis.
+        self.sweep_deg = sweep_deg
 
     def to_json(self):
-        d = {"role": self.role, "axis": list(self.axis), "ref_q": list(self.ref_q)}
-        if self.role == "steer":
-            d["left_deg"] = round(self.left_deg, 3)
-            d["right_deg"] = round(self.right_deg, 3)
-        else:
+        d = {"role": self.role, "axis": list(self.axis),
+             "ref_q": list(self.ref_q), "sweep_deg": round(self.sweep_deg, 1)}
+        if self.role != "steer":
             d["full_deg"] = round(self.full_deg, 3)
         return d
 
@@ -386,30 +445,14 @@ class Calibration(object):
             ref = tuple(float(v) for v in d["ref_q"])
             if len(axis) != 3 or len(ref) != 4:
                 return None
+            # left_deg/right_deg from a pre-1.8.1 file are ignored on purpose:
+            # the steering limits are no longer measured, and a stale pair would
+            # otherwise look like a calibration that had been done properly.
             return cls(str(d["role"]), axis, ref,
-                       float(d.get("left_deg", 0.0)),
-                       float(d.get("right_deg", 0.0)),
-                       float(d.get("full_deg", 0.0)))
+                       float(d.get("full_deg", 0.0)),
+                       float(d.get("sweep_deg", 0.0)))
         except (KeyError, TypeError, ValueError):
             return None
-
-    def half_range_deg(self):
-        """Usable travel each side of centre — the shorter of the two.
-
-        The headset derives full lock as range_deg / 2 either side of centre, so
-        the two sides have to be treated symmetrically somewhere. Doing it here,
-        at the shorter side, means full lock is always reachable; taking the
-        longer one, or the average, would put the game's full lock past a stop.
-        """
-        return min(-self.left_deg, self.right_deg)
-
-    def range_deg(self):
-        """Symmetric usable travel, for AI02.range_deg.
-
-        This is the figure the headset divides steer_deg by, so it must be twice
-        exactly the half-range this file clamps to — otherwise full lock in the
-        game and full lock on the wheel are two different places."""
-        return int(round(2.0 * self.half_range_deg()))
 
 
 class Track(object):
@@ -431,6 +474,161 @@ class Track(object):
         self.prev = wrapped
 
 
+class Collector(object):
+    """
+    Watches one sensor through a calibration sweep and keeps the answer current.
+
+    Everything here is INCREMENTAL — the axis is a running vector sum, the travel
+    a running maximum. No sample is stored, so a sweep can run for as long as the
+    operator wants without the box accumulating anything, and the result is
+    available continuously rather than at the end. That is what lets the screen
+    say "calibrated" the moment a control has moved enough, with nobody pressing
+    anything.
+
+    It also means the answer only ever IMPROVES while the sweep runs: a first
+    pedal press that did not reach the floor is not a mistake to undo, it is
+    simply a smaller envelope than the next press will give.
+    """
+
+    def __init__(self, role, ref_q):
+        self.role = role
+        self.ref_q = ref_q            # centre, or pedal at rest
+        self.prev_q = ref_q
+        self.sum = [0.0, 0.0, 0.0]    # running axis estimate, unnormalised
+        self.mag = 0.0                # sum of the increments' LENGTHS
+        self.ref_v = None             # first significant increment, fixes the fold
+        self.sweep = 0.0              # total path length turned, degrees
+        self.axis = None
+        self.flipped = False          # the sign convention, once resolved
+        self.sign_locked = False
+        self.track = Track()
+        self.travel = 0.0             # furthest from zero in the positive sense
+        self.refined_at = 0.0
+
+    # ── The sweep ────────────────────────────────────────────────────────────
+    def feed(self, q, now):
+        step = swept_deg(self.prev_q, q)
+        if step >= NOISE_FLOOR_DEG:
+            dq = q_canon(q_mul(q_conj(self.prev_q), q))
+            v = [dq[1], dq[2], dq[3]]
+            if self.ref_v is None:
+                self.ref_v = list(v)
+            elif sum(a * b for a, b in zip(v, self.ref_v)) < 0.0:
+                v = [-c for c in v]     # turning back is the same hinge
+            for i in range(3):
+                self.sum[i] += v[i]
+            self.mag += math.sqrt(sum(c * c for c in v))
+            self.sweep += step
+        self.prev_q = q
+
+        if self.axis is None:
+            if self.sweep < MIN_AXIS_SWEEP_DEG:
+                return
+            axis = self._axis()
+            if axis is None:
+                return
+            # Start the angle here rather than at the zero pose. Only
+            # MIN_AXIS_SWEEP_DEG of travel has happened, so "here" is within
+            # that of the zero and the unwrap cannot already have missed a
+            # half-turn.
+            self.axis = axis
+            self.track.reset()
+            self.track.advance(twist_deg(self.ref_q, q, axis))
+            self.refined_at = now
+            return
+
+        if now - self.refined_at >= AXIS_REFINE_SEC:
+            self.refined_at = now
+            self._adopt(self._axis(), q)
+
+        self.track.advance(twist_deg(self.ref_q, q, self.axis))
+
+        if not self.sign_locked:
+            # The first real excursion from zero defines positive: the operator
+            # was asked to turn RIGHT first, and a pedal can only be pressed.
+            if abs(self.track.total) >= SIGN_DEG.get(self.role, SIGN_DEG_DEFAULT):
+                if self.track.total < 0.0:
+                    self.flipped = not self.flipped
+                    self.axis = tuple(-c for c in self.axis)
+                    self.track.total = -self.track.total
+                    self.track.prev = -self.track.prev
+                self.sign_locked = True
+        if self.sign_locked and self.track.total > self.travel:
+            self.travel = self.track.total
+
+    def _axis(self):
+        n = math.sqrt(sum(c * c for c in self.sum))
+        if n < AXIS_MIN_NORM:
+            return None
+        axis = tuple(c / n for c in self.sum)
+        return tuple(-c for c in axis) if self.flipped else axis
+
+    def _adopt(self, axis, q):
+        """Take a better axis, and let the angle it reports move with it.
+
+        A refined axis measures the same rotation slightly differently. That
+        difference is a CORRECTION, not noise, so it is left for the next
+        advance() to apply — swallowing it instead (by re-seeding `prev` every
+        time) loses a fraction of a degree at each refinement, and those add up
+        into a real drift over a long sweep.
+
+        The exception is a refinement that would move the angle more than a
+        quarter turn. That is not a correction, it is an early estimate having
+        been badly wrong, and carrying it into the turn count would corrupt the
+        count rather than fix it — so that one is absorbed.
+        """
+        if axis is None or self.axis is None:
+            return
+        prev = self.track.prev
+        self.axis = axis
+        if prev is not None:
+            jump = wrap180(twist_deg(self.ref_q, q, axis) - prev)
+            if abs(jump) > 90.0:
+                self.track.prev = twist_deg(self.ref_q, q, axis)
+
+    # ── What it has ──────────────────────────────────────────────────────────
+    def ready(self):
+        if self.axis is None or not self.sign_locked:
+            return False
+        if self.role in PEDAL_ROLES:
+            return self.travel >= MIN_PEDAL_TRAVEL_DEG
+        return True
+
+    def result(self):
+        if not self.ready():
+            return None
+        return Calibration(self.role, self.axis, self.ref_q,
+                           full_deg=self.travel, sweep_deg=self.sweep)
+
+    def coherence(self):
+        """How much of the movement was about ONE axis, 0..1.
+
+        The increments were folded onto a common side before being summed, so a
+        control turning on a real hinge gives |sum| == sum of lengths and this
+        reads 1. A box being waved by hand gives increments pointing everywhere,
+        they cancel, and this collapses — which is the difference between "keep
+        pressing" and "that is not mounted to anything", and the box has no
+        other way to tell an operator which one they are looking at.
+        """
+        if self.mag <= 0.0:
+            return 0.0
+        return math.sqrt(sum(c * c for c in self.sum)) / self.mag
+
+    def progress(self):
+        """What the screen says about this sensor while the sweep is running."""
+        p = {"swept": round(self.sweep), "need": round(MIN_AXIS_SWEEP_DEG),
+             "travel": round(self.travel) if self.sign_locked else 0,
+             "coherence": round(self.coherence(), 2),
+             "one_axis": self.mag <= 0.0 or self.coherence() >= MIN_COHERENCE}
+        if self.axis is None:
+            p["state"] = "waiting"
+        elif not self.sign_locked:
+            p["state"] = "measuring"
+        else:
+            p["state"] = "ready" if self.ready() else "measuring"
+        return p
+
+
 class SensorSet(object):
     """
     Every Drive Square sensor box on this machine, as one input device.
@@ -441,11 +639,17 @@ class SensorSet(object):
     """
 
     def __init__(self, log, cal_path, stale_sec=0.5, pedal_deadzone_deg=1.5,
-                 enabled=True):
+                 steer_range_deg=900, enabled=True):
         self._log = log
         self._cal_path = cal_path
         self._stale = stale_sec
         self._deadzone = pedal_deadzone_deg
+        # The hardware's full travel, DECLARED rather than measured — a real
+        # car's wheel is about 900 degrees and the box has no need to discover
+        # that by having someone haul it against both stops. It bounds what goes
+        # on the wire and it is what the headset is told the rig can do; it is
+        # not a sensitivity control and it does not scale anything.
+        self._steer_range = max(1, int(steer_range_deg))
         self._enabled = enabled
 
         self._lock = threading.Lock()
@@ -530,10 +734,14 @@ class SensorSet(object):
                 # The turn count is, because a wheel can be turned while its box
                 # is unplugged and an integrated count cannot survive that.
                 self._track.pop(port.serial, None)
-                if self._job and self._job["role"] == port.role:
-                    self._job = None
-                    self._message = ("%s box unplugged — calibration cancelled"
-                                     % port.role)
+                # A box that goes away mid-calibration takes its own collector
+                # with it and leaves the rest of the sweep running: the others
+                # are still being measured and there is no reason to make an
+                # operator start over because a cable was nudged.
+                if self._job is not None:
+                    self._job["collectors"].pop(port.serial, None)
+                    self._message = ("%s box unplugged — still calibrating the "
+                                     "others" % port.role)
             self._log("sensors: %s box removed (%s)" % (port.role, port.dev))
             port.close()
 
@@ -661,9 +869,10 @@ class SensorSet(object):
                 track.advance(twist_deg(cal.ref_q, q, cal.axis))
 
             job = self._job
-            if job is not None and job["role"] == port.role and job["index"] > 0:
-                if len(job["samples"]) < MAX_CAL_SAMPLES:
-                    job["samples"].append(q)
+            if job is not None and job["index"] > 0:
+                col = job["collectors"].get(port.serial)
+                if col is not None:
+                    col.feed(q, now)
 
     # ── What adiona-wheel.py consumes ────────────────────────────────────────
     def read_roles(self):
@@ -711,11 +920,15 @@ class SensorSet(object):
             return 0.0
         if not port.fresh(now, self._stale) or track.prev is None:
             return 0.0
-        # Clamped to the SYMMETRIC half-range, not to the measured stops: this
-        # value is divided by exactly half of range_deg on the headset, so the
-        # two have to be the same number. Travel past it on the longer side is
-        # already full lock in the game and nothing is lost by stopping here.
-        half = cal.half_range_deg()
+        # DEGREES FROM CENTRE, which is what goes on the wire — not a fraction of
+        # anything. What the game does with them is the game's business: a
+        # tractor, a forklift and a tiller truck's rear steer all want the same
+        # number interpreted differently, and only the vehicle model knows how.
+        #
+        # The clamp is a hardware bound, not a mapping. It stops a slipped turn
+        # count (the thing Ctrl+S exists for) from sending a car to a lock it
+        # could never physically reach.
+        half = self._steer_range / 2.0
         return max(-half, min(half, track.total))
 
     def _pedal_locked(self, role, now):
@@ -731,6 +944,27 @@ class SensorSet(object):
         # a pedal going down and negative for one coming back past rest.
         travel = track.total * (1.0 if cal.full_deg >= 0.0 else -1.0)
         return max(0.0, min(1.0, (travel - self._deadzone) / span))
+
+    def _collector_steer(self, col):
+        """What a still-being-calibrated steering sensor reads, in degrees.
+
+        Exactly what _steer_locked() would report once the calibration is
+        committed, so nothing changes on screen at the moment it is."""
+        if col.axis is None or not col.sign_locked:
+            return 0.0
+        half = self._steer_range / 2.0
+        return max(-half, min(half, col.track.total))
+
+    def _collector_pedal(self, col):
+        """The same for a pedal, against the envelope measured SO FAR — so the
+        deepest press of the sweep reads 1.0 as it happens, and a deeper one
+        rescales what came before it."""
+        if col.axis is None or not col.sign_locked:
+            return 0.0
+        span = col.travel - self._deadzone
+        if span <= 0.0:
+            return 0.0
+        return max(0.0, min(1.0, (col.track.total - self._deadzone) / span))
 
     def _port_locked(self, role):
         for port in self._ports.values():
@@ -773,13 +1007,13 @@ class SensorSet(object):
                     word |= flag_bits.get(port.role, 0)
         return word
 
-    def range_deg(self, default):
-        with self._lock:
-            _port, cal, _track = self._entry_locked("steer")
-        if cal is None:
-            return default
-        deg = cal.range_deg()
-        return deg if deg > 0 else default
+    def range_deg(self, _default=None):
+        """The hardware's full travel, for AI02.range_deg.
+
+        Configured, not measured, and the same whether or not anything has been
+        calibrated — it describes the wheel, and calibrating it does not change
+        how far it turns."""
+        return self._steer_range
 
     def device_name(self):
         with self._lock:
@@ -814,14 +1048,13 @@ class SensorSet(object):
         return True
 
     # ── Calibration commands ─────────────────────────────────────────────────
-    def begin(self, role):
-        if role not in CAL_STEPS:
-            return "unknown role"
+    def begin(self, _role=None):
+        """Start the rig-wide calibration. The role argument is vestigial: there
+        is one calibration and it covers everything attached."""
         with self._lock:
-            if self._port_locked(role) is None:
-                return "no %s box attached" % role
-            self._job = {"role": role, "index": 0, "samples": [],
-                         "marks": {}, "q0": None}
+            if not self._ports:
+                return "no sensor boxes attached"
+            self._job = {"index": 0, "collectors": {}}
             self._message = ""
         return None
 
@@ -834,115 +1067,75 @@ class SensorSet(object):
     def advance(self):
         """Enter: complete the current step and move on. Returns an error or None."""
         with self._lock:
-            job = self._job
-            if job is None:
-                return "not calibrating"
-            role = job["role"]
-            steps = CAL_STEPS[role]
-            port = self._port_locked(role)
-            if port is None or port.q is None:
-                return "no data from the %s box" % role
+            return self._advance_locked()
 
-            if job["index"] == 0:
-                # The reference pose: centre for steering, rest for a pedal.
-                job["q0"] = port.q
-                job["samples"] = []
-                job["index"] = 1
-                return None
+    def _advance_locked(self):
+        """Enter. Two presses is the whole procedure: one to set the zero pose,
+        one to accept what the sweep found."""
+        job = self._job
+        if job is None:
+            return "not calibrating"
 
-            # Mark where this sweep ended, then either move on or finish.
-            job["marks"][steps[job["index"]][0]] = len(job["samples"])
-            job["index"] += 1
-            if job["index"] < len(steps):
-                return None
-            return self._finish_locked(job)
+        if job["index"] == 0:
+            live = [p for p in self._ports.values() if p.q is not None]
+            if not live:
+                return "no data from the sensor boxes"
+            # One pose, every sensor. Wheel centred, pedals up.
+            job["collectors"] = dict(
+                (p.serial, Collector(p.role, p.q)) for p in live)
+            job["index"] = 1
+            self._message = "Zero positions set."
+            return None
+
+        return self._finish_locked(job)
 
     def _finish_locked(self, job):
-        role = job["role"]
-        samples = job["samples"]
-        port = self._port_locked(role)
-        if port is None:
-            self._job = None
-            self._message = "The %s box was unplugged." % role
-            return self._message
-        axis = discover_axis(samples)
-        if axis is None:
-            self._job = None
-            self._message = "The %s control did not move enough to measure." % role
-            return self._message
+        """Accept the sweep. Saves, because this is the confirming keypress."""
+        done, rezeroed, missed = [], [], []
+        for serial, col in job["collectors"].items():
+            cal = col.result()
+            if cal is not None:
+                self._cal[serial] = cal
+                track = self._track.setdefault(serial, Track())
+                track.prev = col.track.prev
+                track.total = col.track.total
+                done.append(col.role)
+                self._log("sensors: %s axis (%.3f, %.3f, %.3f) from %.0f deg "
+                          "swept, travel %.0f"
+                          % ((col.role,) + tuple(col.axis) +
+                             (col.sweep, col.travel)))
+                continue
+            # It never moved enough to measure. If it already had a calibration
+            # that is not a failure — the operator has just re-zeroed it, which
+            # is a useful thing to be able to do on its own (a pedal box that
+            # has settled, a wheel that needs its turn count cleared) and it
+            # would be perverse to throw away a good axis for it.
+            old = self._cal.get(serial)
+            if old is not None:
+                old.ref_q = col.ref_q
+                t = self._track.setdefault(serial, Track())
+                t.reset()
+                t.advance(0.0)
+                rezeroed.append(col.role)
+            else:
+                missed.append(col.role)
 
-        if role == "steer":
-            err = self._finish_steer_locked(job, axis, port)
-        else:
-            err = self._finish_pedal_locked(job, axis, port)
         self._job = None
-        return err
-
-    def _finish_steer_locked(self, job, axis, port):
-        q0 = job["q0"]
-        samples = job["samples"]
-        thetas, prev, total = replay(samples, q0, axis)
-
-        # Sign convention: positive is right. The left sweep ran from the start
-        # of the recording to the 'left' mark, so its end must be negative.
-        left_mark = max(1, job["marks"].get("left", len(thetas)))
-        if thetas and thetas[left_mark - 1] > 0.0:
-            axis = (-axis[0], -axis[1], -axis[2])
-            thetas, prev, total = replay(samples, q0, axis)
-
-        left_deg = min(thetas) if thetas else 0.0
-        right_deg = max(thetas) if thetas else 0.0
-        if right_deg - left_deg < MIN_STEER_RANGE_DEG:
-            self._message = ("Only %.0f degrees of travel measured — turn the "
-                             "wheel to both stops." % (right_deg - left_deg))
-            return self._message
-        if left_deg >= 0.0 or right_deg <= 0.0:
-            self._message = ("The wheel only turned one way from centre. Centre "
-                             "it first, then go fully left and fully right.")
-            return self._message
-
-        cal = Calibration("steer", axis, q0, left_deg=left_deg, right_deg=right_deg)
-        self._cal[port.serial] = cal
-        track = self._track.setdefault(port.serial, Track())
-        track.prev = prev
-        track.total = total
         self._dirty = True
-        self._message = ("Steering: range %d degrees (left %.0f, right %.0f). "
-                         "Press S to save." % (cal.range_deg(), left_deg, right_deg))
-        self._log("sensors: steer axis (%.3f, %.3f, %.3f) range %d"
-                  % (axis[0], axis[1], axis[2], cal.range_deg()))
-        return None
-
-    def _finish_pedal_locked(self, job, axis, port):
-        role = job["role"]
-        q0 = job["q0"]
-        thetas, prev, total = replay(job["samples"], q0, axis)
-        if not thetas:
-            self._message = "No data from the %s box." % role
+        err = self._persist_locked()
+        if err is not None:
+            self._message = "Save failed: %s" % err
             return self._message
 
-        # The pedal's travel is the extreme it reached; its sign tells us which
-        # way "pressed" is, and the axis is flipped so pressing always counts up.
-        peak = max(thetas, key=abs)
-        if peak < 0.0:
-            axis = (-axis[0], -axis[1], -axis[2])
-            thetas, prev, total = replay(job["samples"], q0, axis)
-            peak = -peak
-        if peak < MIN_PEDAL_TRAVEL_DEG:
-            self._message = ("Only %.1f degrees of travel measured — press the "
-                             "%s pedal all the way down." % (peak, role))
-            return self._message
-
-        cal = Calibration(role, axis, q0, full_deg=peak)
-        self._cal[port.serial] = cal
-        track = self._track.setdefault(port.serial, Track())
-        track.prev = prev
-        track.total = total
-        self._dirty = True
-        self._message = ("%s: %.0f degrees of travel. Press S to save."
-                         % (role.capitalize(), peak))
-        self._log("sensors: %s axis (%.3f, %.3f, %.3f) travel %.1f"
-                  % (role, axis[0], axis[1], axis[2], peak))
+        parts = []
+        if done:
+            parts.append("calibrated " + ", ".join(sorted(done)))
+        if rezeroed:
+            parts.append("re-zeroed " + ", ".join(sorted(rezeroed)))
+        if missed:
+            parts.append("no movement from " + ", ".join(sorted(missed)))
+        self._message = ("Saved — " + "; ".join(parts) + "."
+                         if parts else "Nothing to save.")
         return None
 
     def clear(self, role):
@@ -957,20 +1150,32 @@ class SensorSet(object):
             self._message = "%s calibration cleared." % role.capitalize()
         return None
 
+    def _persist_locked(self):
+        """Write every calibration held in memory. Caller holds the lock.
+
+        Everything, not only what is plugged in right now: a box calibrated
+        earlier and since unplugged has a calibration worth keeping, and losing
+        it at the moment of saving would be a surprising way to lose one."""
+        for serial, cal in self._cal.items():
+            self._stored[serial] = cal.to_json()
+        err = self._save()
+        if err is None:
+            self._dirty = False
+        return err
+
     def save(self):
+        """Explicit S.
+
+        MID-CALIBRATION, S CONFIRMS. The screen shows a "Save (S)" button
+        throughout, so S is the obvious key to reach for at the end of a sweep —
+        and writing the committed set at that moment would write everything the
+        sweep has NOT yet produced, i.e. nothing, and then report success. That
+        happened, silently, and cost a calibration."""
         with self._lock:
-            # Everything held in memory, not only what is plugged in right now:
-            # a box calibrated earlier and since unplugged has a calibration
-            # worth keeping, and losing it at the moment of saving would be a
-            # surprising way to lose one.
-            for serial, cal in self._cal.items():
-                self._stored[serial] = cal.to_json()
-            err = self._save()
-            if err is None:
-                self._dirty = False
-                self._message = "Saved."
-            else:
-                self._message = "Save failed: %s" % err
+            if self._job is not None:
+                return self._advance_locked()
+            err = self._persist_locked()
+            self._message = "Saved." if err is None else ("Save failed: %s" % err)
         return err
 
     # ── Published state ──────────────────────────────────────────────────────
@@ -993,16 +1198,37 @@ class SensorSet(object):
                     "calibrated": cal is not None,
                     "axis": [round(v, 4) for v in cal.axis] if cal else None,
                 }
+                # While a sweep is running, the row reports what THIS sensor is
+                # doing RIGHT NOW rather than its saved state — which is usually
+                # nothing, since a first calibration has none. That live readout
+                # is the whole interface for a step with no keypress in it, and
+                # it is the only chance to notice the steering reading backwards
+                # before it is committed.
+                col = None
+                if self._job is not None and self._job["index"] > 0:
+                    col = self._job["collectors"].get(port.serial)
+                    if col is not None:
+                        entry["progress"] = col.progress()
+
                 if role == "steer":
-                    entry["value"] = round(self._steer_locked(now), 1)
-                    entry["raw_deg"] = round(track.total, 1) if track and track.prev is not None else None
+                    entry["range_deg"] = self._steer_range
+                    if col is not None:
+                        entry["value"] = round(self._collector_steer(col), 1)
+                        entry["raw_deg"] = round(col.track.total, 1)
+                    else:
+                        entry["value"] = round(self._steer_locked(now), 1)
+                        entry["raw_deg"] = (round(track.total, 1)
+                                            if track and track.prev is not None else None)
                     if cal:
-                        entry["left_deg"] = round(cal.left_deg, 0)
-                        entry["right_deg"] = round(cal.right_deg, 0)
-                        entry["range_deg"] = cal.range_deg()
+                        entry["sweep_deg"] = round(cal.sweep_deg, 0)
                 elif role in PEDAL_ROLES:
-                    entry["value"] = round(self._pedal_locked(role, now), 3)
-                    entry["raw_deg"] = round(track.total, 1) if track and track.prev is not None else None
+                    if col is not None:
+                        entry["value"] = round(self._collector_pedal(col), 3)
+                        entry["raw_deg"] = round(col.track.total, 1)
+                    else:
+                        entry["value"] = round(self._pedal_locked(role, now), 3)
+                        entry["raw_deg"] = (round(track.total, 1)
+                                            if track and track.prev is not None else None)
                     if cal:
                         entry["full_deg"] = round(abs(cal.full_deg), 1)
                 else:
@@ -1011,16 +1237,16 @@ class SensorSet(object):
 
             job = None
             if self._job is not None:
-                role = self._job["role"]
-                steps = CAL_STEPS[role]
-                idx = min(self._job["index"], len(steps) - 1)
+                idx = min(self._job["index"], len(CAL_STEPS) - 1)
+                cols = self._job["collectors"]
                 job = {
-                    "role": role,
-                    "step": steps[idx][0],
-                    "prompt": steps[idx][1],
+                    "step": CAL_STEPS[idx][0],
+                    "prompt": CAL_STEPS[idx][1],
                     "index": self._job["index"],
-                    "steps": len(steps),
-                    "samples": len(self._job["samples"]),
+                    "steps": len(CAL_STEPS),
+                    # True once every attached sensor has what it needs, which is
+                    # the moment the operator can stop and press Enter.
+                    "all_ready": bool(cols) and all(c.ready() for c in cols.values()),
                 }
 
             roles = set(p.role for p in self._ports.values())
