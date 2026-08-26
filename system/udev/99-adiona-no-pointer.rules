@@ -1,11 +1,27 @@
-# Adiona-TV kiosk: ignore pure pointer devices so the Wayland compositor never
-# draws a mouse cursor on screen. A device that is ALSO a keyboard (combo
-# keyboard+trackpad on a single node) is NOT ignored — otherwise the keyboard
-# would die with it, breaking the Wi-Fi setup overlay and the Ctrl+Alt+F2 shell.
+# Adiona-TV kiosk: input device policy.
 #
-# Net effect: with no input device (normal event use) there is no cursor; a plain
-# mouse is ignored (still no cursor); a combo keyboard keeps working but its
-# pointer is active, so a cursor appears while that keyboard is plugged in.
-ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_MOUSE}=="1", ENV{ID_INPUT_KEYBOARD}!="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
-ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_TOUCHPAD}=="1", ENV{ID_INPUT_KEYBOARD}!="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
-ACTION=="add|change", SUBSYSTEM=="input", ENV{ID_INPUT_POINTINGSTICK}=="1", ENV{ID_INPUT_KEYBOARD}!="1", ENV{LIBINPUT_IGNORE_DEVICE}="1"
+# THIS FILE USED TO MAKE libinput IGNORE POINTER DEVICES, and no longer does.
+#
+# The reason it did was cursor visibility: cage paints a cursor for any pointer
+# it can see, a cursor parked in one spot for hours is exactly the burn-in the
+# screensaver exists to prevent, and CSS cannot reach what the compositor
+# composites. Ignoring the device removed the pointer and the cursor with it.
+#
+# That answer cost more than it bought. It could never cover a combo
+# keyboard+trackpad (a Logitech K400, the usual kiosk remote), which reports
+# ID_INPUT_KEYBOARD and ID_INPUT_MOUSE on ONE event node — dropping it would take
+# the keyboard with it, so the guard below had to let it through and a cursor
+# appeared anyway. And it broke the case that now matters: a plain USB or
+# Bluetooth mouse, which the settings panel is meant to be usable with.
+#
+# Cursor visibility is handled where it belongs instead, in two layers:
+#
+#   * web/index.html sets `cursor: none` on html/body, so the waiting screen and
+#     the screensaver never ask for one, and draws the settings panel's pointer
+#     from a data: URI image so it is always visible there and nowhere else.
+#   * blank-cursor.py + XCURSOR_THEME give the compositor a fully transparent
+#     cursor, which covers what the page cannot: the video player's surface.
+#
+# Nothing is ignored here now. The file is kept, rather than deleted, because the
+# reasoning above is worth having next to the box that behaves this way — and
+# because a future device that genuinely must be ignored belongs here.

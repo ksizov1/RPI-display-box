@@ -81,16 +81,26 @@ both jobs. Everything the game's key table lists works from here — see
 [LAN keyboard](#lan-keyboard) for how it travels.
 
 **F12 is the one key the box keeps for itself**, and it never reaches the
-headset. It opens the settings panel, which now holds both setup screens as tabs.
+headset. It opens the settings panel, which holds every setup screen as a tab.
+
+**While the panel is open the keyboard and mouse belong entirely to it.** The
+bridge releases its exclusive grab for as long as it is up, so nothing on these
+screens can collide with the game's key table — which is why the tabs can have
+plain function keys of their own.
 
 | Key | Does |
 |---|---|
-| **F12** | Open/close the settings panel. Works while a headset is casting: the video is suspended for as long as the panel is up, and returns on its own |
-| **← →** | Switch tab — *Internet Wi-Fi* (scan, join, band plan), *Steering wheel* (axis assignment, range, centring) and, when a rig is plugged in, *Vehicle sensors* (calibration) |
-| **Tab**, arrows, **Enter** | Move around inside a tab, exactly as they did in the old overlays |
-| **S** | Save the wheel mapping or the sensor calibration, on those tabs |
+| **F12** | Open/close the settings panel. Works while a headset is casting: the video is suspended for as long as the panel is up, and returns on its own. It always opens on **F2** |
+| **F1** | *Help* — what each tab is for, and every key on this list |
+| **F2** | *Internet Wi-Fi* — scan, join, band plan |
+| **F3** | *Bluetooth* — pair a keyboard or mouse to the box |
+| **F4** | *Steering wheel* — axis assignment, range, centring |
+| **F5** | *Vehicle sensors* — calibration. Present only while a rig is plugged in |
+| **← →** | Switch tab, skipping any that is not currently present |
+| **Tab**, arrows, **Enter** | Move around inside a tab |
+| **S** | Save the wheel mapping, or confirm a sensor calibration |
 | **Ctrl+S** | Re-centre the steering. The one key the box acts on **and still forwards**: it zeroes the USB sensor rig's turn count here, and the headset re-centres as it always has. See [USB vehicle sensors](#usb-vehicle-sensors-drive-square-steering--gas--brake) |
-| **Esc** | Close the panel |
+| **Esc** | Close the panel, or cancel the step that is running |
 | **Y** / **N** | Answer the software-update prompt, when one is up |
 | *everything else* | Goes to the headset |
 
@@ -123,14 +133,31 @@ while it is up, so its Y/N can never be swallowed by a dialog underneath.
 | An update is installing | Full-screen "do not remove power" screen; the result shows for a few seconds and clears itself |
 | Waiting screen unchanged for 3 min | **Screensaver** — the two logos and the wordmark drift around a half-brightness screen. Any change on screen, or any keypress, dismisses it. Never runs over a live stream, nor over the update prompt |
 
-> **No mouse cursor, ever.** `99-adiona-no-pointer.rules` makes libinput ignore
-> pure pointer devices, but it cannot ignore a combo keyboard+trackpad (a Logitech
-> K400) — keyboard and pointer share one event node, so dropping the device would
-> take the keyboard with it. `cage` then paints a cursor that the page cannot hide,
-> and one parked in a corner for hours is the same burn-in the screensaver exists
-> to prevent. `blank-cursor.py` generates a cursor theme made entirely of
-> transparent pixels, and `cage-session.sh` points `XCURSOR_THEME` at it. The
-> pointer still works for the overlay's click handlers; it is simply not drawn.
+> **A cursor in the settings panel, and nowhere else.** A mouse — USB, Bluetooth
+> or the trackpad half of a combo keyboard — works normally in the panel and is
+> properly visible there. It is not drawn on the waiting screen, over a live
+> stream or under the screensaver, where a pointer parked in a corner for hours
+> is the same burn-in the screensaver exists to prevent.
+>
+> Three layers, each covering what the one before it cannot:
+> `web/index.html` sets `cursor: none` on `html, body`, which handles the waiting
+> screen and the screensaver; it draws the panel's pointer from a **data: URI
+> image**; and `blank-cursor.py` + `XCURSOR_THEME` give the compositor a fully
+> transparent cursor for the one surface CSS cannot reach at all — the video
+> player's.
+>
+> The image matters. Every cursor NAME resolves through that transparent theme,
+> so asking for `default` or `pointer` returns nothing drawable. `<button>` and
+> `<input>` carry user-agent cursor styles that override the inherited
+> `cursor: none`, so the pointer used to wink in and out as it crossed the
+> panel's controls, depending on which names the theme happened to define. An
+> image is not a name and never consults the theme.
+>
+> `99-adiona-no-pointer.rules` used to make libinput ignore pointer devices for
+> the same goal. It no longer does: it could never cover a combo keyboard+
+> trackpad (keyboard and pointer share one event node, so dropping it took the
+> keyboard too), and it broke the plain mouse this panel is meant to be usable
+> with.
 
 ---
 
@@ -763,6 +790,10 @@ system/
                        kiosk-session.sh  → Chromium + player supervision
                        adiona-player.sh  → GStreamer RTP receiver (+ --probe)
   controller/          controller unit
+                       (the controller also pairs Bluetooth keyboards/mice:
+                        `busctl --json` to read BlueZ, one long-lived
+                        `bluetoothctl` to scan and pair — a D-Bus discovery and a
+                        pairing agent both belong to a connection, not a call)
   wheel/               adiona-wheel.py   — USB racing wheel → headset (+ unit)
                        adiona_keys.py    — USB keyboard → headset, in the same packet
                        adiona_sensors.py — Drive Square USB sensors, same packet again

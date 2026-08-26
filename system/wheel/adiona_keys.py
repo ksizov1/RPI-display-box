@@ -189,6 +189,11 @@ RING_SLOTS = 4
 # Actions, as they go on the wire.
 ACTION_UP, ACTION_DOWN, ACTION_REPEAT = 0, 1, 2
 
+# The settings panel's tabs, as the kiosk page names them. Recorded only so the
+# status file can say which one is up; keep in step with TABDEFS in
+# web/index.html, or a new tab reads back as "wifi".
+PANEL_TABS = ("help", "wifi", "bt", "wheel", "sensors")
+
 RESCAN_INTERVAL = 1.0        # look for a newly plugged keyboard
 GATE_INTERVAL = 0.2          # re-evaluate whether to hold the grab
 UPDATE_STATES_INTERACTIVE = ("prompting", "ok", "failed")
@@ -344,7 +349,7 @@ class KeyReader(object):
         once we have released the grab."""
         with self._lock:
             self._panel_open = bool(is_open)
-            if tab in ("wifi", "wheel", "sensors"):
+            if tab in PANEL_TABS:
                 self._panel_tab = tab
 
     # ── Main loop ────────────────────────────────────────────────────────────

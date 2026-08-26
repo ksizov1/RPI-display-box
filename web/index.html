@@ -82,21 +82,62 @@
      have a hotkey of their own; they were merged because every other key now
      belongs to the headset, and one thing to remember from across a room beats
      two. */
+  /* TOP-ANCHORED, NOT CENTRED. The card is as tall as whatever tab is showing,
+     so centring it made the tab strip jump up and down every time you switched
+     tabs — the one row that has to stay still, because it is what you are
+     aiming at. Pinning the top keeps it put and lets the pane below scroll. */
   #settings { position: fixed; inset: 0; z-index: 10; display: flex;
-              align-items: center; justify-content: center;
+              align-items: flex-start; justify-content: center;
+              padding: 5vh 0 3vh;
               background: rgba(255, 255, 255, 0.98);
               font-family: system-ui, "DejaVu Sans", sans-serif; color: #1a1a1a; }
   #settings.settings-hidden { display: none; }
   .set-tabs { display: flex; align-items: center; gap: 1vmin; margin-bottom: 2vmin;
-              padding-bottom: 1vmin; border-bottom: 2px solid #e0e0e0; }
-  .set-tab { font-size: 2.4vmin; font-weight: 600; padding: 0.9vmin 2.4vmin;
+              padding-bottom: 1vmin; border-bottom: 2px solid #e0e0e0;
+              flex: none; }
+  .set-tab { font-size: 2.1vmin; font-weight: 600; padding: 0.9vmin 1.8vmin;
              border: 2px solid transparent; border-radius: 1vmin;
-             background: none; color: #777; }
+             background: none; color: #777; white-space: nowrap; }
+  .set-tab .fk { display: block; font-size: 1.4vmin; font-weight: 700;
+                 letter-spacing: 0.06em; color: #9aa0a6; }
   .set-tab.on { background: #e8f0fe; color: #1a73e8; }
+  .set-tab.on .fk { color: #1a73e8; }
   .set-tab:focus { outline: none; border-color: #1a73e8; }
-  .set-hint { margin-left: auto; font-size: 1.7vmin; color: #888; white-space: nowrap; }
+  .set-hint { margin-left: auto; font-size: 1.6vmin; color: #888; white-space: nowrap; }
   .set-pane.pane-hidden { display: none; }
-  .wifi-card { width: min(860px, 92vw); max-height: 94vh; display: flex; flex-direction: column; }
+  /* The pane scrolls inside the card, so a long tab cannot push the tab strip
+     off the top of the screen. min-height:0 is what lets a flex child shrink. */
+  .set-pane { min-height: 0; overflow-y: auto; }
+  .wifi-card { width: min(980px, 94vw); max-height: 92vh; display: flex; flex-direction: column; }
+  /* A VISIBLE POINTER, BUT ONLY IN HERE. The compositor runs with an all
+     transparent cursor theme so the waiting screen, a live stream and the
+     screensaver never show one — but that theme also swallows any cursor this
+     page asks for by name, which is why the pointer used to flicker in and out
+     depending on which cursor Chromium happened to request. Drawing it from a
+     data: URI sidesteps the theme completely: this is an image, not a name, so
+     it is always drawn and always the same shape. */
+  #settings, #settings *, #update, #update * {
+    cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24'%3E%3Cpath d='M5 2 L5 19 L9.5 14.5 L12.5 21.5 L15.2 20.4 L12.2 13.8 L18.5 13.8 Z' fill='%23fff' stroke='%23000' stroke-width='1.6' stroke-linejoin='round'/%3E%3C/svg%3E") 5 2, default;
+  }
+  /* Inputs would otherwise fall back to the theme's "text"/"xterm" cursor, which
+     is transparent — an invisible caret over the one field somebody has to type
+     a Wi-Fi password into. Same trick: an image, not a name. */
+  #settings input {
+    cursor: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24'%3E%3Cg stroke='%23fff' stroke-width='4' fill='none'%3E%3Cpath d='M9 4h6M12 4v16M9 20h6'/%3E%3C/g%3E%3Cg stroke='%23000' stroke-width='1.6' fill='none'%3E%3Cpath d='M9 4h6M12 4v16M9 20h6'/%3E%3C/g%3E%3C/svg%3E") 12 12, text;
+  }
+
+  .help-wrap { font-size: 2vmin; line-height: 1.45; }
+  .help-lead { margin: 0 0 2vmin; color: #444; }
+  .help-lead b { color: #111; }
+  .help-item { display: flex; gap: 2vmin; align-items: baseline;
+               padding: 0.7vmin 0; }
+  .help-k { flex: none; width: 9ch; font-weight: 700; color: #1a73e8;
+            font-size: 1.9vmin; text-align: right; }
+  .help-item b { color: #111; }
+  .help-sep { border-top: 1px solid #e0e0e0; margin: 1.6vmin 0; }
+  .help-foot { color: #888; font-size: 1.7vmin; margin: 2vmin 0 0;
+               text-align: center; }
+
   .wifi-title { font-size: 3.4vmin; font-weight: 700; text-align: center; }
   .wifi-note { font-size: 1.9vmin; color: #555; text-align: center; margin: 1vmin 0 2vmin; line-height: 1.4; }
   .wifi-note b { color: #111; }
@@ -261,18 +302,71 @@
      this is a big screen. The headset never learns anything about the device. -->
 <div id="settings" class="settings-hidden">
   <div class="wifi-card">
+    <!-- Each tab has a function key of its own. While this panel is open the
+         keyboard belongs entirely to it — the bridge releases its grab, so
+         nothing here can collide with the game's key table. -->
     <div class="set-tabs" role="tablist" aria-label="Adiona-TV settings">
+      <button id="tabHelp" class="set-tab" role="tab" aria-selected="false"
+              aria-controls="paneHelp"><span class="fk">F1</span>Help</button>
       <button id="tabWifi" class="set-tab on" role="tab" aria-selected="true"
-              aria-controls="paneWifi">Internet Wi-Fi</button>
+              aria-controls="paneWifi"><span class="fk">F2</span>Internet Wi-Fi</button>
+      <button id="tabBt" class="set-tab" role="tab" aria-selected="false"
+              aria-controls="paneBt"><span class="fk">F3</span>Bluetooth</button>
       <button id="tabWheel" class="set-tab" role="tab" aria-selected="false"
-              aria-controls="paneWheel">Steering wheel</button>
+              aria-controls="paneWheel"><span class="fk">F4</span>Steering wheel</button>
       <!-- Hidden until a Drive Square sensor box is actually plugged in: this is
            specialist hardware and most boxes never see one, so an always-present
-           third tab would be one more thing between an operator and the Wi-Fi
-           screen. setTab()/cycleTab() skip it while it is hidden. -->
+           tab would be one more thing between an operator and the Wi-Fi screen.
+           setTab()/cycleTab() skip it while it is hidden. -->
       <button id="tabSensors" class="set-tab" role="tab" aria-selected="false"
-              aria-controls="paneSensors" style="display:none">Vehicle sensors</button>
-      <span class="set-hint">← → switch tab &nbsp;·&nbsp; Esc close</span>
+              aria-controls="paneSensors" style="display:none"><span class="fk">F5</span>Vehicle sensors</button>
+      <span class="set-hint">F1–F5 or ← → &nbsp;·&nbsp; Esc close</span>
+    </div>
+
+    <div id="paneHelp" class="set-pane pane-hidden" role="tabpanel" aria-labelledby="tabHelp">
+      <div class="help-wrap">
+        <p class="help-lead">This panel is the box's own settings. It opens with
+          <b>F12</b> and closes with <b>Esc</b>. While it is open the keyboard
+          and mouse belong to this screen; everything else you type goes to the
+          headset.</p>
+
+        <div class="help-item"><span class="help-k">F1</span>
+          <div><b>Help</b> — this page.</div></div>
+
+        <div class="help-item"><span class="help-k">F2</span>
+          <div><b>Internet Wi-Fi</b> — joins this box to a venue's Wi-Fi so it has
+            internet, using the USB adapter. This is <i>not</i> the headset
+            network, which is fixed and always on. Also holds the radio band
+            plan: the two radios must never share a band.</div></div>
+
+        <div class="help-item"><span class="help-k">F3</span>
+          <div><b>Bluetooth</b> — pairs a Bluetooth keyboard or mouse to the box,
+            so you do not need one plugged in. Scan, pick a device, and follow
+            the prompt.</div></div>
+
+        <div class="help-item"><span class="help-k">F4</span>
+          <div><b>Steering wheel</b> — for a USB racing wheel. Assigns which axis
+            is steering, gas and brake, sets the rotation range and the
+            spring-to-centre strength.</div></div>
+
+        <div class="help-item"><span class="help-k">F5</span>
+          <div><b>Vehicle sensors</b> — for a Drive Square USB sensor rig clamped
+            to a real car's wheel and pedals. Appears only when one is plugged
+            in. Two keypresses: zero everything, then move everything.</div></div>
+
+        <div class="help-sep"></div>
+
+        <div class="help-item"><span class="help-k">F12</span>
+          <div>Open or close this panel. It works while a headset is casting —
+            the video steps aside and comes back on its own.</div></div>
+        <div class="help-item"><span class="help-k">Ctrl+S</span>
+          <div>Re-centre the steering. Takes wherever the wheel is now as dead
+            ahead, without disturbing its calibration.</div></div>
+        <div class="help-item"><span class="help-k">Esc</span>
+          <div>Close the panel, or cancel whatever step is running.</div></div>
+
+        <p class="help-foot" id="helpFoot"></p>
+      </div>
     </div>
 
     <div id="paneWifi" class="set-pane" role="tabpanel" aria-labelledby="tabWifi">
@@ -305,6 +399,25 @@
         <div id="bandHint" class="band-hint"></div>
       </div>
       <div id="wifiMsg" class="wifi-msg"></div>
+    </div>
+
+    <div id="paneBt" class="set-pane pane-hidden" role="tabpanel" aria-labelledby="tabBt">
+      <div class="wifi-note">
+        Pairs a <b>Bluetooth keyboard or mouse</b> to this box, so one is not
+        needed in a USB port.<br>
+        <b>Put the device into pairing mode</b> — usually a button held until its
+        light flashes. Scanning starts as soon as this tab opens; <b>R</b> scans
+        again if the device was not ready in time.
+      </div>
+      <div id="btList" class="wifi-list" tabindex="0" role="listbox"
+           aria-label="Bluetooth devices"></div>
+      <div class="wifi-btns">
+        <button id="btScan">Scan (R)</button>
+        <button id="btPair">Pair / Connect (Enter)</button>
+        <button id="btForget">Forget (F)</button>
+        <button id="btClose">Close (Esc)</button>
+      </div>
+      <div id="btMsg" class="wifi-msg"></div>
     </div>
 
     <div id="paneWheel" class="set-pane pane-hidden" role="tabpanel" aria-labelledby="tabWheel">
@@ -1083,6 +1196,118 @@
   document.getElementById("whlSave").addEventListener("click", whlSave);
   document.getElementById("whlClose").addEventListener("click", function () { settingsShow(false); });
 
+  // ── Bluetooth tab (pair a keyboard or mouse to the box) ───────────────────
+  // Deliberately the same shape as the Wi-Fi tab: a list you move through with
+  // the arrows, Enter to act, R to rescan, F to forget. The box does the work;
+  // this renders what it says and relays a keypress.
+  var btListEl = document.getElementById("btList");
+  var btMsgEl = document.getElementById("btMsg");
+  var btSel = 0, btTimer = 0;
+  var bt = { available: false, devices: [] };
+
+  function btPost(p) {
+    return fetch("/bt", { method: "POST", body: JSON.stringify(p) })
+      .then(function (r) { return r.json(); });
+  }
+  function btMsg(text, color) {
+    btMsgEl.style.color = color || "#555";
+    btMsgEl.textContent = text;
+  }
+
+  function btIcon(d) {
+    if (d.icon === "input-keyboard") return "⌨";
+    if (d.icon === "input-mouse" || d.icon === "input-tablet") return "🖱";
+    if (d.icon === "input-gaming") return "🎮";
+    return "•";
+  }
+
+  function renderBt() {
+    if (!bt.available) {
+      btListEl.innerHTML = '<div class="wifi-empty">' +
+        esc(bt.message || "No usable Bluetooth adapter on this box.") + "</div>";
+      return;
+    }
+    var ds = bt.devices || [];
+    if (btSel >= ds.length) btSel = Math.max(0, ds.length - 1);
+    if (!ds.length) {
+      btListEl.innerHTML = '<div class="wifi-empty">' +
+        (bt.scanning ? "Scanning — put the device into pairing mode…"
+                     : "Nothing found yet. Press R to scan.") + "</div>";
+    } else {
+      btListEl.innerHTML = ds.map(function (d, i) {
+        var badge = d.connected
+          ? '<span class="badge conn">connected</span>'
+          : (d.paired ? '<span class="badge saved">paired</span>' : "");
+        return '<div class="wifi-item' + (i === btSel ? " sel" : "") +
+               (d.input ? "" : " off") + '">' +
+               '<span class="sig">' + btIcon(d) + "</span>" +
+               '<span class="name">' + esc(d.name) + "</span>" +
+               badge + "</div>";
+      }).join("");
+    }
+    // The agent's own words, verbatim. A keyboard's passkey is not something to
+    // paraphrase — the operator has to type exactly the digits BlueZ chose.
+    if (bt.agent) btMsg(bt.agent, "#1a73e8");
+    else if (bt.message) btMsg(bt.message);
+  }
+
+  function loadBt() {
+    return fetch("/bt", { cache: "no-store" })
+      .then(function (r) { return r.json(); })
+      .then(function (b) { bt = b; renderBt(); })
+      .catch(function () {});
+  }
+
+  function btPolling(on) {
+    if (btTimer) { clearInterval(btTimer); btTimer = 0; }
+    if (on) btTimer = setInterval(loadBt, 1000);
+  }
+
+  function openBt() {
+    btSel = 0;
+    btMsg("Scanning… put the device into pairing mode.");
+    // Scan on arrival rather than waiting for R. Opening this tab IS the
+    // request — and a device only advertises for a short while after its
+    // pairing button is held, so the useful window is easy to miss if the
+    // scan does not already be running when it opens.
+    btPost({ action: "scan" }).then(loadBt).catch(function () {});
+    loadBt();
+    setTimeout(function () { btListEl.focus(); }, 50);
+  }
+
+  function btCurrent() { return (bt.devices || [])[btSel] || null; }
+
+  btListEl.addEventListener("keydown", function (e) {
+    var ds = bt.devices || [];
+    if (e.key === "ArrowDown") {
+      btSel = Math.min(ds.length - 1, btSel + 1); renderBt(); e.preventDefault();
+    } else if (e.key === "ArrowUp") {
+      btSel = Math.max(0, btSel - 1); renderBt(); e.preventDefault();
+    } else if (e.key === "Enter") {
+      var d = btCurrent();
+      if (d) btPost({ action: d.paired ? "connect" : "pair", mac: d.mac }).then(loadBt);
+      e.preventDefault();
+    } else if (e.key === "r" || e.key === "R") {
+      btPost({ action: "scan" }).then(loadBt); e.preventDefault();
+    } else if (e.key === "f" || e.key === "F") {
+      var f = btCurrent();
+      if (f && f.paired) btPost({ action: "forget", mac: f.mac }).then(loadBt);
+      e.preventDefault();
+    }
+  });
+  document.getElementById("btScan").addEventListener("click", function () {
+    btPost({ action: "scan" }).then(loadBt);
+  });
+  document.getElementById("btPair").addEventListener("click", function () {
+    var d = btCurrent();
+    if (d) btPost({ action: d.paired ? "connect" : "pair", mac: d.mac }).then(loadBt);
+  });
+  document.getElementById("btForget").addEventListener("click", function () {
+    var d = btCurrent();
+    if (d && d.paired) btPost({ action: "forget", mac: d.mac }).then(loadBt);
+  });
+  document.getElementById("btClose").addEventListener("click", function () { settingsShow(false); });
+
   // ── Drive Square USB sensor tab (keyboard-only: arrows/Enter/S) ────────────
   // Calibrates the Steering, Gas and Brake boxes. Unlike the wheel tab, which
   // assigns axes that already exist, this one MEASURES: the operator sweeps each
@@ -1370,20 +1595,35 @@
   // keyboard is NOT grabbed (no headset, panel already open, update prompt up)
   // Chromium receives the very same F12, and a flag would be toggled twice.
   var settingsEl = document.getElementById("settings");
-  var TABS = ["wifi", "wheel", "sensors"];
-  var paneEls = { wifi: document.getElementById("paneWifi"),
-                  wheel: document.getElementById("paneWheel"),
-                  sensors: document.getElementById("paneSensors") };
-  var tabEls = { wifi: document.getElementById("tabWifi"),
-                 wheel: document.getElementById("tabWheel"),
-                 sensors: document.getElementById("tabSensors") };
-  var settingsOpen = false, settingsTab = "wifi";
+  // ONE table, not three parallel ones. The tab strip, the panes, the function
+  // keys and the arrow-key order all come from here, so adding a tab is one
+  // entry rather than four places to keep in step.
+  var TABDEFS = [
+    { key: "help",    fkey: "F1", tab: "tabHelp",    pane: "paneHelp",    open: function () { openHelp(); } },
+    { key: "wifi",    fkey: "F2", tab: "tabWifi",    pane: "paneWifi",    open: function () { openWifi(); } },
+    { key: "bt",      fkey: "F3", tab: "tabBt",      pane: "paneBt",      open: function () { openBt(); } },
+    { key: "wheel",   fkey: "F4", tab: "tabWheel",   pane: "paneWheel",   open: function () { openWheel(); } },
+    { key: "sensors", fkey: "F5", tab: "tabSensors", pane: "paneSensors", open: function () { openSensors(); } }
+  ];
+  var TABS = TABDEFS.map(function (t) { return t.key; });
+  var paneEls = {}, tabEls = {}, tabByFkey = {};
+  TABDEFS.forEach(function (t) {
+    paneEls[t.key] = document.getElementById(t.pane);
+    tabEls[t.key] = document.getElementById(t.tab);
+    tabByFkey[t.fkey] = t.key;
+    tabEls[t.key].addEventListener("click", function () { setTab(t.key); });
+  });
+  // F2 by default: Internet Wi-Fi is what anyone opening this panel at a venue
+  // has come for. Help is to its left because that is where a help tab belongs,
+  // not because it is the first thing anyone wants.
+  var DEFAULT_TAB = "wifi";
+  var settingsOpen = false, settingsTab = DEFAULT_TAB;
 
   // Which tabs exist right now. Only the sensor tab is conditional, and it is
   // conditional on hardware rather than on a setting: most boxes never see a
-  // Drive Square rig, and a permanently empty third tab in front of the Wi-Fi
-  // screen is worse than no tab at all. Everything below routes through this, so
-  // there is one answer to "does this tab exist" and not three.
+  // Drive Square rig, and a permanently empty tab in front of the Wi-Fi screen
+  // is worse than no tab at all. Everything below routes through this, so there
+  // is one answer to "does this tab exist" and not three.
   var snsAttached = 0;
   function tabExists(t) { return t !== "sensors" || snsAttached > 0; }
   function visibleTabs() { return TABS.filter(tabExists); }
@@ -1394,7 +1634,7 @@
     tabEls.sensors.style.display = attached > 0 ? "" : "none";
     // The rig was unplugged while its own tab was on screen. Do not leave the
     // panel showing a pane that no longer has a tab.
-    if (!tabExists(settingsTab)) setTab("wifi");
+    if (!tabExists(settingsTab)) setTab(DEFAULT_TAB);
   }
 
   // Tell the box what the panel is doing. The reader cannot see Esc or a mouse
@@ -1408,7 +1648,7 @@
   }
 
   function setTab(tab) {
-    if (TABS.indexOf(tab) < 0 || !tabExists(tab)) tab = "wifi";
+    if (TABS.indexOf(tab) < 0 || !tabExists(tab)) tab = DEFAULT_TAB;
     settingsTab = tab;
     TABS.forEach(function (t) {
       paneEls[t].classList.toggle("pane-hidden", t !== tab);
@@ -1417,10 +1657,9 @@
     });
     wheelPolling(settingsOpen && tab === "wheel");
     sensorsPolling(settingsOpen && tab === "sensors");
+    btPolling(settingsOpen && tab === "bt");
     if (!settingsOpen) return;
-    if (tab === "wifi") openWifi();
-    else if (tab === "wheel") openWheel();
-    else openSensors();
+    TABDEFS.forEach(function (t) { if (t.key === tab) t.open(); });
     uiReport();
   }
 
@@ -1428,10 +1667,14 @@
     settingsOpen = open;
     settingsEl.classList.toggle("settings-hidden", !open);
     if (open) {
-      setTab(tab || settingsTab);            // reports on our behalf
+      // Always lands on Internet Wi-Fi unless a tab is named. Predictable beats
+      // sticky on a screen somebody walks up to: whatever was left open twenty
+      // minutes ago is not what the next person came for.
+      setTab(tab || DEFAULT_TAB);            // reports on our behalf
     } else {
       wheelPolling(false);
       sensorsPolling(false);
+      btPolling(false);
       uiReport();
     }
   }
@@ -1445,9 +1688,14 @@
     setTab(vis[(i + dir + vis.length) % vis.length]);
   }
 
-  tabEls.wifi.addEventListener("click", function () { setTab("wifi"); });
-  tabEls.wheel.addEventListener("click", function () { setTab("wheel"); });
-  tabEls.sensors.addEventListener("click", function () { setTab("sensors"); });
+  function openHelp() {
+    // The one thing on the help page that is not the same on every box.
+    var sn = state.sensors || {};
+    document.getElementById("helpFoot").textContent =
+      "Adiona-TV " + (state.version ? "v" + state.version : "") +
+      (sn.attached ? "  ·  " + sn.attached + " vehicle sensor box" +
+                     (sn.attached === 1 ? "" : "es") + " attached" : "");
+  }
 
   // Long poll. Deliberately not a fast repeating one: this box sits on its
   // waiting screen for hours and has no business generating traffic then, which
@@ -1658,6 +1906,14 @@
       return;
     }
     if (settingsOpen) {
+      // F1-F5 pick a tab outright. Safe to take unconditionally: while this
+      // panel is open the keyboard bridge has released its grab, so no keystroke
+      // is going to the headset and nothing here can collide with the game.
+      if (tabByFkey[e.key]) {
+        setTab(tabByFkey[e.key]);
+        e.preventDefault();
+        return;
+      }
       // defaultPrevented on Escape for the same reason the arrows have it: a
       // pane gets first refusal. The sensor tab uses it to cancel a calibration
       // in progress without also closing the panel out from under the operator.

@@ -24,6 +24,7 @@ the session.
 stdlib only — nothing to pip-install on the image.
 """
 
+import collections
 import json
 import mimetypes
 import os
@@ -120,6 +121,11 @@ KEYS_CMD_SEQ = [0]
 SENSORS_STATUS_PATH = os.path.join(RUN_DIR, "sensors.json")
 SENSORS_CMD_PATH = os.path.join(RUN_DIR, "sensors-cmd.json")
 SENSORS_CMD_SEQ = [0]
+
+# The settings panel's tabs, as the page names them. Only ever used to sanity
+# check what the page reports about itself; keep in step with TABDEFS in
+# web/index.html, or a new tab is quietly reported as "wifi".
+PANEL_TABS = ("help", "wifi", "bt", "wheel", "sensors")
 
 # ── Software update bridge ───────────────────────────────────────────────────
 # Identical arrangement to the wheel bridge above, and for the same reason: the
@@ -255,6 +261,351 @@ def wheel_command(data):
     return {"ok": True, "message": action}
 
 
+# ── Bluetooth (pairing a keyboard or mouse to the box) ───────────────────────
+# TWO TOOLS, AND THE SPLIT IS NOT ARBITRARY.
+#
+# READING state uses `busctl --json`, which hands back BlueZ's own property
+# dictionary. Scraping bluetoothctl's output instead means parsing ANSI colour,
+# a moving prompt and asynchronous event lines interleaved with replies — a
+# losing game against a tool whose output is meant for a human.
+#
+# DOING things uses a single long-lived `bluetoothctl`, because both jobs belong
+# to a D-Bus CONNECTION rather than to a call. Measured on this box: `busctl call
+# StartDiscovery` starts a scan that BlueZ cancels the instant busctl exits, and
+# a pairing agent has to SERVE an object, which no one-shot call can do. One
+# bluetoothctl held open provides both.
+BT_SCAN_SECONDS = 20.0
+BT_LOG_LINES = 40
+# Anything the pairing agent says goes straight to the screen. A keyboard's
+# passkey prompt is not something to paraphrase: the operator has to type the
+# exact digits BlueZ chose.
+BT_AGENT_MARK = "[agent]"
+# bluetoothctl colours its output and redraws its prompt. Strip both before any
+# of it is matched on or put in front of an operator.
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]|\r")
+
+
+def busctl_paths():
+    """Every object path org.bluez exposes. Plain text, deliberately.
+
+    NOT GetManagedObjects, which would give paths and properties in one call:
+    `busctl --json` CANNOT SERIALISE THAT REPLY. BlueZ hands back each device's
+    ManufacturerData as a dict keyed by uint16, JSON has no such key type, and
+    busctl fails the whole call with "Failed to create new json object: Invalid
+    argument" — so one advertising device in the room turned the entire device
+    list into nothing. It only ever looked fine because an empty room has no
+    manufacturer data in it.
+    """
+    try:
+        out = subprocess.run(["busctl", "--list", "tree", "org.bluez"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [l.strip() for l in out.stdout.splitlines()
+            if l.strip().startswith("/org/bluez/")]
+
+
+def busctl_props(path, iface, names):
+    """Read named properties from one object, or None if any of them is absent.
+
+    `busctl get-property` prints ONE json object per property, newline
+    separated rather than as an array, so this pairs them back up with the names
+    in order. Asking for a property the object does not have fails the whole
+    call — which is why Icon, absent on anything BlueZ has not classified yet,
+    is fetched on its own.
+    """
+    try:
+        out = subprocess.run(["busctl", "--json=short", "get-property",
+                              "org.bluez", path, iface] + list(names),
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    vals = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            vals.append(json.loads(line).get("data"))
+        except ValueError:
+            return None
+    if len(vals) != len(names):
+        return None
+    return dict(zip(names, vals))
+
+
+# Always present on org.bluez.Device1. Icon, Name and RSSI are not, and asking
+# for one that is missing fails the whole read.
+BT_DEV_PROPS = ("Address", "Alias", "Paired", "Trusted", "Connected")
+BT_DEV_PATH_RE = re.compile(
+    r"^/org/bluez/(hci\d+)/dev_([0-9A-Fa-f]{2}(?:_[0-9A-Fa-f]{2}){5})$")
+
+
+def bt_adapters():
+    """Adapter names (hciN) that are not rfkill-blocked, best first.
+
+    A box can have two: the Pi's internal radio and the USB Wi-Fi dongle's. The
+    dongle's arrives soft-blocked and is the one bluetoothctl picks by default,
+    which is why "no adapter" and "adapter that will not power on" look the same
+    from the command line. Blocked ones are simply not offered here.
+    """
+    names = []
+    base = "/sys/class/rfkill"
+    try:
+        entries = sorted(os.listdir(base))
+    except OSError:
+        return names
+    for entry in entries:
+        d = os.path.join(base, entry)
+        try:
+            if open(os.path.join(d, "type")).read().strip() != "bluetooth":
+                continue
+            name = open(os.path.join(d, "name")).read().strip()
+            soft = open(os.path.join(d, "soft")).read().strip()
+            hard = open(os.path.join(d, "hard")).read().strip()
+        except OSError:
+            continue
+        if name.startswith("hci") and soft == "0" and hard == "0":
+            names.append(name)
+    return names
+
+
+class BtManager(object):
+    """One bluetoothctl, kept alive, plus busctl for reading."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.proc = None
+        self.adapter = None            # "hci0"
+        self.icons = {}                # device path -> Icon, once BlueZ knows it
+        self.log = collections.deque(maxlen=BT_LOG_LINES)
+        self.agent_says = ""           # the newest [agent] line, for the screen
+        self.busy = ""                 # "pairing AA:BB:.." while one is running
+        self.message = ""
+        self.scan_until = 0.0
+
+    # ── process ──────────────────────────────────────────────────────────────
+    def _alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def _start(self):
+        """Bring bluetoothctl up and point it at a usable adapter."""
+        adapters = bt_adapters()
+        if not adapters:
+            self.message = "No usable Bluetooth adapter on this box."
+            return False
+        self.adapter = adapters[0]
+        try:
+            self.proc = subprocess.Popen(
+                ["bluetoothctl"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, bufsize=1)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.message = "bluetoothctl unavailable: %s" % e
+            self.proc = None
+            return False
+        threading.Thread(target=self._reader, daemon=True).start()
+        addr = self._adapter_prop("Address") or ""
+        # KeyboardDisplay is what lets BlueZ ask a keyboard's passkey question at
+        # all; with NoInputNoOutput a keyboard simply refuses to pair.
+        self._write("select %s" % addr if addr else "")
+        self._write("agent KeyboardDisplay")
+        self._write("default-agent")
+        self._write("power on")
+        self._write("pairable on")
+        return True
+
+    def _write(self, line):
+        if not line or not self._alive():
+            return
+        try:
+            self.proc.stdin.write(line + "\n")
+            self.proc.stdin.flush()
+        except (OSError, ValueError):
+            pass
+
+    def _reader(self):
+        """Keep the last few lines, and surface anything the agent says."""
+        proc = self.proc
+        try:
+            for raw in proc.stdout:
+                line = ANSI_RE.sub("", raw).strip()
+                if not line:
+                    continue
+                with self.lock:
+                    self.log.append(line)
+                    if BT_AGENT_MARK in line:
+                        self.agent_says = line.split(BT_AGENT_MARK, 1)[1].strip()
+                    low = line.lower()
+                    if "pairing successful" in low:
+                        self.message = "Paired."
+                        self.busy = ""
+                        self.agent_says = ""
+                    elif "failed to pair" in low or "authentication failed" in low:
+                        self.message = "Pairing failed. Put the device back into "\
+                                       "pairing mode and try again."
+                        self.busy = ""
+                        self.agent_says = ""
+                    elif "connection successful" in low:
+                        self.message = "Connected."
+                        self.busy = ""
+                # A yes/no question would otherwise sit there for ever. This box
+                # is pairing a keyboard in a venue, not guarding a bank.
+                if "(yes/no)" in line or "yes/no" in line.lower():
+                    self._write("yes")
+        except (OSError, ValueError):
+            pass
+
+    def ensure(self):
+        if self._alive():
+            return True
+        return self._start()
+
+    # ── reading ──────────────────────────────────────────────────────────────
+    def _adapter_prop(self, name):
+        if not self.adapter:
+            return None
+        got = busctl_props("/org/bluez/%s" % self.adapter,
+                           "org.bluez.Adapter1", (name,))
+        return got.get(name) if got else None
+
+    def _icon(self, path):
+        """A device's Icon, cached — BlueZ only learns it once the device has
+        been interrogated, and until then the property does not exist at all."""
+        if path in self.icons:
+            return self.icons[path]
+        got = busctl_props(path, "org.bluez.Device1", ("Icon",))
+        icon = (got or {}).get("Icon") or ""
+        if icon:
+            self.icons[path] = icon     # only a real answer is worth keeping
+        return icon
+
+    def devices(self):
+        """Every device BlueZ currently knows about, on this adapter."""
+        out = []
+        for path in busctl_paths():
+            m = BT_DEV_PATH_RE.match(path)
+            if not m:
+                continue
+            if self.adapter and m.group(1) != self.adapter:
+                continue
+            props = busctl_props(path, "org.bluez.Device1", BT_DEV_PROPS)
+            if props is None:
+                continue                # vanished between the tree and the read
+            icon = self._icon(path)
+            mac = props.get("Address") or m.group(2).replace("_", ":")
+            out.append({
+                "mac": mac,
+                "name": props.get("Alias") or mac,
+                "paired": bool(props.get("Paired")),
+                "connected": bool(props.get("Connected")),
+                "trusted": bool(props.get("Trusted")),
+                "icon": icon,
+                # What the box actually cares about. Everything is still listed —
+                # BlueZ often has not classified a device yet, and hiding the
+                # unclassified ones would hide the keyboard someone came to pair.
+                "input": icon in ("input-keyboard", "input-mouse",
+                                  "input-tablet", "input-gaming"),
+            })
+        out.sort(key=lambda d: (not d["connected"], not d["paired"],
+                                not d["input"], d["name"].lower()))
+        return out
+
+    def status(self):
+        with self.lock:
+            agent, message, busy = self.agent_says, self.message, self.busy
+            scanning = time.monotonic() < self.scan_until
+        available = bool(bt_adapters())
+        if not available:
+            return {"available": False, "powered": False, "scanning": False,
+                    "adapter": None, "devices": [], "agent": "", "busy": "",
+                    "message": "No usable Bluetooth adapter on this box."}
+        return {
+            "available": True,
+            "adapter": self.adapter,
+            "powered": bool(self._adapter_prop("Powered")),
+            "scanning": scanning or bool(self._adapter_prop("Discovering")),
+            "devices": self.devices(),
+            "agent": agent,
+            "busy": busy,
+            "message": message,
+        }
+
+    # ── doing ────────────────────────────────────────────────────────────────
+    def scan(self):
+        if not self.ensure():
+            return {"ok": False, "message": self.message}
+        with self.lock:
+            self.scan_until = time.monotonic() + BT_SCAN_SECONDS
+            self.message = "Scanning…"
+        self._write("scan on")
+        threading.Timer(BT_SCAN_SECONDS, lambda: self._write("scan off")).start()
+        return {"ok": True, "message": "scanning"}
+
+    def act(self, action, mac):
+        if not self.ensure():
+            return {"ok": False, "message": self.message}
+        with self.lock:
+            self.agent_says = ""
+            if action == "pair":
+                self.busy = mac
+                self.message = "Pairing… follow any prompt shown here."
+            elif action == "connect":
+                self.busy = mac
+                self.message = "Connecting…"
+            elif action == "disconnect":
+                self.message = "Disconnecting…"
+            else:
+                self.message = "Removing…"
+        if action == "pair":
+            # trust before connect, so it reconnects by itself after a reboot —
+            # which for the box's own keyboard is the entire point.
+            self._write("pair %s" % mac)
+            self._write("trust %s" % mac)
+            self._write("connect %s" % mac)
+        elif action == "connect":
+            self._write("trust %s" % mac)
+            self._write("connect %s" % mac)
+        elif action == "disconnect":
+            self._write("disconnect %s" % mac)
+        elif action == "forget":
+            self._write("disconnect %s" % mac)
+            self._write("remove %s" % mac)
+            with self.lock:
+                self.message = "Removed."
+        return {"ok": True, "message": action}
+
+
+BT = BtManager()
+MAC_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+
+def bt_status():
+    try:
+        return BT.status()
+    except Exception as e:                      # never take the page down
+        return {"available": False, "powered": False, "scanning": False,
+                "adapter": None, "devices": [], "agent": "", "busy": "",
+                "message": "Bluetooth unavailable: %s" % e}
+
+
+def bt_command(data):
+    """One Bluetooth action from the kiosk page. Whitelisted, and the MAC is
+    checked against a strict pattern — it is pasted straight into a command."""
+    action = str(data.get("action", ""))
+    if action == "scan":
+        return BT.scan()
+    if action not in ("pair", "connect", "disconnect", "forget"):
+        return {"ok": False, "message": "unknown action"}
+    mac = str(data.get("mac", "")).strip()
+    if not MAC_RE.match(mac):
+        return {"ok": False, "message": "bad device address"}
+    return BT.act(action, mac)
+
+
 def sensors_status():
     """Read the sensor bridge's status file. Absent service == no sensors."""
     try:
@@ -331,7 +682,7 @@ def keys_panel_report(data):
     knows when to take the keyboard back."""
     is_open = bool(data.get("open"))
     tab = str(data.get("tab", "wifi"))
-    if tab not in ("wifi", "wheel", "sensors"):
+    if tab not in PANEL_TABS:
         tab = "wifi"
     with LOCK:
         PANEL["open"] = is_open
@@ -1094,6 +1445,10 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(sensors_status()).encode("utf-8"),
                        "application/json")
             return
+        if path == "/bt":
+            self._send(200, json.dumps(bt_status()).encode("utf-8"),
+                       "application/json")
+            return
         if path == "/ui":
             self._send(200, json.dumps(self._ui_wait(query)).encode("utf-8"),
                        "application/json")
@@ -1114,7 +1469,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
-        if path not in ("/wifi", "/wheel", "/sensors", "/update", "/ui"):
+        if path not in ("/wifi", "/wheel", "/sensors", "/bt", "/update", "/ui"):
             self._send(404, b"not found", "text/plain")
             return
         try:
@@ -1129,6 +1484,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/sensors":
             self._send(200, json.dumps(sensor_command(data)).encode("utf-8"),
+                       "application/json")
+            return
+        if path == "/bt":
+            self._send(200, json.dumps(bt_command(data)).encode("utf-8"),
                        "application/json")
             return
         if path == "/update":
