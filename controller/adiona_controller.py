@@ -1145,6 +1145,116 @@ def wifi_uplink_iface():
     return None
 
 
+# USB Wi-Fi chipsets known NOT to work on this image, by USB vendor id. Without
+# this, such a dongle is indistinguishable on screen from no dongle at all: it
+# never becomes a netdev, so wifi_uplink_iface() is simply None. Matched on the
+# vendor only, because the product id changes with the mode the dongle is in.
+#
+# a69c = aicsemi (AIC8800). Measured on a bad batch: enumerates as a 1.7 MB USB
+# disk holding the Windows driver ("Aic MSC", a69c:5721), usb-modeswitch-data
+# has no rule for it, and there is no in-kernel driver even after switching -
+# only an out-of-tree module that would need rebuilding for every kernel update.
+UNSUPPORTED_WIFI_VENDORS = {
+    "a69c": "AIC8800",
+}
+_unsupported_logged = set()
+
+
+def unsupported_wifi_dongles():
+    """USB devices plugged in whose Wi-Fi chipset this image cannot drive, as
+    [{"usb_id": "a69c:5721", "chip": "AIC8800"}]. Read from sysfs: cheap, and
+    works whatever mode the dongle enumerated in."""
+    found = []
+    try:
+        devs = sorted(os.listdir("/sys/bus/usb/devices"))
+    except OSError:
+        return found
+    for d in devs:
+        base = "/sys/bus/usb/devices/" + d
+        try:
+            with open(base + "/idVendor") as fh:
+                vid = fh.read().strip().lower()
+            with open(base + "/idProduct") as fh:
+                pid = fh.read().strip().lower()
+        except OSError:
+            continue        # interfaces and root hubs have no ids of their own
+        chip = UNSUPPORTED_WIFI_VENDORS.get(vid)
+        if not chip:
+            continue
+        usb_id = "%s:%s" % (vid, pid)
+        found.append({"usb_id": usb_id, "chip": chip})
+        if usb_id not in _unsupported_logged:
+            _unsupported_logged.add(usb_id)
+            print("[adiona-controller] unsupported USB Wi-Fi adapter: %s (%s) - "
+                  "no Linux driver on this image, replace the dongle" % (chip, usb_id))
+    return found
+
+
+# Uplink drivers that bring the dongle up but were rejected for service, keyed by
+# kernel module. Keyed on the driver rather than a USB id because the verdict was
+# about the driver, and one chip ships under several product ids.
+#
+# rtl8xxxu: the generic driver for older Realtek Wi-Fi 4 parts. An RTL8188FTV
+# (0bda:f179) on it was tried early on and rejected as not reliable enough; the
+# RTL8188GU and RTL8192EU land on the same driver. The dongles in service use the
+# dedicated rtw88/rtw89 drivers instead.
+REJECTED_WIFI_DRIVERS = {
+    "rtl8xxxu": "driver not reliable enough for the uplink",
+}
+_rejected_logged = set()
+
+
+def usb_model_name(usb_path):
+    """Model name for a USB device from udev's hardware database - what lsusb
+    prints, e.g. "RTL8188FTV 802.11b/g/n 1T1R 2.4G WLAN Adapter". The device's
+    own product string is often useless ("802.11n"), so it is only the fallback.
+    None if neither is known."""
+    try:
+        out = subprocess.run(["udevadm", "info", "--query=property", "--path=" + usb_path],
+                             capture_output=True, text=True, timeout=3).stdout
+        for line in out.splitlines():
+            if line.startswith("ID_MODEL_FROM_DATABASE="):
+                return line.split("=", 1)[1].strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    try:
+        with open(os.path.join(usb_path, "product")) as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+def rejected_uplink(iface):
+    """{"driver", "usb_id", "model", "reason"} if [iface] runs on a rejected
+    driver, else None."""
+    if not iface:
+        return None
+    dev = "/sys/class/net/%s/device" % iface
+    try:
+        driver = os.path.basename(os.path.realpath(dev + "/driver/module"))
+    except OSError:
+        return None
+    reason = REJECTED_WIFI_DRIVERS.get(driver)
+    if not reason:
+        return None
+    # device/ is the USB interface; the ids live on its parent, the USB device.
+    usb = os.path.dirname(os.path.realpath(dev))
+    ids = []
+    for name in ("idVendor", "idProduct"):
+        try:
+            with open(os.path.join(usb, name)) as fh:
+                ids.append(fh.read().strip())
+        except OSError:
+            ids.append("")
+    usb_id = "%s:%s" % tuple(ids) if ids[0] else "?"
+    model = usb_model_name(usb)
+    if usb_id not in _rejected_logged:
+        _rejected_logged.add(usb_id)
+        print("[adiona-controller] rejected USB Wi-Fi adapter on %s: %s (%s, %s) - "
+              "%s, replace the dongle" % (iface, model or "unknown", usb_id, driver, reason))
+    return {"driver": driver, "usb_id": usb_id, "model": model, "reason": reason}
+
+
 def default_route_dev():
     try:
         out = subprocess.run(["ip", "route", "show", "default"],
@@ -1210,7 +1320,11 @@ def wifi_info(do_rescan=False):
             # is no adapter or its capability could not be read; the UI treats
             # only an explicit False as "cannot switch".
             "band_plan": current_band_plan(),
-            "uplink_5ghz": iface_supports_5ghz(up)}
+            "uplink_5ghz": iface_supports_5ghz(up),
+            # Only looked for when there is no adapter: it explains the absence.
+            "unsupported": [] if up else unsupported_wifi_dongles(),
+            # Present and working, but on a driver rejected for service.
+            "rejected": rejected_uplink(up)}
     if not up:
         return info
     if do_rescan:
