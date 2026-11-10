@@ -197,13 +197,13 @@ Say "pushed $branch - CI will tag $Tag and publish the release"
 
 Write-Host ""
 Write-Host "Next:" -ForegroundColor Green
-Write-Host "  1. wait a couple of minutes, then open Releases/$Tag and take"
-Write-Host "     adiona-tv-$Version.tar.gz and box_versions.json"
-Write-Host "  2. scp the tarball to /var/www/license-api-binaries/5/ on the licence server"
-Write-Host "  3. write a real 'notes' line in box_versions.json, then use it to"
-Write-Host "     REPLACE data/box_versions.json there - it is the whole file"
-Write-Host "  4. push the licence server, then: bash tools/verify-signing.sh"
-Write-Host "  5. power-cycle a box and answer the prompt on the TV"
+Write-Host "  1. wait a couple of minutes for CI to publish Releases/$Tag"
+Write-Host "  2. .\tools\publish-release.ps1 -Notes `"one line for the TV prompt`""
+Write-Host "     (uploads to S3 + the VM mirror, writes the licence server's"
+Write-Host "      data/box_versions.json; needs 'aws login' and ADIONA_MIRROR_SSH)"
+Write-Host "  3. review, commit and push the licence server, then:"
+Write-Host "     bash tools/verify-signing.sh"
+Write-Host "  4. power-cycle a box and answer the prompt on the TV"
 Write-Host ""
 Write-Host "  (SD-card image: not built by this push. Start the workflow by hand" -ForegroundColor DarkGray
 Write-Host "   from the Actions tab; it attaches the .img.xz to Releases/$Tag.)" -ForegroundColor DarkGray

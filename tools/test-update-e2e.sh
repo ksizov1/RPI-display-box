@@ -69,8 +69,11 @@ cat > "$SB/server.py" <<PYEOF
 import base64, http.server, json, os, subprocess, sys
 KEY = sys.argv[1]
 MANIFEST = {"schema": 1, "channel": "stable", "min_client_protocol": 1, "pins": {},
+  # The primary deliberately 404s, so the install below can only succeed through
+  # the mirror - the same shape as the CDN-down / VM-up case in production.
   "releases": [{"version": "$TO_VER",
-    "url": "http://127.0.0.1:$PORT/adiona-tv-$TO_VER.tar.gz",
+    "url": "http://127.0.0.1:$PORT/primary-is-down/adiona-tv-$TO_VER.tar.gz",
+    "mirrors": ["http://127.0.0.1:$PORT/adiona-tv-$TO_VER.tar.gz"],
     "size": $SIZE, "sha256": "$SHA", "notes": "End-to-end test release.",
     "min_from": "1.0.0", "min_image": "1.0.0", "packages": [], "rollout": 100}]}
 
@@ -149,7 +152,7 @@ echo "=== 3. the updater: check, verify, download, stage ==="
 # TO_VER goes in through the environment, not by interpolation: the heredoc is
 # quoted ('PY') so the shell leaves its body alone, which is what keeps the Python
 # readable — but it also means $TO_VER would arrive at Python as a literal.
-PATH="$SB/bin:$PATH" TO_VER="$TO_VER" python3 - <<'PY'
+(PATH="$SB/bin:$PATH" TO_VER="$TO_VER" python3 - <<'PY'
 import importlib.util, os, time
 spec = importlib.util.spec_from_file_location("au", os.environ["ADIONA_ROOT"] + "/updater/adiona-updater.py")
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
@@ -165,6 +168,9 @@ for _ in range(600):
     time.sleep(0.1)
 print("  after stage :", m.STATE["state"], "|", m.STATE["message"])
 PY
+) | tee "$SB/stage.log"
+chk "primary 404 -> fell back"    'grep -q "primary-is-down.*trying the next mirror" "$SB/stage.log"'
+chk "fetched from the mirror"     'grep -q "downloaded from mirror" "$SB/stage.log"'
 chk "release $TO_VER staged"      '[ -d "$BOX/opt/adiona/releases/$TO_VER" ]'
 chk "staged VERSION is $TO_VER"   '[ "$(cat "$BOX/opt/adiona/releases/$TO_VER/VERSION")" = "$TO_VER" ]'
 chk "no .partial left behind"     '[ ! -d "$BOX/opt/adiona/releases/$TO_VER.partial" ]'

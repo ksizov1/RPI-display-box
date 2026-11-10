@@ -239,43 +239,60 @@ if offered is None:
 # ── 4. is it actually downloadable? ──────────────────────────────────────────
 # The manifest is a promise about a file. Checking the promise without checking
 # the file is how a signed, well-formed manifest still fails on the box.
-url = offered.get("url", "")
+#
+# Every location is checked: `url` (the S3/CloudFront CDN - the only one boxes
+# predating `mirrors` will ever try) and each mirror (the licence server VM, until
+# it is retired). A broken mirror fails this too: a fallback nobody has tested is
+# not a fallback.
 want = int(offered.get("size", 0) or 0)
-print("\nfetching %s" % url)
+mirrors = offered.get("mirrors") if isinstance(offered.get("mirrors"), list) else []
+targets = [("primary", offered.get("url", ""))] + [("mirror", m) for m in mirrors]
 
-probe = subprocess.run(
-    ["curl", "-sSL", "-o", os.devnull, "-w", "%{http_code} %{size_download} %{url_effective}",
-     "--max-time", "60", url],
-    capture_output=True, text=True)
-parts = (probe.stdout or "").split()
-if probe.returncode != 0 or len(parts) < 2:
-    print("\nUNREACHABLE: could not fetch the release.")
-    print("             %s" % (probe.stderr or probe.stdout or "curl failed").strip()[:200])
-    print("             A box would fail here, AFTER the operator pressed Y.")
+def probe_url(role, url):
+    print("\nfetching %s  (%s)" % (url, role))
+    probe = subprocess.run(
+        ["curl", "-sSL", "-o", os.devnull, "-w", "%{http_code} %{size_download} %{url_effective}",
+         "--max-time", "60", url],
+        capture_output=True, text=True)
+    parts = (probe.stdout or "").split()
+    if probe.returncode != 0 or len(parts) < 2:
+        print("UNREACHABLE: could not fetch the release from the %s." % role)
+        print("             %s" % (probe.stderr or probe.stdout or "curl failed").strip()[:200])
+        return False
+    code, got = parts[0], int(parts[1])
+    final = parts[2] if len(parts) > 2 else url
+    if code != "200":
+        print("UNREACHABLE: the %s returns HTTP %s." % (role, code))
+        if code == "403" and "cloudfront.net" in url:
+            print("             From CloudFront/S3, 403 means the object is not in the")
+            print("             bucket - run tools/publish-release.ps1.")
+        if final != url:
+            print("             It redirected to %s" % final)
+            print("             A trailing slash added here means the web server resolved the")
+            print("             path to a DIRECTORY - the filename never reached it. With")
+            print("             nginx that is `alias` in a regex location dropping the")
+            print("             unmatched tail; use `root` instead.")
+        print("             The file may not be uploaded, or may not be readable.")
+        return False
+    if want and got != want:
+        print("MISMATCH: the manifest says %d bytes, the %s returned %d." % (want, role, got))
+        print("          The uploaded tarball is not the one this manifest describes, so")
+        print("          the box would reject it on the sha256 check after downloading it.")
+        return False
+    print("download : HTTP 200, %d bytes, matches the manifest" % got)
+    return True
+
+results = [probe_url(role, u) for role, u in targets]
+if not results[0]:
+    print("\nFAILED: the primary download does not work. A box without mirror support")
+    print("        fails here, AFTER the operator pressed Y.")
+    sys.exit(1)
+if not all(results):
+    print("\nFAILED: a mirror does not serve the release. Boxes would still get it from")
+    print("        the primary, but the fallback is broken.")
     sys.exit(1)
 
-code, got = parts[0], int(parts[1])
-final = parts[2] if len(parts) > 2 else url
-if code != "200":
-    print("\nUNREACHABLE: the release URL returns HTTP %s." % code)
-    if final != url:
-        print("             It redirected to %s" % final)
-        print("             A trailing slash added here means the web server resolved the")
-        print("             path to a DIRECTORY - the filename never reached it. With")
-        print("             nginx that is `alias` in a regex location dropping the")
-        print("             unmatched tail; use `root` instead.")
-    print("             The file may not be uploaded, or may not be readable by the")
-    print("             web server's user.")
-    sys.exit(1)
-
-if want and got != want:
-    print("\nMISMATCH: the manifest says %d bytes, the server returned %d." % (want, got))
-    print("          The uploaded tarball is not the one this manifest describes, so")
-    print("          the box would reject it on the sha256 check after downloading it.")
-    sys.exit(1)
-
-print("download : HTTP 200, %d bytes, matches the manifest" % got)
-
-print("\nVERIFIED: signed by the pair of this public key, well-formed, downloadable,")
+print("\nVERIFIED: signed by the pair of this public key, well-formed, downloadable")
+print("          from %d location%s," % (len(targets), "" if len(targets) == 1 else "s"))
 print("          and a box on v%s would be offered v%s." % (boxver, offered["version"]))
 PY

@@ -667,9 +667,13 @@ It rides on the wheel socket because the headset's socket is *connected* to
 
    Uplinks at events are routinely somebody's phone hotspot, which is the whole
    reason nothing downloads before the question is answered.
-3. **Download and stage.** The tarball is verified against the sha256 in the
-   signed manifest and unpacked into `/opt/adiona/releases/<version>/`. Nothing
-   the box is running has changed yet.
+3. **Download and stage.** The tarball comes from the AWS builds CDN (S3 +
+   CloudFront, `…cloudfront.net/rpi/`). If that fails, the box tries each
+   `mirrors` entry in turn; today that is the licence server VM (`/5/`), kept as a
+   fallback until it is retired. Every source is held to the same signed size and
+   sha256, so a mirror can make the download more reliable but can never change
+   what gets installed. The tarball is then unpacked into
+   `/opt/adiona/releases/<version>/`. Nothing the box is running has changed yet.
 4. **Apply.** `apply-update.sh` installs any missing apt packages *first* (so a
    failure leaves the box untouched), merges new `box.conf` keys without
    overwriting anything the operator set, then swaps `/opt/adiona/current` — one
@@ -805,6 +809,7 @@ tools/
   deploy.ps1           live deploy from a Windows checkout
   release.ps1          cut a release: bump VERSION, commit, push (CI tags it)
   make-release.sh      build the OTA tarball + the manifest that describes it
+  publish-release.ps1  upload a release to S3 (+ the VM mirror), write the manifest
   verify-signing.sh    prove the server signs with the pair of update-key.pub
   test-apply-update.sh sandbox test for the update/rollback machinery (Linux/WSL)
   test-update-e2e.sh   end-to-end check of check → download → apply (Linux/WSL)
@@ -914,11 +919,43 @@ Everything for a version ends up on **one page**, `Releases/vX.Y.Z`:
 | `box_versions.json` | automatically | the complete manifest; replaces the server's copy |
 | `*.img.xz` | **by hand** (see below) | flashing a new SD card |
 
-Publishing an OTA is then two steps on the licence server: copy the tarball to the
-public binary directory, and replace `data/box_versions.json` with the one from
-the release page. The manifest is the whole contract — it names the URL, the size
-and the sha256, and it is signed, so a box needs nothing else to decide what to
-install and to prove it got it intact.
+### Publishing an OTA
+
+Tarballs are hosted the same way as the game's Windows and Web builds: in the
+`adiona-builds-242344399348-us-east-1` S3 bucket, served by CloudFront.
+
+| Role | Location |
+|---|---|
+| Primary (`url`) | `s3://adiona-builds-242344399348-us-east-1/rpi/adiona-tv-X.Y.Z.tar.gz` → `https://djmxvs3blcla1.cloudfront.net/rpi/adiona-tv-X.Y.Z.tar.gz` |
+| Mirror (`mirrors`) | `/var/www/license-api-binaries/5/` on the licence server VM → `https://license.drivingsimulator.com/5/adiona-tv-X.Y.Z.tar.gz` |
+
+Once CI has published `Releases/vX.Y.Z`:
+
+```powershell
+aws login                                                  # the d2-marketing account
+$env:ADIONA_MIRROR_SSH = "user@licence-vm"                 # once per shell
+.\tools\publish-release.ps1 -Notes "One line for the TV prompt."
+.\tools\publish-release.ps1 -Notes "Canary." -Rollout 10   # a few boxes first
+```
+
+The script takes the CI-built tarball and manifest from the release page. It
+checks that they agree, then uploads the tarball to S3. It never overwrites an
+existing version, because published names are immutable and cached for a year.
+It then `scp`s the tarball to the VM mirror and writes
+`..\Adiona-license-server\data\box_versions.json` with your notes and rollout.
+Review that file, commit and push the licence server, then run `verify-signing.sh`.
+
+`-SkipMirror` publishes to S3 only and writes an empty `mirrors` list. When the
+VM is retired, that becomes the default. Set `ADIONA_RELEASE_MIRROR_URLS=""`
+for `make-release.sh` in CI, and nothing else changes.
+
+Boxes running an updater older than the `mirrors` support (≤ 1.9.2) read only
+`url`, so they download from the CDN straight away and never fall back to the
+VM. That is why the CDN has to be the primary.
+
+The manifest is the whole contract: it names the URLs, the size and the sha256,
+and it is signed. A box needs nothing else to decide what to install and to
+prove it got it intact.
 
 Before publishing anything anyone is waiting for:
 
@@ -931,7 +968,8 @@ one failure in this chain that is completely silent — the server reports
 `"signed": true`, boxes check in without errors, and nothing goes wrong until the
 first release, which every box then refuses and goes on refusing. This fetches a
 real manifest, verifies it the way a box would with the key a box would use, and
-checks that the URL it names actually downloads at the declared size.
+checks that the primary URL and every mirror actually download at the declared
+size.
 
 ## Building an SD-card image
 
@@ -1104,11 +1142,41 @@ vcgencmd get_throttled                # 0x0 = supply is fine
 - **NetworkManager keeps re-scanning.** Background scans on a client interface
   briefly leave the channel, which a marginal link may not survive. Check the
   journal for repeated `scanning` entries.
-- **Chipset.** The dongle in use is an RTL8821CU on the in-kernel `rtw88_8821cu`
-  driver — dual-band, and it reports AP mode as well as client. Prefer adapters
+- **Chipset.** Every dongle batch this box has used, measured on the hardware
+  (kernel 6.18, image 1.7.0). Only RTL8811CU and RTL8851BU are known to work:
+
+  | Batch | USB id (`lsusb`) | Chip | Kernel driver | Bands | Bluetooth | Status |
+  |---|---|---|---|---|---|---|
+  | 0 (early development) | `0bda:f179` "RTL8188FTV 802.11b/g/n 1T1R 2.4G" | Realtek RTL8188FTV (Wi-Fi 4) | `rtl8xxxu`, in-kernel | 2.4 GHz only | none | **rejected** — comes up as `wlan1` but the driver was not reliable enough |
+  | 1 (original) | `0bda:c811` "802.11ac NIC" | Realtek RTL8811CU (Wi-Fi 5) | `rtw88_8821cu`, in-kernel | 2.4 + 5 GHz | none | works |
+  | 2 — "WiFi 6 AX900, Bluetooth 5.3" | `0bda:b851` "802.11ax WLAN Adapter" | Realtek RTL8851BU (Wi-Fi 6) | `rtw89_8851bu`, in-kernel | 2.4 + 5 GHz | yes, arrives soft-blocked; ignored by the pairing UI | works |
+  | 3 — "WiFi 6 AX900/600, Bluetooth 5.4" | `a69c:5721` "Aic MSC" | AIC8800 | none | — | — | **unsupported** |
+
+  Batches 2 and 3 were near-identical listings, so the listing text does not
+  identify the chip. Check one sample's USB vendor id before buying a batch
+  (`lsusb`, or Windows Device Manager → Hardware Ids): `0bda` Realtek, `a69c`
+  AIC (reject). A Realtek vendor id is not enough on its own: batch 0 shows that
+  an in-kernel driver is not the same as a good one. Avoid anything that lands on
+  the generic `rtl8xxxu` driver (RTL8188FTV, RTL8188GU, RTL8192EU and similar
+  older Wi-Fi 4 parts); the working dongles use the dedicated `rtw88`/`rtw89`
+  drivers. A new chip is not known good until it has run as the uplink on a box
+  for a while — add it to the table when it has. Prefer adapters
   with in-kernel drivers; an out-of-tree module (`rtl88xxau` and friends) adds a
   failure mode that no amount of configuration fixes. `dmesg` naming the module
   tells you which you have.
+- **"Unsupported USB Wi-Fi adapter" on the Wi-Fi tab.** The controller recognises
+  chipsets this image cannot drive (`UNSUPPORTED_WIFI_VENDORS` in
+  `adiona_controller.py`) and names them instead of reporting no adapter; the
+  journal logs the same line once. Seen so far: **AIC8800** (`a69c:…`), sold as
+  generic "AX"/"Wi-Fi 6" dongles. It enumerates as a tiny USB disk holding the
+  Windows driver (`lsusb`: `a69c:5721 aicsemi Aic MSC`) and has no in-kernel
+  driver, so it never becomes `wlan1`. Replace the dongle — buy by chipset, not
+  brand, since vendors swap chips under the same product name.
+- **"Service: rejected USB Wi-Fi adapter: …" on the Wi-Fi tab.** The
+  dongle works, but its kernel driver is one rejected for service
+  (`REJECTED_WIFI_DRIVERS` in `adiona_controller.py`; today only `rtl8xxxu`, see
+  batch 0 above). Keyed on the driver, not the USB id, so every chip on that
+  driver is caught. Logged to the journal once as well. Replace the dongle.
 
 Ethernet remains the dependable uplink — the dongle exists for venues where
 running a cable is impractical, and it is the box's least reliable link by nature.

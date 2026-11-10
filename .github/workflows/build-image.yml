@@ -213,13 +213,15 @@ jobs:
           body: |
             **OTA update** for boxes already in the field.
 
-            1. Upload `adiona-tv-${{ steps.gate.outputs.version }}.tar.gz` to
-               `/var/www/license-api-binaries/5/` on the licence server.
-            2. Write a real `notes` line in `box_versions.json`, then use it to
-               REPLACE `data/box_versions.json` there. It is the complete manifest,
-               not a fragment - nothing to splice.
+            1. Run `.\tools\publish-release.ps1 -Notes "..."`. It uploads
+               `adiona-tv-${{ steps.gate.outputs.version }}.tar.gz` to the S3
+               builds bucket (`rpi/`, served by CloudFront - the primary) and to
+               the licence server VM's `/5/` (the mirror). It also writes the
+               complete manifest over the licence server's `data/box_versions.json`.
+            2. Review, commit and push the licence server.
             3. Run `bash tools/verify-signing.sh`, which checks the signature and
-               the shape and tells you what a box would actually be offered.
+               the shape, what a box would actually be offered, and that the
+               primary and every mirror serve the tarball.
             See `Adiona-license-server/docs/BOX_UPDATES.md`.
 
             The flashable SD-card image is NOT built automatically. Start

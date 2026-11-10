@@ -19,8 +19,19 @@
 #     bash tools/make-release.sh /tmp/out        # somewhere else
 #
 # Produces exactly two files, both ready to use as-is:
-#   adiona-tv-<version>.tar.gz   -> scp to /var/www/license-api-binaries/5/
+#   adiona-tv-<version>.tar.gz   -> uploaded by tools/publish-release.ps1 to
+#                                   S3 (primary) and the licence server VM (mirror)
 #   box_versions.json            -> REPLACES data/box_versions.json on the server
+#
+# Hosting. The primary download is the AWS builds CDN - the same S3 bucket and
+# CloudFront distribution the game's win/ and web/ builds use - under rpi/. The
+# licence server VM (/5/) is listed in `mirrors` as a fallback while it is phased
+# out; a box running an updater that understands `mirrors` tries it only if the
+# CDN fails. Older boxes read `url` alone, which is why the CDN has to be `url`.
+#
+#   ADIONA_RELEASE_BASE_URL     primary base   (default: the CloudFront rpi/ prefix)
+#   ADIONA_RELEASE_MIRROR_URLS  space-separated mirror bases
+#                               (default: the VM; set to "" to list no mirror)
 #
 # box_versions.json is the COMPLETE manifest, not a fragment to splice into an
 # existing one. Editing a fragment into an array by hand went wrong the first time
@@ -101,7 +112,16 @@ done
 # refuse the release on every box in the existing fleet — which is exactly the
 # fleet a first OTA release is aimed at. Set it ONLY when a release genuinely
 # depends on something a reflash provides.
-BASE_URL="${ADIONA_RELEASE_BASE_URL:-https://license.drivingsimulator.com/5}"
+BASE_URL="${ADIONA_RELEASE_BASE_URL:-https://djmxvs3blcla1.cloudfront.net/rpi}"
+# ${VAR-default}, not ${VAR:-default}: an explicitly EMPTY value means "no mirror".
+MIRROR_BASES="${ADIONA_RELEASE_MIRROR_URLS-https://license.drivingsimulator.com/5}"
+
+NAME="$(basename "$TARBALL")"
+MIRRORS_JSON=""
+for base in $MIRROR_BASES; do
+	[ -n "$MIRRORS_JSON" ] && MIRRORS_JSON="$MIRRORS_JSON, "
+	MIRRORS_JSON="$MIRRORS_JSON\"${base%/}/$NAME\""
+done
 
 # min_from and min_image default to EMPTY, i.e. no constraint, because both fail
 # CLOSED when set and neither is normally wanted.
@@ -120,7 +140,8 @@ cat > "$OUT/box_versions.json" <<JSON
   "releases": [
     {
       "version": "$VERSION",
-      "url": "$BASE_URL/$(basename "$TARBALL")",
+      "url": "${BASE_URL%/}/$NAME",
+      "mirrors": [$MIRRORS_JSON],
       "size": $SIZE,
       "sha256": "$SHA",
       "notes": "TODO: one line, shown on the TV in the update prompt",
@@ -140,11 +161,9 @@ echo "  sha256 $SHA"
 echo
 echo "  $OUT/box_versions.json  <- the COMPLETE manifest; replace the server's copy"
 echo
-echo "Before uploading, edit box_versions.json:"
-echo "  * write a real 'notes' line - it is what the operator reads on the TV;"
-echo "  * set 'rollout' below 100 to try it on a few boxes first."
+echo "notes and rollout are filled in at publish time (-Notes, -Rollout): the notes"
+echo "line is what the operator reads on the TV; rollout < 100 tries it on a few boxes."
 echo
-echo "Then, on the licence server:"
-echo "  scp $(basename "$TARBALL") <vm>:/var/www/license-api-binaries/5/"
-echo "  cp box_versions.json data/box_versions.json && git commit && git push"
-echo "  bash tools/verify-signing.sh     # confirms a box would actually be offered it"
+echo "Then publish (uploads to S3 + the VM mirror, writes the licence server's copy):"
+echo "  .\tools\publish-release.ps1 -Notes \"...\"      # from Windows"
+echo "  then commit + push the licence server, and: bash tools/verify-signing.sh"

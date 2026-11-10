@@ -531,6 +531,53 @@ def enough_space(size):
     return free >= need, free
 
 
+MAX_MIRRORS = 4
+
+
+def release_urls(rel):
+    """Where this release can be fetched from, in the order to try them.
+
+    `url` is the primary (the S3/CloudFront CDN). `mirrors` is an optional list of
+    other places serving the SAME bytes (today: the licence server VM, kept as a
+    fallback while it is phased out). Every candidate is held to the same signed
+    size and sha256, so a mirror can only ever supply the file the manifest
+    already describes; it widens availability, never trust.
+
+    Boxes older than this function read only `url`, so the primary must always be
+    the location we most want the fleet to use.
+    """
+    mirrors = rel.get("mirrors")
+    if not isinstance(mirrors, list):
+        mirrors = []
+    urls = []
+    for u in [rel.get("url")] + mirrors[:MAX_MIRRORS]:
+        if isinstance(u, str) and u.strip() and u.strip() not in urls:
+            urls.append(u.strip())
+    return urls
+
+
+def download_any(urls, size, sha256, dest, on_progress):
+    """download() from the first URL that yields the right bytes.
+
+    Any failure (DNS, HTTP error, timeout, short read, sha256 mismatch) moves on
+    to the next candidate; the last error is raised if none works."""
+    if not urls:
+        raise ValueError("the release names no download URL")
+    last = None
+    for i, url in enumerate(urls):
+        try:
+            on_progress(0.0)
+            got = download(url, size, sha256, dest, on_progress)
+            if i:
+                log("downloaded from mirror %s" % url)
+            return got
+        except (urllib.error.URLError, socket.timeout, OSError, ValueError) as e:
+            last = e
+            more = i + 1 < len(urls)
+            log("download from %s failed: %s%s" % (url, e, " — trying the next mirror" if more else ""))
+    raise last
+
+
 def download(url, size, sha256, dest, on_progress):
     """Fetch to `dest`, hashing as we go. No Range resume: restarting from zero is
     simpler and the artifact is small, and a hard cap at 110% of the declared size
@@ -999,7 +1046,7 @@ class Updater(object):
             return
         version = rel.get("version", "")
         size = int(rel.get("size", 0) or 0)
-        url = rel.get("url", "")
+        urls = release_urls(rel)
         sha = rel.get("sha256", "")
 
         room, free = enough_space(size)
@@ -1016,7 +1063,7 @@ class Updater(object):
         os.makedirs(DOWNLOAD_DIR, exist_ok=True)
         dest = os.path.join(DOWNLOAD_DIR, "adiona-tv-%s.tar.gz" % version)
         try:
-            download(url, size, sha, dest, lambda p: set_state(progress=round(p, 3)))
+            download_any(urls, size, sha, dest, lambda p: set_state(progress=round(p, 3)))
             set_state(state="verifying", progress=1.0, message="Verifying v%s" % version)
             packages = rel.get("packages") if ALLOW_PACKAGES else []
             release_dir = stage(dest, version, packages)
