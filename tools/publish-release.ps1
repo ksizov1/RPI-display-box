@@ -167,7 +167,9 @@ for (const r of m.releases) {
 fs.writeFileSync(dst, JSON.stringify(m, null, 2) + '\n');
 '@
 $rc = Invoke-Native node @('-e', $js, $manifestPath, $versionsFile)
-Remove-Item Env:ADIONA_BOX_NOTES, Env:ADIONA_BOX_ROLLOUT, Env:ADIONA_BOX_DROP_MIRRORS
+# SilentlyContinue: assigning '' to an env var DELETES it in PowerShell, so
+# ADIONA_BOX_DROP_MIRRORS does not exist at all unless -SkipMirror was given.
+Remove-Item Env:ADIONA_BOX_NOTES, Env:ADIONA_BOX_ROLLOUT, Env:ADIONA_BOX_DROP_MIRRORS -ErrorAction SilentlyContinue
 if ($rc -ne 0) { Fail "could not write $versionsFile" }
 
 # ── 6. can a box actually fetch it? ──────────────────────────────────────────
